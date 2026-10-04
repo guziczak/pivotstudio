@@ -1,88 +1,176 @@
+![Pivot Studio — od komórek do odpowiedzi. Zaznacz powiązane tabele, naciśnij Enter i otwórz wspólne dane.][hero]
+
 <h1 align="center">Pivot Studio</h1>
-<p align="center"><strong>Arkusz. Bazy danych. Relacje. Jedna przestrzeń pracy.</strong></p>
-<p align="center">Natywne Qt Widgets · jeden plik Python · lokalna praca · bez wstążki</p>
 
-**Pivot Studio** łączy edytowalny arkusz kalkulacyjny z eksploratorem baz, mapą relacji i tabelami przestawnymi. Otwierasz XLSX albo SQLite, oglądasz strukturę, łączysz powiązane tabele i analizujesz dane bez ręcznego przenoszenia ich między aplikacjami.
+<p align="center">
+<b>Swoboda arkusza. Struktura bazy. Siła tabel przestawnych.</b><br>
+Jedna lokalna aplikacja w pliku <code>PivotStudio.py</code>. Bez przeglądarki i bez rozbudowanej wstążki.
+</p>
 
-**Wydanie rozwojowe 0.7.1.** Nie jest pełnym zamiennikiem Excela ani certyfikowanym narzędziem bazodanowym.
+<p align="center">
+<a href="https://github.com/guziczak/pivotstudio/raw/refs/heads/main/PivotStudio.py"><b>Pobierz PivotStudio.py ↓</b></a>
+&nbsp; · &nbsp;
+<a href="#szybki-start">Uruchom</a>
+&nbsp; · &nbsp;
+<a href="#zobacz-jak-pracujesz">Zobacz, jak pracujesz</a>
+&nbsp; · &nbsp;
+<a href="#status-i-ograniczenia">Status i ograniczenia</a>
+</p>
 
-[Uruchomienie](#uruchomienie) · [Możliwości](#możliwości) · [Zrzuty](#zrzuty) · [Ograniczenia](#ograniczenia) · [Licencja](#licencja)
+---
 
-![Mapa relacji z zaznaczonymi tabelami](docs/screenshots/database-relations.png)
-*Rzeczywisty widok Windows z 0.7.0. Wersja 0.7.1 dodaje wykaz licencji, bez przebudowy diagramu.*
+Masz arkusz do uporządkowania? Bazę, której strukturę chcesz poznać? Dwie tabele, które dopiero razem odpowiadają na pytanie? **Pivot Studio łączy te zadania w jednym miejscu:** od komórek, przez mapę relacji i wspólne rekordy, po podsumowanie.
 
-## Uruchomienie
+Zaczynasz od pliku. Narzędzia otwierasz wtedy, gdy ich potrzebujesz.
 
-Pobierz **`PivotStudio.py`**, zapisz go lokalnie i uruchom:
+## Szybki start
 
-```console
+Pobierz **[PivotStudio.py](https://github.com/guziczak/pivotstudio/raw/refs/heads/main/PivotStudio.py)** i uruchom:
+
+```powershell
 py PivotStudio.py
 ```
 
-Na Linux/macOS: `python3 PivotStudio.py`.
+**Potrzebujesz Pythona 3.10–3.14, 64-bit, z Tcl/Tk.** Pierwszy start otwiera wybór **publicznego PyPI** albo **własnego Artifactory**, a następnie przygotowuje prywatne środowisko bibliotek. Nie musisz ręcznie wykonywać poleceń `pip`.
 
-Potrzebny jest **64-bitowy CPython 3.10–3.14** oraz **Tcl/Tk (Tkinter)**. Dla pełnego zestawu opcjonalnych sterowników użyj Pythona 3.11 lub nowszego; przypięty sterownik Firebirda nie obsługuje 3.10. Dostępność bibliotek zależy również od systemu i architektury. Windows jest głównym środowiskiem docelowym; pozostałe platformy nie zostały w pełni zweryfikowane.
-
-Przed pierwszym pobieraniem pojawia się okno przygotowania. Wybierasz **Publiczne PyPI** albo **Własne Artifactory** i wpisujesz własny adres indeksu. Dostępne są opcjonalne ustawienia CA, proxy i pakietów offline. Biblioteki trafiają do prywatnego środowiska. Hasło repozytorium nie jest zapisywane, a błąd Artifactory nie przełącza instalatora automatycznie na PyPI.
-
-![Wybór własnego źródła pakietów](docs/screenshots/setup-artifactory.png)
-*Uruchomiony Tkinter 0.7.1 na Linux/Xvfb. Adres example.com jest wyłącznie przykładem, nie domyślnym firmowym serwerem.*
-
-**Do uruchamiania i przekazywania aplikacji wystarczy sam plik `.py`.** README i screenshoty służą prezentacji repozytorium. Interpreter i biblioteki są osobnymi składnikami — program nie jest samodzielnym plikiem EXE.
-
-## Możliwości
-
-| Obszar | Co oferuje Pivot Studio |
-|---|---|
-| **Arkusz** | Kolumny A–XFD, numery wierszy, adres i pasek formuły, edycja komórek, kopiowanie zakresów, cofanie, podstawowe formatowanie, zakładki i zoom. Wirtualne adresowanie nie znosi limitów liczby zapisanych komórek. |
-| **Pliki** | XLSX z wieloma arkuszami, CSV/TSV, lokalne kopie robocze i eksport do nowej kopii XLSX. |
-| **Bazy** | Katalog tabel, widoków, kolumn, kluczy, indeksów i innych obiektów. Dane stronicowane tylko do odczytu. SQLite oraz opcjonalne adaptery H2, Firebird i Oracle. |
-| **Relacje** | Mapa zadeklarowanych kluczy obcych. Zaznacz powiązane tabele i naciśnij Enter, aby otworzyć wspólne dane przez LEFT/INNER JOIN. Niejednoznaczność wymaga wyboru. |
-| **Analizy** | Wiersze, kolumny, miary, filtry, sumy, średnie i liczby unikalne. Pivot i wykres z zakresu; obliczenia bazodanowe wykonywane u źródła. |
-| **Projekty** | `.pivot` v4, opcjonalne dołączanie przygotowanych danych, zapisane plany JOIN i odczyt starszych projektów. Kopia przed nadpisaniem starszego formatu. |
-| **Licencje** | **Pomoc → Technologie i licencje**: lokalne wersje bibliotek, deklaracje, warunki, źródła, teksty licencji oraz kopiowanie i eksport wykazu. |
-
-## Pierwsze kroki
-
-Otwórz **menu → Pomoc → Otwórz przykład**, aby zobaczyć fikcyjne dane. Własny XLSX możesz przeciągnąć na okno, a później przełączać arkusze zakładkami na dole.
-
-Upuszczenie pliku SQLite otwiera eksplorator bazy. W **Relacjach** zaznacz powiązane tabele i naciśnij **Enter**. To odczyt wspólnych danych, nie edycja bazy ani tworzenie fizycznej tabeli. Funkcje i polecenia można wyszukiwać przez **Ctrl+K**.
-
-## Zrzuty
+Od razu możesz upuścić XLSX lub SQLite na okno. Bez własnych danych: **menu → Pomoc → Otwórz przykład**.
 
 <details>
-<summary>Arkusz oraz pozostałe warianty okna przygotowania</summary>
+<summary><b>Wymagania, inne systemy i opcjonalne sterowniki</b></summary>
 
-### Arkusz
+Windows jest główną platformą docelową. Na Linux/macOS uruchomienie to `python3 PivotStudio.py`; dostępność bibliotek zależy od platformy, a pełny odbiór tych systemów pozostaje otwarty.
 
-![Kompaktowy arkusz z zaznaczeniem](docs/screenshots/spreadsheet.png)
+Dla wszystkich opcjonalnych sterowników potrzebny jest **Python 3.11 lub nowszy** — przypięty sterownik Firebirda nie obsługuje Pythona 3.10.
 
-*Historyczny zrzut Windows z 0.5.0, pokazujący układ arkusza. Późniejsze wersje poprawiły siatkę i kolory zaznaczenia.*
+| Źródło | Dodatkowe składniki |
+| :--- | :--- |
+| **SQLite** | Obsługa w Pythonie; bez osobnego serwera. |
+| **H2** | JPype1, zgodna 64-bitowa Java i wskazany JAR H2 2.x. |
+| **Firebird** | `firebird-driver` i zgodna biblioteka klienta Firebird. |
+| **Oracle** | `python-oracledb`; w trybie Thick także Oracle Client. |
 
-### Publiczne PyPI
-
-![Przygotowanie z publicznego PyPI](docs/screenshots/setup-pypi.png)
-
-### Jasny motyw przygotowania
-
-![Jasny motyw instalatora](docs/screenshots/setup-light.png)
-
-*Zrzuty instalatora: rzeczywisty Tkinter 0.7.1 na Linux/Xvfb, bez uruchamiania pobierania. Nie potwierdzają zachowania ramki Windows. Zrzuty aplikacji zostały przycięte bez paska zadań. Nie dodano makiety nieuruchomionego okna licencji.*
+Biblioteki i interpreter są osobnymi składnikami. Jeden plik `.py` oznacza prostą dystrybucję kodu aplikacji, nie samodzielny plik EXE.
 
 </details>
 
-## Ograniczenia
+## Zobacz, jak pracujesz
 
-Program nie zapewnia pełnej zgodności z Excelem, makrami ani wszystkimi obiektami i formułami XLSX. Przy pracy z ważnymi plikami zachowaj oryginały i sprawdź eksportowaną kopię.
+### 01 · Otwórz bazę, nie formularz
 
-Źródła baz pozostają tylko do odczytu. Edytujesz lokalny arkusz albo świadomie utworzoną kopię danych. **„Kopia strony → arkusz” obejmuje bieżącą stronę, nie cały wynik.** Płaski JOIN może powielać miary tabel nadrzędnych; pivot nie jest wielotabelowym modelem miar Excela.
+Przeciągnij plik SQLite na okno. Dostajesz **katalog tabel, widoków, kolumn, kluczy i indeksów** — bez obowiązkowego tworzenia analizy. Przełącz się na **Relacje**, żeby zobaczyć, co z czym się łączy.
 
-Aplikacja nie ma wbudowanej telemetrii, lokalnego serwera HTTP ani WebEngine i nie wysyła automatycznie skoroszytów. Sieć jest używana przy wybranej instalacji pakietów, połączeniu z bazą oraz po jawnym otwarciu źródła dokumentacji. Projekty, importy i migawki **nie są szyfrowane**.
+Powiązane tabele są blisko siebie. Linie prowadzą między polami kluczy. Mapę możesz przesuwać i powiększać; ręczny układ pozostaje po powrocie z danych.
 
-Nowy dialog licencji 0.7.1 nie został sprawdzony w uruchomionym PySide6 ani na Windows w środowisku przygotowania wydania. Testy rdzenia i Tkintera nie zastępują odbioru GUI. Adaptery H2, Firebird i Oracle wymagają prób na rzeczywistych instancjach.
+![Mapa struktury bazy: zaznaczone events i operations, wyróżnione pola klucza i polecenie otwarcia połączonych danych.][relations]
+
+### 02 · Zaznacz. Enter. Wspólne dane.
+
+Zaznacz powiązane tabele przez **Ctrl+klik** lub prostokąt i naciśnij **Enter**. Pivot otworzy wspólną kartę według zadeklarowanej relacji — bez przepisywania kluczy i bez ręcznego pisania SQL.
+
+Na przykład `events.operation_id → operations.operation_id`: zdarzenie i przypisana do niego operacja w jednym wierszu. Nagłówki wskazują pochodzenie pól, a rodzaj połączenia można zmienić między **wszystkimi rekordami podstawy (LEFT)** i **tylko dopasowanymi (INNER)**. Gdy relacja jest niejednoznaczna, wybierasz ją jawnie.
+
+![Wynik połączenia events i operations: wspólna tabela z nazwami źródeł w nagłówkach, filtrem i kartą wyniku.][joined]
+
+<sub>Identyfikatory operacji, zatwierdzeń i znaczniki czasu na zdjęciu zamaskowano.</sub>
+
+### 03 · Z rekordów zrób odpowiedź
+
+**Region do wierszy. Miesiąc do kolumn. Kwota do wartości.** Tak powstaje podsumowanie, które można filtrować, zapisać i wyeksportować. Dostępne są między innymi sumy, średnie, liczba rekordów i liczba wartości unikalnych.
+
+Przykład: **jak rozkłada się sprzedaż między regionami?**
+
+| Region | 2026-01 | 2026-02 | Ogółem |
+| :--- | ---: | ---: | ---: |
+| Południe | 9 000 | 13 500 | 22 500 |
+| Północ | 12 000 | 15 000 | 27 000 |
+| Zachód | 7 500 | 11 000 | 18 500 |
+| **Ogółem** | **28 500** | **39 500** | **68 000** |
+
+<sub>Fikcyjne dane: wynik obliczony silnikiem Pivot Studio 0.7.2 dla 12 rekordów. To tabela w README, nie zrzut interfejsu.</sub>
+
+Zaznaczenie w arkuszu może stać się źródłem pivota lub wykresu. Połączenie tabel może zasilić analizę pełnego wyniku, a nie tylko aktualnie oglądanej strony. **Przy relacji jeden-do-wielu dobierz właściwy poziom agregacji:** wartość z tabeli nadrzędnej może wystąpić w kilku wierszach JOIN-a.
+
+### 04 · Kiedy potrzebujesz arkusza — masz arkusz
+
+**A, B, C… u góry. 1, 2, 3… z lewej.** Aktywna komórka, pasek formuły, zakresy, zakładki i zoom. Do tego edycja, kopiowanie i wklejanie, cofanie, podstawowe formatowanie i lokalny silnik formuł.
+
+XLSX otwierasz jako skoroszyt z nazwanymi arkuszami. Przełączasz zakładki bez ponownego importowania pliku. Narzędzia **Format**, **Dane** i **Pivot** są pod ręką, ale nie zajmują czterech rzędów ekranu.
+
+![Lokalny arkusz Pivot Studio: kompaktowy nagłówek, pasek formuły, oznaczenia komórek i zakładki na dole.][sheet]
+
+<details>
+<summary><b>Praca z klawiaturą</b></summary>
+
+| Klawisz | W arkuszu |
+| :--- | :--- |
+| **Enter / Shift+Enter** | Zatwierdź wpis i przejdź w dół / w górę. |
+| **Tab / Shift+Tab** | Zatwierdź wpis i przejdź w prawo / w lewo. |
+| **Escape** | Anuluj niezapisaną edycję komórki. |
+| **F2** | Edytuj aktywną komórkę. |
+| **Ctrl+C / Ctrl+V** | Kopiuj / wklej zakres. |
+| **Ctrl+K** | Wyszukaj polecenie. |
+
+Obsługa zatwierdzania i nawigacji została przebudowana w **0.7.2**. Stan jej weryfikacji jest opisany w sekcji [Status i ograniczenia](#status-i-ograniczenia). Enter na diagramie ma osobne działanie: otwiera zaznaczone dane.
+
+</details>
+
+## Jedno przygotowanie. Twoje źródło bibliotek.
+
+Na pierwszym ekranie wybierasz, skąd pobrać pakiety. **Własny adres Artifactory**, opcjonalny login i hasło/token; dla sieci firmowej także CA i proxy. Jest również możliwość wskazania kompletu pakietów offline.
+
+<p align="center">
+<img src="docs/screenshots/setup-artifactory.png" width="720" alt="Okno przygotowania Pivot Studio z wyborem własnego Artifactory, adresem indeksu i opcjonalnym logowaniem.">
+</p>
+
+Hasło źródła pakietów nie jest zapisywane. Błąd firmowego indeksu **nie przełącza pobierania samowolnie na PyPI**. Przygotowane biblioteki pozostają w prywatnym środowisku — nie trzeba instalować ich globalnie.
+
+## Lokalnie, z jasnymi zasadami
+
+**Arkusz edytujesz. Bazę przeglądasz.** Połączenia bazodanowe i ich wyniki pozostają tylko do odczytu. Polecenie **„Kopia strony → arkusz”** tworzy edytowalną kopię bieżącej strony. Eksport XLSX zapisuje nową kopię skoroszytu, nie nadpisuje otwartego oryginału.
+
+**Zapisujesz pracę, nie tylko obraz tabeli.** Projekt `.pivot` zachowuje arkusze, analizy i nazwane plany połączeń. Przygotowane dane można dołączyć do projektu; oryginalny XLSX jest osobną decyzją. Nie jest to automatyczna kopia całego serwera bazodanowego.
+
+**Wiesz, czego używasz.** W **Pomoc → Technologie i licencje** sprawdzisz lokalne wersje składników, deklaracje i warunki, źródła oraz dostępne teksty licencji. Zestawienie można skopiować lub wyeksportować; nieznane wersje wymagają weryfikacji, nie dostają automatycznie zielonego „tak”.
+
+Aplikacja nie ma wbudowanej telemetrii ani WebEngine. Sieć jest potrzebna przy wybranym pobieraniu pakietów, połączeniach z serwerami baz i otwieraniu źródeł dokumentacji. **Projekty, importy i migawki nie są szyfrowane.**
+
+## Status i ograniczenia
+
+**0.7.2 · aktywnie rozwijane wydanie.** Pivot Studio nie jest pełnym zamiennikiem Excela. Obsługa formuł i formatowania ma określony zakres; makra i część obiektów XLSX nie są obsługiwane. Przy ważnych plikach zachowaj oryginał i sprawdź eksportowaną kopię.
+
+Roboczy skoroszyt ma limit **200 000 zapisanych komórek**, a pojedyncza operacja — **100 000**. Plan JOIN obejmuje **2–8 różnych tabel z jednego źródła**. Płaskie połączenie nie jest wielotabelowym modelem miar Excela. Widoczność katalogu bazy zależy od uprawnień konta.
+
+<details>
+<summary><b>Stan testów i pochodzenie materiałów</b></summary>
+
+Raport wydania 0.7.2: **379 testów rdzenia i regresji** oraz **61 testów przygotowania i Tkintera** zakończonych powodzeniem. **26 nowych testów klawiatury Qt nie wykonano** z powodu braku PySide6 w środowisku przygotowania wydania. Nie oznacza to potwierdzenia wszystkich interakcji na Windows. Adaptery H2, Firebird i Oracle wymagają prób na rzeczywistych instancjach.
+
+Zdjęcia przedstawiają rzeczywiście uruchomioną aplikację, nie makiety. Mapa i wynik JOIN-a pochodzą z Windows, z wersji 0.7.0; arkusz — z udostępnionego zdjęcia sprzed poprawki 0.7.2. Okno przygotowania to Tkinter 0.7.1 na Linux/Xvfb. Baner wykorzystuje fragment autentycznego diagramu. Zrzuty przycięto bez paska zadań; w wyniku JOIN-a zamaskowano techniczne identyfikatory i znaczniki czasu. Nie są to nowe zrzuty GUI 0.7.2.
+
+Mała tabela sprzedaży powyżej powstała z fikcyjnego, dwumiesięcznego zbioru. Jej wartości i sumy obliczono przez `run_pivot()` z niezmienionego kodu 0.7.2 i niezależnie porównano z agregacją SQLite. Nie przedstawia danych użytkownika ani nagrania GUI.
+
+Wbudowane sprawdzenia, uruchamiane jawnie:
+
+```powershell
+py PivotStudio.py --self-test       # rdzeń, bez Qt i bez sieci
+py PivotStudio.py --bootstrap-test  # przygotowanie i Tkinter, bez pobierania
+py PivotStudio.py --ui-test         # prawdziwe kontrolki; wymaga PySide6
+```
+
+</details>
 
 ## Licencja
 
-Kod aplikacji: [MIT](LICENSE). Biblioteki, Java i klienci baz zachowują odrębne licencje i wymagania. Deklaracje, warunki i dostępne źródła znajdziesz w **Pomoc → Technologie i licencje**; wykaz nie zastępuje pełnego audytu konkretnej dystrybucji.
+Własny kod aplikacji jest dostępny na **[MIT](LICENSE)**. Biblioteki, Java i klienci baz mają odrębne licencje oraz warunki dystrybucji. Wykaz w aplikacji pomaga je sprawdzić, ale nie zastępuje audytu konkretnego zestawu komponentów.
 
-Repozytorium nie zawiera bibliotek, plików JAR/DLL, fontów, gotowego venv ani prywatnych baz i projektów.
+Do przekazania programu wystarczy **`PivotStudio.py`**. W repozytorium są tylko kod, ten README, licencja i obrazy w `docs/screenshots/` — bez dołączonych bibliotek, venv i prywatnych plików baz.
+
+---
+
+<p align="center"><b>Otwórz dane. Zobacz powiązania. Znajdź odpowiedź.</b></p>
+<p align="center"><a href="https://github.com/guziczak/pivotstudio/raw/refs/heads/main/PivotStudio.py">Pobierz Pivot Studio</a> · <a href="#szybki-start">Wróć do startu ↑</a></p>
+
+[hero]: docs/screenshots/hero.png
+[relations]: docs/screenshots/database-relations.png
+[joined]: docs/screenshots/joined-data.png
+[sheet]: docs/screenshots/spreadsheet.png
