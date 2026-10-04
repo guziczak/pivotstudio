@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Pivot Studio 0.7.1 — lokalny arkusz i analizy w jednym pliku.
+"""Pivot Studio 0.7.2 — lokalny arkusz i analizy w jednym pliku.
 
 Uruchomienie: py PivotStudio.py (Windows) / python3 PivotStudio.py.
 Tkinter: wybór PyPI / własnego Artifactory przed pobraniem bibliotek.
@@ -24,6 +24,8 @@ relacje i stronicowane dane bez obowiązkowego tworzenia analizy.
 0.7.0: czytelna mapa grupowana według powiązań; zaznacz tabele i Enter,
 aby otworzyć połączone rekordy według FK. JOIN jest tylko do odczytu.
 0.7.1: lokalny wykaz technologii i licencji, źródła, noty i eksport.
+0.7.2: wspólny szkic komórki i paska formuły; Enter/Tab, ruch odwrotny,
+Escape, zakresy i zamrożone okienka. Edycja wartości nie resetuje siatki.
 Bez zmian zależności, instalatora, formatu projektu i obliczeń.
 """
 from __future__ import annotations
@@ -67,7 +69,7 @@ from xml.sax.saxutils import escape as xml_escape
 import zipfile
 
 APP_NAME = 'Pivot Studio'
-APP_VERSION = '0.7.1'
+APP_VERSION = '0.7.2'
 PROJECT_VERSION = 4
 PROJECT_APP_ID = 0x50565331
 MAX_BODY = 4 * 1024 * 1024
@@ -4750,6 +4752,181 @@ class SheetCalculator:
         return self.compare(value,criterion,'=')
 
 
+@dataclasses.dataclass(frozen=True)
+class SheetChange:
+    """Transient notification; never serialized into a project."""
+    kind: str = 'book'
+    sheet_id: str = ''
+    addresses: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass
+class SheetEditDraft:
+    """A draft belongs to the cell where editing began, not the current selection."""
+    token: str
+    book_id: str
+    sheet_id: str
+    row: int
+    column: int
+    structure_epoch: int
+    original: dict | None
+    text: str
+
+
+@dataclasses.dataclass(frozen=True)
+class SheetCommitResult:
+    accepted: bool
+    changed: bool = False
+    message: str = ''
+
+
+def sheet_begin_edit(session, sheet_id, row, column):
+    address = sheet_address(row, column)
+    original = sheet_find(session.book, sheet_id)['cells'].get(address)
+    return SheetEditDraft(uid(), session.book['id'], sheet_id, row, column,
+                          session.structure_epoch, clone(original), sheet_raw(original or {}))
+
+
+def sheet_commit_edit(session, draft, *, read_only=False):
+    """One atomic commit. An unchanged value is success, not a validation error."""
+    if read_only:
+        return SheetCommitResult(False, message='Ten arkusz jest tylko do odczytu.')
+    if not session or session.book['id'] != draft.book_id:
+        return SheetCommitResult(False, message='Zmieniono skoroszyt. Wpis nie został zapisany w innym dokumencie.')
+    if session.structure_epoch != draft.structure_epoch:
+        return SheetCommitResult(False, message='Zmieniono strukturę arkusza podczas edycji. Skopiuj wpis i anuluj go przez Escape.')
+    try:
+        record = sheet_find(session.book, draft.sheet_id)['cells'].get(sheet_address(draft.row, draft.column))
+        if record != draft.original:
+            return SheetCommitResult(False, message='Zawartość komórki zmieniła się podczas edycji. Nie nadpisano jej. Skopiuj wpis i naciśnij Escape.')
+        if draft.text == sheet_raw(draft.original or {}):
+            return SheetCommitResult(True)
+        changed = session.edit(draft.sheet_id, draft.row, draft.column, draft.text)
+        return SheetCommitResult(True, bool(changed))
+    except Exception as exc:
+        return SheetCommitResult(False, message=safe_error(exc))
+
+
+@dataclasses.dataclass(frozen=True)
+class SheetHiddenAxis:
+    """Compressed hidden intervals; Enter does not scan a million filtered rows."""
+    intervals: tuple[tuple[int, int], ...] = ()
+
+    @classmethod
+    def from_sections(cls, sections):
+        intervals = []
+        for value in sorted(set(sections)):
+            if intervals and value == intervals[-1][1] + 1:
+                intervals[-1] = (intervals[-1][0], value)
+            else:
+                intervals.append((value, value))
+        return cls(tuple(intervals))
+
+    def next_visible(self, value, step, lower, upper):
+        import bisect
+        value = max(lower, value) if step > 0 else min(upper, value)
+        if not lower <= value <= upper:
+            return None
+        index = bisect.bisect_right(self.intervals, (value, math.inf)) - 1
+        if index >= 0 and self.intervals[index][0] <= value <= self.intervals[index][1]:
+            value = self.intervals[index][1] + 1 if step > 0 else self.intervals[index][0] - 1
+        return value if lower <= value <= upper else None
+
+
+def sheet_nav_subtract(rect, block):
+    r, c, er, ec = rect
+    a, b, d, e = block
+    top, left, bottom, right = max(r, a), max(c, b), min(er, d), min(ec, e)
+    if top > bottom or left > right:
+        return (rect,)
+    return tuple(piece for piece in ((r, c, top - 1, ec), (bottom + 1, c, er, ec),
+                                     (top, c, bottom, left - 1), (top, right + 1, bottom, ec))
+                 if piece[0] <= piece[2] and piece[1] <= piece[3])
+
+
+@functools.lru_cache(maxsize=32)
+def sheet_navigation_regions(ranges, merges):
+    """Subtract covered merge cells geometrically; do not enumerate selections."""
+    regions = tuple(ranges)
+    for r, c, er, ec in merges:
+        for block in ((r, c + 1, r, ec), (r + 1, c, er, ec)):
+            if block[0] > block[2] or block[1] > block[3]:
+                continue
+            regions = tuple(piece for rect in regions for piece in sheet_nav_subtract(rect, block))
+            if len(regions) > 32768:
+                raise UserError('Zaznaczenie ze scaleniami jest zbyt złożone. Zaznacz mniejszy obszar.')
+    return regions
+
+
+def sheet_next_cell(current, direction, *, ranges=(), merges=(), hidden_rows=None,
+                    hidden_columns=None, max_rows=SHEET_MAX_ROWS, max_columns=SHEET_MAX_COLS):
+    """Pure navigation. Enter traverses columns; Tab traverses rows in a selection.
+
+    Outside a multi-cell selection the movement is straight and bounded. Frozen
+    panes are a presentation detail and must not be included in hidden sections.
+    """
+    if direction not in ('down', 'up', 'right', 'left'):
+        raise ValueError('Nieznany kierunek nawigacji.')
+    if not 0 <= current[0] < max_rows or not 0 <= current[1] < max_columns:
+        raise ValueError('Nieprawidłowa aktywna komórka.')
+    rows = hidden_rows or SheetHiddenAxis()
+    columns = hidden_columns or SheetHiddenAxis()
+    vertical = direction in ('down', 'up')
+    step = 1 if direction in ('down', 'right') else -1
+    merges = tuple(tuple(x) for x in merges)
+    ranges = tuple(tuple(x) for x in ranges)
+    if len(ranges) > 4096:
+        raise UserError('Zbyt wiele oddzielnych zaznaczeń do nawigacji.')
+    for r, c, er, ec in (*ranges, *merges):
+        if not 0 <= r <= er < max_rows or not 0 <= c <= ec < max_columns:
+            raise ValueError('Zakres nawigacji jest poza arkuszem.')
+    span = next((x for x in merges if x[0] <= current[0] <= x[2] and x[1] <= current[1] <= x[3]), None)
+    if span:
+        current = span[:2]
+    in_selection = any(r <= current[0] <= er and c <= current[1] <= ec for r, c, er, ec in ranges)
+    regions = sheet_navigation_regions(ranges, merges) if in_selection else ()
+    multi = bool(regions) and not (len(regions) == 1 and regions[0][:2] == regions[0][2:])
+
+    if multi:
+        major_axis, minor_axis = (columns, rows) if vertical else (rows, columns)
+        def key(cell):
+            return (cell[1], cell[0]) if vertical else cell
+        def candidate(rect, after):
+            r, c, er, ec = rect
+            lo, hi, minor_lo, minor_hi = (c, ec, r, er) if vertical else (r, er, c, ec)
+            major, minor = key(after) if after is not None else (lo if step > 0 else hi, minor_lo - 1 if step > 0 else minor_hi + 1)
+            first = major_axis.next_visible(major, step, lo, hi)
+            if first is None:
+                return None
+            minor_start = minor + step if first == major else (minor_lo if step > 0 else minor_hi)
+            second = minor_axis.next_visible(minor_start, step, minor_lo, minor_hi)
+            if second is None:
+                first = major_axis.next_visible(first + step, step, lo, hi)
+                if first is None:
+                    return None
+                second = minor_axis.next_visible(minor_lo if step > 0 else minor_hi, step, minor_lo, minor_hi)
+            if second is None:
+                return None
+            return (second, first) if vertical else (first, second)
+        def choose(after):
+            choices = [cell for rect in regions if (cell := candidate(rect, after)) is not None]
+            return (min if step > 0 else max)(choices, key=key) if choices else None
+        return choose(current) or choose(None) or current
+
+    row, col = current
+    for _ in range(len(merges) + 2):
+        start = (span[2] if step > 0 else span[0]) if vertical and span else (span[3] if step > 0 else span[1]) if span else row if vertical else col
+        value = (rows if vertical else columns).next_visible(start + step, step, 0, (max_rows if vertical else max_columns) - 1)
+        if value is None:
+            return current
+        row, col = (value, col) if vertical else (row, value)
+        span = next((x for x in merges if x[0] <= row <= x[2] and x[1] <= col <= x[3]), None)
+        target = span[:2] if span else (row, col)
+        if rows.next_visible(target[0], 1, target[0], target[0]) is not None and columns.next_visible(target[1], 1, target[1], target[1]) is not None:
+            return target
+    return current
+
+
 class SheetSession:
     """Sparse atomic edit commands. UI and persisted project share one owned book.
 
@@ -4758,8 +4935,11 @@ class SheetSession:
     """
     def __init__(self, book, changed=None):
         self.book=book;self.changed=changed or (lambda:None);self.calculator=SheetCalculator(book)
+        self.last_change=SheetChange();self.structure_epoch=0
         self.history=[];self.position=0;self.history_bytes=0;self.available_bytes=lambda:SHEET_MAX_BYTES
-    def notify(self):
+    def notify(self, change=None):
+        self.last_change=change or SheetChange()
+        if self.last_change.kind=='book':self.structure_epoch+=1
         self.book['revision']=self.book.get('revision',0)+1;self.calculator.invalidate();self.changed()
     def record(self,command):
         import zlib
@@ -4768,7 +4948,8 @@ class SheetSession:
         self.history_bytes=sum(x['_bytes'] for x in self.history)
         while len(self.history)>60 or self.history_bytes>24*1024*1024:
             removed=self.history.pop(0);self.history_bytes-=removed['_bytes']
-        self.position=len(self.history);self.notify()
+        self.position=len(self.history)
+        self.notify(SheetChange('cells',command['sid'],tuple(command['after'])) if command['type']=='cells' else SheetChange())
     def apply_cells(self,sid,changes,label='Edycja komórek'):
         sheet=sheet_find(self.book,sid)
         if len(changes)>SHEET_MAX_PATCH:raise UserError('Jedna operacja może zmienić najwyżej 100 000 komórek.')
@@ -4821,7 +5002,7 @@ class SheetSession:
             raw=json.loads(zlib.decompress(base64.b64decode(command[direction])).decode('utf-8'))
             if len(dumps(raw).encode('utf-8'))>self.available_bytes()-4096:raise UserError('Przywrócenie przekroczyłoby limit projektu.')
             rev=self.book.get('revision',0);self.book.clear();self.book.update(raw);self.book['revision']=rev
-        self.notify()
+        self.notify(SheetChange('cells',command['sid'],tuple(command[direction])) if command['type']=='cells' else SheetChange())
     def undo(self):
         if self.position:
             self._restore(self.history[self.position-1],'before');self.position-=1;return True
@@ -7870,6 +8051,14 @@ def native_ui_types():
             cells=sheet_find(session.book,sid)['cells'];coords=[sheet_position(a) for a in cells]
             self.row_limit=min(SHEET_MAX_ROWS,max(1000,max((r for r,c in coords),default=0)+101))
             self.col_limit=min(SHEET_MAX_COLS,max(52,max((c for r,c in coords),default=0)+11));self.endResetModel()
+        def cells_changed(self,change):
+            if self.session is None:return
+            if change.sheet_id==self.sheet_id and change.addresses:
+                positions=[sheet_position(a) for a in change.addresses]
+                self.ensure_cell(max(r for r,c in positions),max(c for r,c in positions))
+            # Formulas on this sheet can depend on any edited sheet. Invalidate
+            # display roles without resetting indexes, selection, or editor.
+            self.dataChanged.emit(self.index(0,0),self.index(self.row_limit-1,self.col_limit-1),[])
         def rowCount(self,parent=QC.QModelIndex()):return 0 if parent.isValid() else self.row_limit
         def columnCount(self,parent=QC.QModelIndex()):return 0 if parent.isValid() else self.col_limit
         def ensure_cell(self,row,col):
@@ -7931,6 +8120,362 @@ def native_ui_types():
                 return True
             except Exception as exc:self.editFailed.emit(safe_error(exc));return False
 
+    class SheetInput(QW.QLineEdit):
+        """Track IME preedit without intercepting the input method's own Enter."""
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._sheet_preedit = False
+            self._sheet_token = ''
+            self._sheet_finished = False
+        def inputMethodEvent(self, event):
+            super().inputMethodEvent(event)
+            self._sheet_preedit = bool(event.preeditString())
+
+    class SheetInteraction(QC.QObject):
+        """Scoped owner of commit/cancel/navigation for the four sheet panes.
+
+        No global Return shortcut, no delayed second cursor move. Qt's delegate
+        lifecycle can call the same commit, but a consumed token cannot write twice.
+        """
+        def __init__(self, workspace):
+            super().__init__(workspace)
+            self._workspace = workspace
+            self.draft = None
+            self._session = None
+            self._editor = None
+            self._editor_view = None
+            self._active_input = None
+            self._busy = False
+            self._closing_editor = False
+            self._syncing = False
+            self._focus_ticket = 0
+            self._visibility_key = None
+            self._visibility = (SheetHiddenAxis(), SheetHiddenAxis())
+            self._completed = collections.deque(maxlen=32)
+            self._edit_selection = None
+            self._headers = set()
+            for view in workspace.views.views:
+                for header in (view.horizontalHeader(),view.verticalHeader()):
+                    target=header.viewport();self._headers.add(target);target.installEventFilter(self)
+            app = QW.QApplication.instance()
+            if app is not None:
+                app.focusChanged.connect(self.focus_changed)
+        @staticmethod
+        def key_action(event):
+            key = event.key()
+            mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+            plain = mods == Qt.KeyboardModifier.NoModifier
+            shift = mods == Qt.KeyboardModifier.ShiftModifier
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if plain or shift:
+                    return 'up' if shift else 'down'
+                # Do not silently interpret Ctrl/Alt+Enter as plain Enter.
+                return 'special-enter'
+            if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab) and (plain or shift):
+                return 'left' if shift or key == Qt.Key.Key_Backtab else 'right'
+            if key == Qt.Key.Key_Escape and plain:
+                return 'cancel'
+            if key == Qt.Key.Key_F6 and (plain or shift):
+                return 'previous-area' if shift else 'next-area'
+            return ''
+        def live(self, widget):
+            return widget is not None and qt_object_alive(widget)
+        def owns_editor(self, editor):
+            return self.live(editor) and editor is self._editor and self.draft is not None and editor._sheet_token == self.draft.token
+        def begin(self, index, editor=None, view=None):
+            ws = self._workspace
+            if self._busy or not ws.session or not index.isValid():
+                return False
+            target = (ws.session.book['id'], ws.sheet_id, index.row(), index.column())
+            if self.draft is not None:
+                previous = (self.draft.book_id, self.draft.sheet_id, self.draft.row, self.draft.column)
+                if target != previous and not self.finish(focus=False):
+                    return False
+            if self.draft is None:
+                self.draft = sheet_begin_edit(ws.session, ws.sheet_id, index.row(), index.column())
+                self._session = ws.session
+                self._edit_selection = ws.capture_selection()
+                self.clear_error()
+            if editor is not None:
+                self._editor, self._editor_view = editor, view
+                editor._sheet_token = self.draft.token
+                editor._sheet_finished = False
+                self._active_input = editor
+            return True
+        def begin_formula(self):
+            ws = self._workspace
+            text = ws.formula.text()
+            existed = self.draft is not None
+            if not self.begin(ws.grid.currentIndex()):
+                return False
+            self._active_input = ws.formula
+            if not existed:
+                self.draft.text = text
+            self.sync_text()
+            return True
+        def attach_editor(self, editor, index, view):
+            if self.owns_editor(editor):
+                return  # dataChanged must not replace an in-progress draft.
+            if not self.begin(index, editor, view):
+                return
+            editor.setText(self.draft.text)
+            editor.selectAll()
+            if not getattr(editor, '_sheet_connected', False):
+                editor._sheet_connected = True
+                editor.textEdited.connect(lambda text, e=editor: self.text_edited(e, text))
+            self.sync_text()
+        def text_edited(self, widget, text):
+            if self._busy or self._syncing:
+                return
+            if self.draft is None:
+                if widget is not self._workspace.formula or not self.begin_formula():
+                    return
+            if widget is not self._workspace.formula and not self.owns_editor(widget):
+                return
+            self._active_input = widget
+            self.draft.text = text
+            self.clear_error()
+            self.sync_text()
+        def sync_text(self):
+            if self.draft is None or self._syncing:
+                return
+            self._syncing = True
+            try:
+                for widget in (self._workspace.formula, self._editor):
+                    if not self.live(widget) or widget is self._active_input:
+                        continue
+                    if widget.text() != self.draft.text:
+                        position = widget.cursorPosition()
+                        blocker = QC.QSignalBlocker(widget)
+                        widget.setText(self.draft.text)
+                        widget.setCursorPosition(min(position, len(self.draft.text)))
+                        del blocker
+            finally:
+                self._syncing = False
+        def show_error(self, text):
+            ws = self._workspace
+            ws.edit_error.setText(text)
+            ws.edit_error.show()
+        def clear_error(self):
+            ws = self._workspace
+            ws.edit_error.clear()
+            ws.edit_error.hide()
+        def context_valid(self):
+            ws = self._workspace
+            d = self.draft
+            return d is not None and ws.session is self._session and ws.sheet_id == d.sheet_id and ws.session.book['id'] == d.book_id
+        def finish(self, direction=None, *, focus=False, cancel=False, close_editor=True):
+            if self._busy:
+                return False
+            ws = self._workspace
+            if not ws.session:
+                return self.draft is None
+            self._busy = True
+            origin = (max(0, ws.grid.currentIndex().row()), max(0, ws.grid.currentIndex().column()))
+            editor, view = self._editor, self._editor_view
+            changed = False
+            try:
+                d = self.draft
+                if d is not None:
+                    if not cancel:
+                        if not self.context_valid():
+                            self.show_error('Zmieniono kontekst edycji. Wpis nie trafił do innego arkusza. Skopiuj go lub anuluj przez Escape.')
+                            self.restore_edit_focus()
+                            return False
+                        if self.live(self._active_input):
+                            d.text = self._active_input.text()
+                        result = sheet_commit_edit(self._session, d, read_only=ws.model.read_only)
+                        if not result.accepted:
+                            self.show_error(result.message)
+                            self.restore_edit_focus()
+                            return False
+                        changed = result.changed
+                    origin = (d.row, d.column)
+                    self._completed.append(d.token)
+                    if self.live(editor):
+                        editor._sheet_finished = True
+                    self.draft = None
+                    self._session = self._editor = self._editor_view = self._active_input = None
+                    self._focus_ticket += 1
+                    if close_editor and self.live(editor) and self.live(view):
+                        self._closing_editor = True
+                        try:
+                            view.itemDelegate().closeEditor.emit(editor, QW.QAbstractItemDelegate.EndEditHint.NoHint)
+                        finally:
+                            self._closing_editor = False
+                self.clear_error()
+                if changed and ws._filters:
+                    ws.apply_filters()
+                if direction:
+                    self.navigate(direction, origin)
+                else:
+                    ws.selection_changed()
+                    if focus:
+                        self.focus_cell(origin)
+                if ws._refresh_deferred:
+                    ws._refresh_deferred = False
+                    if not ws._refresh_queued:
+                        ws._refresh_queued = True
+                        QC.QTimer.singleShot(0, ws.refresh_document)
+                return True
+            finally:
+                self._busy = False
+        def from_formula(self, direction=None, *, focus=False):
+            if self.draft is None and not self.begin_formula():
+                return False
+            self._active_input = self._workspace.formula
+            return self.finish(direction, focus=focus)
+        def native_commit(self, editor):
+            if getattr(editor, '_sheet_finished', False) or getattr(editor, '_sheet_token', '') in self._completed:
+                return True
+            if not self.owns_editor(editor):
+                return False
+            self._active_input = editor
+            return self.finish(close_editor=False)
+        def native_close(self, editor, hint):
+            if self._closing_editor or not self.owns_editor(editor):
+                return True
+            if QW.QApplication.focusWidget() is self._workspace.formula:
+                return False
+            return self.finish(cancel=hint == QW.QAbstractItemDelegate.EndEditHint.RevertModelCache, close_editor=False)
+        def editor_destroyed(self, editor):
+            if editor is self._editor:
+                self._editor = self._editor_view = None
+                if self.draft is not None:
+                    self._active_input = self._workspace.formula
+                    self.sync_text()
+        def visibility(self):
+            ws = self._workspace
+            panes = ws.views
+            key = (panes.frozen, *(v._visibility_revision for v in panes.views))
+            if key != self._visibility_key:
+                fr, fc = panes.frozen
+                hidden_rows = {r for r in panes.grid._hidden_rows if r >= fr} | {r for r in panes.top._hidden_rows if r < fr}
+                hidden_cols = {c for c in panes.grid._hidden_columns if c >= fc} | {c for c in panes.left._hidden_columns if c < fc}
+                self._visibility = (SheetHiddenAxis.from_sections(hidden_rows), SheetHiddenAxis.from_sections(hidden_cols))
+                self._visibility_key = key
+            return self._visibility
+        def navigate(self, direction, origin=None):
+            ws = self._workspace
+            if not ws.session:
+                return
+            index = ws.grid.currentIndex()
+            current = origin or (max(0, index.row()), max(0, index.column()))
+            ranges = tuple((s.top(), s.left(), s.bottom(), s.right()) for s in ws.grid.selectionModel().selection())
+            merges = tuple(sheet_range(area) for area in ws.active_sheet()['merges'])
+            hidden_rows, hidden_cols = self.visibility()
+            target = sheet_next_cell(current, direction, ranges=ranges, merges=merges,
+                                     hidden_rows=hidden_rows, hidden_columns=hidden_cols)
+            ws.model.ensure_cell(*target)
+            new_index = ws.model.index(*target)
+            multiple = any(sheet_rect_count(r) > 1 for r in ranges) or len(ranges) > 1
+            inside = any(r <= target[0] <= er and c <= target[1] <= ec for r, c, er, ec in ranges)
+            if multiple and inside:
+                ws.grid.selectionModel().setCurrentIndex(new_index, QC.QItemSelectionModel.SelectionFlag.NoUpdate)
+            else:
+                ws.grid.selectionModel().setCurrentIndex(new_index, QC.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            ws.anchor_index = None
+            ws.selection_changed()
+            self.focus_cell(target)
+        def focus_cell(self, coordinate=None):
+            ws = self._workspace
+            if not ws.session:
+                return
+            index = ws.grid.currentIndex()
+            row, col = coordinate or (max(0, index.row()), max(0, index.column()))
+            view = ws.views.view_for(row, col)
+            view.scrollTo(ws.model.index(row, col), QW.QAbstractItemView.ScrollHint.EnsureVisible)
+            view.setFocus(Qt.FocusReason.OtherFocusReason)
+        def cycle_area(self, reverse=False):
+            ws = self._workspace
+            current = QW.QApplication.focusWidget()
+            if not self.finish(focus=False):
+                return
+            index = ws.grid.currentIndex()
+            view = ws.views.view_for(max(0, index.row()), max(0, index.column()))
+            areas = [view, ws.formula, ws.address, ws.book_button, ws._host_window.titlebar.menu_button]
+            position = next((i for i, area in enumerate(areas) if current is area or (current is not None and area.isAncestorOf(current))), 0)
+            areas[(position + (-1 if reverse else 1)) % len(areas)].setFocus(Qt.FocusReason.TabFocusReason)
+        def handle_key(self, event, widget):
+            action = self.key_action(event)
+            if not action:
+                return False
+            if getattr(widget, '_sheet_preedit', False):
+                return False
+            if isinstance(widget, QW.QLineEdit):
+                completer = widget.completer()
+                if completer is not None and completer.popup().isVisible():
+                    return False
+            event.accept()
+            if event.type() == QC.QEvent.Type.ShortcutOverride:
+                return True
+            try:
+                if action == 'special-enter':
+                    ws = self._workspace
+                    ws._host_window.statusBar().showMessage('Enter: zatwierdź i przejdź niżej. Shift+Enter: wyżej. Pełny tekst: przycisk ołówka.', 4500)
+                elif action in ('next-area', 'previous-area'):
+                    self.cycle_area(action == 'previous-area')
+                elif action == 'cancel':
+                    self.finish(cancel=True, focus=True)
+                elif widget is self._workspace.formula:
+                    self.from_formula(action, focus=True)
+                else:
+                    self.finish(action, focus=True)
+            except Exception as exc:
+                self.show_error(safe_error(exc))
+            return True
+        def eventFilter(self, widget, event):
+            if widget in self._headers and event.type()==QC.QEvent.Type.MouseButtonPress and self.draft is not None:
+                return not self.finish(focus=False)
+            return False
+        def input_event(self, widget, event):
+            kind = event.type()
+            if kind in (QC.QEvent.Type.KeyPress, QC.QEvent.Type.ShortcutOverride):
+                return self.handle_key(event, widget)
+            if kind == QC.QEvent.Type.FocusIn:
+                if widget is self._workspace.formula:
+                    self.begin_formula()
+                elif self.owns_editor(widget):
+                    self._active_input = widget
+            elif kind == QC.QEvent.Type.FocusOut and self.draft is not None:
+                self.defer_focus_settle()
+            return False
+        def focus_changed(self, old, new):
+            if self.draft is not None and not self._busy:
+                self.defer_focus_settle()
+        def defer_focus_settle(self):
+            self._focus_ticket += 1
+            ticket = self._focus_ticket
+            token = self.draft.token if self.draft else ''
+            QC.QTimer.singleShot(0, self, lambda: self.settle_focus(token, ticket))
+        def settle_focus(self, token, ticket):
+            if ticket != self._focus_ticket or self._busy or not self.draft or self.draft.token != token:
+                return
+            focus = QW.QApplication.focusWidget()
+            if focus is None or QW.QApplication.activePopupWidget() is not None:
+                return
+            if focus is self._workspace.formula or focus is self._editor:
+                return
+            if QW.QApplication.activeModalWidget() is not None:
+                return
+            self.finish(focus=False)
+        def restore_edit_focus(self):
+            # Only restoring a rejected draft needs a queued focus operation;
+            # successful commit/navigation itself is synchronous and performed once.
+            d = self.draft
+            if d is None:
+                return
+            token = d.token
+            def restore():
+                if self.draft is None or self.draft.token != token or not self._workspace.isVisible():
+                    return
+                if self.context_valid() and self._session.structure_epoch==self.draft.structure_epoch and self._edit_selection is not None:
+                    current=self._workspace.grid.currentIndex()
+                    if (current.row(),current.column())!=(self.draft.row,self.draft.column):self._workspace.restore_selection(self._edit_selection)
+                widget = self._active_input if self.live(self._active_input) else self._workspace.formula
+                widget.setFocus(Qt.FocusReason.OtherFocusReason)
+            QC.QTimer.singleShot(0, self, restore)
+
     class SheetDelegate(QW.QStyledItemDelegate):
         def __init__(self,view):
             super().__init__(view);self._grid=view
@@ -7950,7 +8495,7 @@ def native_ui_types():
                 opt.palette.setColor(QG.QPalette.ColorGroup.All,role,bg)
             opt.backgroundBrush=QG.QBrush(bg)
         def createEditor(self,parent,option,index):
-            editor=QW.QLineEdit(parent);editor.setFrame(False);editor.setObjectName('cellEditor')
+            editor=SheetInput(parent);editor.setFrame(False);editor.setObjectName('cellEditor')
             editor.setFont(index.data(Qt.ItemDataRole.FontRole) or option.font)
             foreground,background=index.model().display_colors(index,current=True)
             selected_fg,selected_bg=index.model().display_colors(index,selected=True,current=False)
@@ -7958,8 +8503,23 @@ def native_ui_types():
                 '; border-radius: 0; color: '+foreground+'; background-color: '+background+
                 '; selection-color: '+selected_fg+'; selection-background-color: '+selected_bg+'; }')
             return editor
-        def setEditorData(self,editor,index):editor.setText(index.data(Qt.ItemDataRole.EditRole) or '');editor.selectAll()
-        def setModelData(self,editor,model,index):model.setData(index,editor.text(),Qt.ItemDataRole.EditRole)
+        def setEditorData(self,editor,index):
+            self._grid._workspace.interaction.attach_editor(editor,index,self._grid)
+        def setModelData(self,editor,model,index):
+            self._grid._workspace.interaction.native_commit(editor)
+        def destroyEditor(self,editor,index):
+            self._grid._workspace.interaction.editor_destroyed(editor)
+            super().destroyEditor(editor,index)
+        def eventFilter(self,editor,event):
+            if isinstance(editor,SheetInput):
+                controller=self._grid._workspace.interaction
+                if event.type() in (QC.QEvent.Type.KeyPress,QC.QEvent.Type.ShortcutOverride):
+                    # Returning False delivers IME/completer keys to the editor,
+                    # not to QStyledItemDelegate's second commit handler.
+                    if controller.key_action(event):return controller.handle_key(event,editor)
+                controller.input_event(editor,event)
+                if event.type()==QC.QEvent.Type.FocusOut:return False
+            return super().eventFilter(editor,event)
         def updateEditorGeometry(self,editor,option,index):editor.setGeometry(option.rect.adjusted(0,0,-1,-1))
         def paint(self,painter,option,index):
             opt=QW.QStyleOptionViewItem(option);self.initStyleOption(opt,index)
@@ -7990,6 +8550,7 @@ def native_ui_types():
     class SheetGrid(QW.QTableView):
         def __init__(self,workspace):
             super().__init__(workspace);self._workspace=workspace;self._fill_start=None;self._fill_target=None;self._auxiliary=False
+            self._hidden_rows=set();self._hidden_columns=set();self._visibility_revision=0
             self.setObjectName('sheetGrid');self.setFrameShape(QW.QFrame.Shape.NoFrame)
             self.setShowGrid(True);self.setWordWrap(False);self.setAlternatingRowColors(False)
             self.setSelectionMode(QW.QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -8006,6 +8567,27 @@ def native_ui_types():
                 head.customContextMenuRequested.connect(lambda point,h=head,a=axis:self._workspace.header_menu(h,a,point))
             self.verticalScrollBar().valueChanged.connect(self._grow)
             self.horizontalScrollBar().valueChanged.connect(self._grow)
+        def setRowHidden(self,row,hide):
+            before=row in self._hidden_rows
+            if hide:self._hidden_rows.add(row)
+            else:self._hidden_rows.discard(row)
+            if before!=bool(hide):self._visibility_revision+=1
+            super().setRowHidden(row,hide)
+        def setColumnHidden(self,column,hide):
+            before=column in self._hidden_columns
+            if hide:self._hidden_columns.add(column)
+            else:self._hidden_columns.discard(column)
+            if before!=bool(hide):self._visibility_revision+=1
+            super().setColumnHidden(column,hide)
+        def event(self,event):
+            controller=getattr(getattr(self,'_workspace',None),'interaction',None)
+            if controller is not None and event.type() in (QC.QEvent.Type.ShortcutOverride,QC.QEvent.Type.KeyPress):
+                if controller.handle_key(event,self):return True
+            return super().event(event)
+        def closeEditor(self,editor,hint):
+            controller=getattr(getattr(self,'_workspace',None),'interaction',None)
+            if controller is not None and not controller.native_close(editor,hint):return
+            super().closeEditor(editor,hint)
         def _grow(self,*_):
             if self._auxiliary:return
             model=self.model()
@@ -8158,6 +8740,8 @@ def native_ui_types():
                     if not rect.isEmpty():painter.fillRect(rect,ui_color('accent'))
             finally:painter.end()
         def mousePressEvent(self,event):
+            if not self._workspace.commit_active_editor():
+                event.accept();return
             if event.button()==Qt.MouseButton.LeftButton and self._handle_rect().contains(event.position().toPoint()):
                 self._fill_start=self._workspace.selected_rect();self._fill_target=None;event.accept();return
             self._workspace.anchor_index=None;super().mousePressEvent(event)
@@ -8204,6 +8788,10 @@ def native_ui_types():
             for view in (self.top,self.corner):view.verticalScrollBar().valueChanged.connect(lambda value,v=view:v.verticalScrollBar().setValue(0) if value else None)
             for view in (self.left,self.corner):view.horizontalScrollBar().valueChanged.connect(lambda value,v=view:v.horizontalScrollBar().setValue(0) if value else None)
             self.configure((0,0))
+        def view_for(self,row,column):
+            fr,fc=self.frozen
+            if row<fr:return self.corner if column<fc else self.top
+            return self.left if column<fc else self.grid
         def column_resized(self,origin,index,size):
             if self._syncing:return
             self._syncing=True
@@ -8295,16 +8883,17 @@ def native_ui_types():
         """
         def __init__(self,window):
             super().__init__(window);self._host_window=window;self.session=None;self.sheet_id='';self.anchor_index=None
-            self._loading=False;self._refresh_queued=False;self._cut=None;self._view_states={};self._filters={};self._filter_states={};self._hidden_filter_rows=set();self._cancelled=False
+            self._loading=False;self._refresh_queued=False;self._refresh_deferred=False;self._pending_reset=False;self._cut=None;self._view_states={};self._filters={};self._filter_states={};self._hidden_filter_rows=set();self._cancelled=False
             self.setObjectName('sheetWorkspace');layout=QW.QVBoxLayout(self);layout.setContentsMargins(0,0,0,0);layout.setSpacing(0)
             formula=QW.QFrame();formula.setObjectName('formulaBar');row=QW.QHBoxLayout(formula);row.setContentsMargins(12,5,12,5);row.setSpacing(8)
             self.address=QW.QLineEdit('A1');self.address.setObjectName('cellAddress');self.address.setFixedWidth(105);self.address.setAccessibleName('Adres komórki lub zakresu');self.address.setToolTip('Przejdź do komórki lub zaznacz zakres, np. A1:C20')
             self.address.returnPressed.connect(lambda:self.safe(self.navigate_address));row.addWidget(self.address)
             fx=label('ƒx',True);fx.setObjectName('formulaMark');row.addWidget(fx)
-            self.formula=QW.QLineEdit();self.formula.setObjectName('formulaInput');self.formula.setPlaceholderText('Wartość lub formuła, np. =SUM(A2:A20)');self.formula.setAccessibleName('Pełna zawartość lub formuła aktywnej komórki')
-            self.formula.returnPressed.connect(lambda:self.safe(self.commit_formula));self.formula.installEventFilter(self);row.addWidget(self.formula,1)
+            self.formula=SheetInput();self.formula.setObjectName('formulaInput');self.formula.setPlaceholderText('Wartość lub formuła, np. =SUM(A2:A20)');self.formula.setAccessibleName('Pełna zawartość lub formuła aktywnej komórki')
+            self.formula.installEventFilter(self);row.addWidget(self.formula,1)
             self.formula_more=icon_button('edit','Edytuj pełny tekst komórki',lambda:self.safe(self.edit_full_text));row.addWidget(self.formula_more);layout.addWidget(formula)
             self.notice=label('',True,True);self.notice.setObjectName('sheetNotice');self.notice.hide();layout.addWidget(self.notice)
+            self.edit_error=label('',False,True);self.edit_error.setObjectName('error');self.edit_error.setAccessibleName('Błąd zapisu komórki');self.edit_error.hide();layout.addWidget(self.edit_error)
             self.model=SheetModel(self);self.model.editFailed.connect(lambda text:self._host_window.report(text));self.views=SheetViews(self,self.model);self.grid=self.views.grid;layout.addWidget(self.views,1)
             footer=QW.QFrame();footer.setObjectName('sheetFooter');bottom=QW.QHBoxLayout(footer);bottom.setContentsMargins(8,3,10,3);bottom.setSpacing(6)
             self.book_button=QW.QToolButton();self.book_button.setObjectName('sheetBookButton');self.book_button.setIcon(ui_icon('folder'));self.book_button.setToolTip('Skoroszyty w projekcie');self.book_button.clicked.connect(self.book_menu);bottom.addWidget(self.book_button)
@@ -8323,10 +8912,12 @@ def native_ui_types():
             self.grid.verticalScrollBar().valueChanged.connect(lambda _:self._geometry_timer.start())
             self.model.rowsInserted.connect(lambda *_:self._geometry_timer.start())
             self.model.columnsInserted.connect(lambda *_:self._geometry_timer.start())
+            self.interaction=SheetInteraction(self)
+            self.formula.textEdited.connect(lambda text:self.interaction.text_edited(self.formula,text))
         def safe(self,fn):return self._host_window.guard(fn)
         def eventFilter(self,obj,event):
-            if obj is self.formula and event.type()==QC.QEvent.Type.KeyPress and event.key()==Qt.Key.Key_Escape:
-                self.selection_changed();self.grid.setFocus();return True
+            if obj is self.formula and hasattr(self,'interaction'):
+                return self.interaction.input_event(obj,event)
             return False
         def active_sheet(self):return sheet_find(self.session.book,self.sheet_id)
         def register_book(self):
@@ -8335,6 +8926,9 @@ def native_ui_types():
             host.service.document['active_workpad']=book['id']
         def document_changed(self):
             self.register_book();self._recovery_timer.start()
+            change=self.session.last_change
+            if change.kind=='cells':self.model.cells_changed(change)
+            else:self._pending_reset=True
             if not self._refresh_queued:
                 self._refresh_queued=True;QC.QTimer.singleShot(0,self.refresh_document)
         def flush_recovery(self):
@@ -8342,6 +8936,8 @@ def native_ui_types():
             try:self._host_window.service.checkpoint()
             except Exception as exc:self._host_window.statusBar().showMessage('Nie zapisano kopii roboczej: '+safe_error(exc),12000)
         def bind(self,session,sheet_id=None):
+            if not self.commit_active_editor():return False
+            self._pending_reset=False
             if self.session:self.save_view_state()
             if self.session is not None and self.session is not session:self.session.changed=lambda:None
             self.session=session;self.session.changed=self.document_changed
@@ -8354,6 +8950,7 @@ def native_ui_types():
                 self.model.set_book(session,self.sheet_id);self.sync_tabs();self.apply_dimensions();self.restore_view_state()
             finally:self._loading=False
             self.apply_filters();self.selection_changed();self._geometry_timer.start();self.update_notice()
+            return True
         def sync_tabs(self):
             self.sheet_tabs.blockSignals(True)
             try:
@@ -8376,21 +8973,39 @@ def native_ui_types():
         def refresh_document(self):
             self._refresh_queued=False
             if not self.session or self._host_window.closing:return
-            valid=any(s['id']==self.sheet_id for s in self.session.book['sheets'])
-            if not valid:self.sheet_id=self.session.book['active_sheet']
-            v,h=self.grid.verticalScrollBar().value(),self.grid.horizontalScrollBar().value()
-            current=self.grid.currentIndex();row=max(0,current.row());col=max(0,current.column());rect=None
-            try:rect=self.selected_rect()
-            except UserError:pass
-            self._loading=True
-            try:
-                self.model.set_book(self.session,self.sheet_id);self.sync_tabs();self.apply_dimensions();self.model.ensure_cell(row,col)
-                if rect:self.select_rect(rect)
-                else:self.grid.setCurrentIndex(self.model.index(row,col))
-                if self._filters:self.apply_filters()
-                self.grid.verticalScrollBar().setValue(v);self.grid.horizontalScrollBar().setValue(h)
-            finally:self._loading=False
-            self.selection_changed();self._geometry_timer.start();self._host_window.refresh_navigation();self._host_window.update_actions();self.update_notice()
+            if self.interaction.draft is not None:
+                self._refresh_deferred=True;return
+            if self._pending_reset:
+                self._pending_reset=False
+                valid=any(sh['id']==self.sheet_id for sh in self.session.book['sheets'])
+                if not valid:self.sheet_id=self.session.book['active_sheet']
+                state=self.capture_selection()
+                v,h=self.grid.verticalScrollBar().value(),self.grid.horizontalScrollBar().value()
+                self._loading=True
+                try:
+                    self.model.set_book(self.session,self.sheet_id);self.sync_tabs();self.apply_dimensions()
+                    self.restore_selection(state)
+                    self.grid.verticalScrollBar().setValue(v);self.grid.horizontalScrollBar().setValue(h)
+                finally:self._loading=False
+            if self._filters:self.apply_filters()
+            self.selection_changed();self._geometry_timer.start()
+            self._host_window.refresh_navigation();self._host_window.update_actions();self.update_notice()
+        def capture_selection(self):
+            current=self.grid.currentIndex()
+            ranges=tuple((a.top(),a.left(),a.bottom(),a.right()) for a in self.grid.selectionModel().selection())
+            return (max(0,current.row()),max(0,current.column()),ranges)
+        def restore_selection(self,state):
+            row,col,ranges=state
+            row=min(SHEET_MAX_ROWS-1,max(0,row));col=min(SHEET_MAX_COLS-1,max(0,col))
+            selection=QC.QItemSelection()
+            for r,c,er,ec in ranges:
+                if 0<=r<=er<SHEET_MAX_ROWS and 0<=c<=ec<SHEET_MAX_COLS:
+                    self.model.ensure_cell(er,ec)
+                    selection.merge(QC.QItemSelection(self.model.index(r,c),self.model.index(er,ec)),QC.QItemSelectionModel.SelectionFlag.Select)
+            self.model.ensure_cell(row,col)
+            if not selection:selection.select(self.model.index(row,col),self.model.index(row,col))
+            self.grid.selectionModel().select(selection,QC.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            self.grid.selectionModel().setCurrentIndex(self.model.index(row,col),QC.QItemSelectionModel.SelectionFlag.NoUpdate)
         def apply_dimensions(self):
             if not self.session:return
             self._loading=True;self.views._syncing=True
@@ -8466,8 +9081,9 @@ def native_ui_types():
             if not index.isValid():index=self.model.index(0,0);self.grid.setCurrentIndex(index)
             try:self.address.setText(sheet_range_name(self.selected_rect()))
             except UserError:self.address.setText(sheet_address(index.row(),index.column()))
-            editing_target=getattr(self,'_formula_target',None)
-            if not self.formula.hasFocus() or editing_target!=(self.sheet_id,index.row(),index.column()):
+            if self.interaction.draft is not None:
+                self.interaction.sync_text()
+            else:
                 self.formula.setText(self.model.data(index,Qt.ItemDataRole.EditRole) or '');self.formula.setCursorPosition(0)
             self._formula_target=(self.sheet_id,index.row(),index.column())
             self.formula.setToolTip(self.model.data(index,Qt.ItemDataRole.ToolTipRole) or '')
@@ -8486,29 +9102,32 @@ def native_ui_types():
             if numbers:text+='   Suma: '+sheet_display(sum(numbers,Decimal(0)))+'   Średnia: '+sheet_display(sum(numbers,Decimal(0))/len(numbers))
             self.summary.setText(text);self.summary.setToolTip(text)
         def navigate_address(self):
-            rect=sheet_range(self.address.text());self.select_rect(rect);self.grid.scrollTo(self.model.index(rect[0],rect[1]));self.grid.setFocus()
+            text=self.address.text();rect=sheet_range(text)
+            if not self.commit_active_editor():return
+            self.select_rect(rect);self.interaction.focus_cell(rect[:2])
         def commit_formula(self):
-            if not self.session:return
-            index=self.grid.currentIndex();self.model.setData(index,self.formula.text());self.grid.setFocus()
+            return self.interaction.from_formula(focus=False)
         def commit_active_editor(self):
-            focus=QW.QApplication.focusWidget()
-            if focus is self.formula and self.session:self.commit_formula()
-            elif isinstance(focus,QW.QLineEdit) and focus.objectName()=='cellEditor':
-                for view in self.views.views:
-                    if view.isAncestorOf(focus):
-                        view.itemDelegate().commitData.emit(focus);view.itemDelegate().closeEditor.emit(focus,QW.QAbstractItemDelegate.EndEditHint.NoHint);break
+            return self.interaction.finish(focus=False) if hasattr(self,'interaction') else True
         def save_view_state(self):
             if not self.session:return
-            index=self.grid.currentIndex();self._view_states[(self.session.book['id'],self.sheet_id)]=(max(0,index.row()),max(0,index.column()),self.grid.verticalScrollBar().value(),self.grid.horizontalScrollBar().value())
+            self._view_states[(self.session.book['id'],self.sheet_id)]=(self.capture_selection(),self.grid.verticalScrollBar().value(),self.grid.horizontalScrollBar().value())
         def restore_view_state(self):
-            row,col,v,h=self._view_states.get((self.session.book['id'],self.sheet_id),(0,0,0,0));self.model.ensure_cell(row,col);self.grid.setCurrentIndex(self.model.index(row,col));self.grid.verticalScrollBar().setValue(v);self.grid.horizontalScrollBar().setValue(h)
+            state,v,h=self._view_states.get((self.session.book['id'],self.sheet_id),((0,0,()),0,0))
+            self.restore_selection(state);self.grid.verticalScrollBar().setValue(v);self.grid.horizontalScrollBar().setValue(h)
         def tab_changed(self,index):
             if self._loading or not self.session or index<0:return
             sid=self.sheet_tabs.tabData(index)
             if sid==self.sheet_id:return
-            self.commit_active_editor();self.save_view_state();self.bind(self.session,sid);self.grid.setFocus()
+            if not self.commit_active_editor():
+                blocker=QC.QSignalBlocker(self.sheet_tabs)
+                old=next((i for i in range(self.sheet_tabs.count()) if self.sheet_tabs.tabData(i)==self.sheet_id),0)
+                self.sheet_tabs.setCurrentIndex(old);del blocker
+                return
+            self.save_view_state();self.bind(self.session,sid);self.interaction.focus_cell()
         def tabs_moved(self,*_):
             if self._loading or not self.session:return
+            if not self.commit_active_editor():self.sync_tabs();return
             ids=[self.sheet_tabs.tabData(i) for i in range(self.sheet_tabs.count())]
             def mutate(book):
                 visible={s['id']:s for s in book['sheets']};book['sheets']=[visible[i] for i in ids]+[s for s in book['sheets'] if s['hidden']]
@@ -8517,12 +9136,15 @@ def native_ui_types():
             index=self.sheet_tabs.currentIndex()+delta
             if 0<=index<self.sheet_tabs.count():self.sheet_tabs.setCurrentIndex(index)
         def add_sheet(self):
+            if not self.commit_active_editor():return
             sid=self.session.add_sheet();self.bind(self.session,sid);self.grid.setFocus()
         def rename_sheet(self,index=None):
+            if not self.commit_active_editor():return
             sid=self.sheet_tabs.tabData(index) if index is not None and index>=0 else self.sheet_id
             sh=sheet_find(self.session.book,sid);name,ok=QW.QInputDialog.getText(self,'Nazwa arkusza','Nazwa:',QW.QLineEdit.EchoMode.Normal,sh['name'])
             if ok:self.session.rename_sheet(sid,name)
         def tab_menu(self,point):
+            if not self.commit_active_editor():return
             index=self.sheet_tabs.tabAt(point)
             if index<0:return
             self.sheet_tabs.setCurrentIndex(index);menu=QW.QMenu(self)
@@ -8531,9 +9153,11 @@ def native_ui_types():
             menu.addAction('Usuń arkusz…',lambda:self.safe(self.delete_sheet))
             menu.addSeparator();menu.addAction('Dodaj arkusz',lambda:self.safe(self.add_sheet));menu.exec(self.sheet_tabs.mapToGlobal(point))
         def delete_sheet(self):
+            if not self.commit_active_editor():return
             if confirm(self,'Usuń arkusz','Usunąć „'+self.active_sheet()['name']+'”? Operację można cofnąć; oryginalny XLSX nie będzie zmieniony.'):
                 self.session.remove_sheet(self.sheet_id);self.bind(self.session,self.session.book['active_sheet'])
         def book_menu(self):
+            if not self.commit_active_editor():return
             menu=QW.QMenu(self)
             for book in self._host_window.service.document.get('workpads',[]):
                 action=menu.addAction(book['title']);action.setCheckable(True);action.setChecked(self.session is not None and book['id']==self.session.book['id'])
@@ -8553,6 +9177,7 @@ def native_ui_types():
             self.zoom_text.setText(str(value)+'%')
             if self.session:self.apply_dimensions();self._geometry_timer.start();self.grid.viewport().update()
         def copy_cells(self,cut=False):
+            if not self.commit_active_editor():return
             rect=self.selected_rect()
             if sheet_rect_count(rect)>SHEET_MAX_PATCH:raise UserError('Kopiuj najwyżej 100 000 komórek naraz.')
             sh=self.active_sheet();matrix=[];cells=[]
@@ -8577,6 +9202,7 @@ def native_ui_types():
             mime.setData('application/x-pivot-cells',QC.QByteArray(raw));QW.QApplication.clipboard().setMimeData(mime)
             self._cut=payload if cut else None;self._host_window.statusBar().showMessage('Wycięcie nastąpi po wklejeniu.' if cut else 'Skopiowano '+sheet_range_name(rect),3500)
         def paste_cells(self,values_only=False):
+            if not self.commit_active_editor():return
             if self._filters:raise UserError('Wyłącz filtr przed wklejaniem zakresu. Nie zmieniono ukrytych wierszy.')
             mime=QW.QApplication.clipboard().mimeData();rect=self.selected_rect();r0,c0=rect[:2];sh=self.active_sheet();patch={};payload=None
             if mime.hasFormat('application/x-pivot-cells'):
@@ -8628,11 +9254,14 @@ def native_ui_types():
             else:self.session.apply_cells(self.sheet_id,patch,'Wklejanie')
             self.model.ensure_cell(r0+h-1,c0+w-1);self.select_rect((r0,c0,r0+h-1,c0+w-1));self.grid.setFocus()
         def clear_selection(self):
+            if not self.commit_active_editor():return
             if self._filters:raise UserError('Wyłącz filtr przed zbiorczym usuwaniem wartości.')
             self.session.clear_range(self.sheet_id,self.selected_rect())
         def toggle_format(self,key):
+            if not self.commit_active_editor():return
             style=self.model.cell_style(self.grid.currentIndex());self.session.format_range(self.sheet_id,self.selected_rect(),{key:not style.get(key,False)})
         def format_dialog(self):
+            if not self.commit_active_editor():return
             dialog=SheetFormatDialog(self)
             try:
                 if dialog.exec()==QW.QDialog.DialogCode.Accepted:self.session.format_range(self.sheet_id,self.selected_rect(),dialog.value)
@@ -8650,11 +9279,13 @@ def native_ui_types():
             menu.addSeparator();menu.addAction('Wszystkie ustawienia…',lambda:self.safe(self.format_dialog))
             widget=button or self.formula_more;menu.exec(widget.mapToGlobal(QC.QPoint(0,widget.height())))
         def cell_menu(self,point):
+            if not self.commit_active_editor():return
             menu=QW.QMenu(self)
             for title,fn in [('Kopiuj\tCtrl+C',lambda:self.copy_cells(False)),('Wytnij\tCtrl+X',lambda:self.copy_cells(True)),('Wklej\tCtrl+V',self.paste_cells),('Wklej wartości\tCtrl+Shift+V',lambda:self.paste_cells(True)),('Wyczyść zawartość\tDelete',self.clear_selection)]:menu.addAction(title,lambda checked=False,f=fn:self.safe(f))
             menu.addSeparator();menu.addAction('Edytuj pełną treść…',lambda:self.safe(self.edit_full_text));menu.addAction('Format komórek…',lambda:self.safe(self.format_dialog));menu.addAction('Dopasuj kolumny',lambda:self.safe(self.fit_columns))
             menu.addSeparator();menu.addAction('Tabela przestawna z zakresu…',lambda:self.safe(self.make_pivot));menu.addAction('Wykres z zakresu…',lambda:self.safe(self.make_chart));menu.exec(point)
         def header_menu(self,header,axis,point):
+            if not self.commit_active_editor():return
             section=header.logicalIndexAt(point)
             if section<0:return
             if axis=='row':self.grid.selectRow(section)
@@ -8665,6 +9296,7 @@ def native_ui_types():
             if axis=='column':menu.addAction('Dopasuj szerokość',lambda:self.safe(lambda:self.fit_columns([section])))
             menu.addSeparator();menu.addAction('Kopiuj zawartość',lambda:self.safe(lambda:self.copy_cells(False)));menu.exec(header.mapToGlobal(point))
         def fill_selection(self,direction):
+            if not self.commit_active_editor():return
             if self._filters:raise UserError('Wyłącz filtr przed wypełnieniem.')
             rect=self.selected_rect();r,c,er,ec=rect
             source=(r,c,r,ec) if direction=='down' else (r,c,er,c)
@@ -8680,6 +9312,7 @@ def native_ui_types():
                 self.grid.setColumnWidth(col,math.ceil(width))
             self._geometry_timer.start()
         def edit_full_text(self):
+            if not self.commit_active_editor():return
             index=self.grid.currentIndex();dialog=FormDialog('Komórka '+sheet_address(index.row(),index.column()),self)
             editor=QW.QPlainTextEdit();editor.setPlainText(self.model.data(index,Qt.ItemDataRole.EditRole) or '');editor.setMinimumHeight(220);dialog.add_widget(editor)
             dialog.read=lambda:editor.toPlainText();limited_dialog_size(dialog,680,390)
@@ -8687,6 +9320,7 @@ def native_ui_types():
                 if dialog.exec()==QW.QDialog.DialogCode.Accepted:self.model.setData(index,dialog.value)
             finally:dialog.deleteLater()
         def find_text(self):
+            if not self.commit_active_editor():return
             text,ok=QW.QInputDialog.getText(self,'Znajdź','Szukaj w aktywnym arkuszu:')
             if not ok or not text:return
             current=self.grid.currentIndex();after=(current.row(),current.column());matches=[]
@@ -8696,6 +9330,7 @@ def native_ui_types():
             if not matches:self._host_window.statusBar().showMessage('Nie znaleziono „'+text+'”.',6000);return
             matches.sort();position=next((p for p in matches if p>after),matches[0]);self.select_rect((*position,*position));self.grid.scrollTo(self.model.index(*position));self.grid.setFocus()
         def replace_text(self):
+            if not self.commit_active_editor():return
             dialog=FormDialog('Znajdź i zamień tekst',self);old=QW.QLineEdit();new=QW.QLineEdit();dialog.form.addRow('Znajdź',old);dialog.form.addRow('Zamień na',new)
             dialog.add_widget(label('Aktywny arkusz. Zmieniane są tylko komórki tekstowe; liczby i formuły pozostają bez zmian.',True,True));dialog.read=lambda:(old.text(),new.text());limited_dialog_size(dialog,510,290)
             try:
@@ -8710,6 +9345,7 @@ def native_ui_types():
             if patch and confirm(self,'Zamień tekst',f'Zmienić {len(patch)} komórek? Operację można cofnąć.'):
                 self.session.apply_cells(self.sheet_id,patch,'Zamień tekst')
         def data_menu(self,button):
+            if not self.commit_active_editor():return
             menu=QW.QMenu(self)
             menu.addAction('Filtr w tej kolumnie…',lambda:self.safe(self.filter_column));menu.addAction('Wyczyść filtry',self.clear_filters)
             menu.addAction('Sortuj zakres rosnąco…',lambda:self.safe(lambda:self.sort_range(False)))
@@ -8723,6 +9359,7 @@ def native_ui_types():
             menu.addSeparator();menu.addAction('Połącz bazę…',self._host_window.add_source);menu.addAction('Dodaj plik…',self._host_window.import_data)
             menu.exec(button.mapToGlobal(QC.QPoint(0,button.height())))
         def set_freeze(self,rows,cols):
+            if not self.commit_active_editor():return
             self.session.checkpoint_command('Blokowanie okienek',lambda b:sheet_find(b,self.sheet_id).update(freeze=[rows,cols]))
         def filter_column(self):
             col=self.grid.currentIndex().column();text,ok=QW.QInputDialog.getText(self,'Filtr kolumny '+sheet_col_name(col),'Tekst zawiera (puste pole usuwa filtr):',QW.QLineEdit.EchoMode.Normal,self._filters.get(col,''))
@@ -8737,7 +9374,8 @@ def native_ui_types():
             # Undo only rows hidden by our prior filter. Frozen prefixes retain
             # their independent visibility rules.
             for row in self._hidden_filter_rows:
-                if row<self.model.rowCount():self.grid.setRowHidden(row,row<fr);self.views.left.setRowHidden(row,row<fr)
+                if row<self.model.rowCount():
+                    for view in self.views.views:view.setRowHidden(row,row<fr and view in (self.grid,self.views.left))
             hidden=set()
             if self._filters:
                 header=sheet_range(sh['filter'])[0] if sh['filter'] else self.used_rect()[0]
@@ -8746,11 +9384,14 @@ def native_ui_types():
                 for row in range(used[0],used[2]+1):
                     visible=row==header or all(text in sheet_display(self.session.calculator.cell(self.sheet_id,row,col)).casefold() for col,text in self._filters.items())
                     if not visible:
-                        hidden.add(row);self.grid.setRowHidden(row,True);self.views.left.setRowHidden(row,True)
+                        hidden.add(row)
+                        for view in self.views.views:view.setRowHidden(row,True)
             self._hidden_filter_rows=hidden
+            self.views._sizes()
             self.notice.setText('Filtr aktywny · numery wierszy zachowują adresy oryginału. Dane → Wyczyść filtry.');self.notice.setVisible(bool(self._filters))
         def clear_filters(self):self._filters={};self.apply_filters()
         def sort_range(self,reverse=False):
+            if not self.commit_active_editor():return
             if self._filters:raise UserError('Wyłącz filtr przed zmianą kolejności danych.')
             if any(cell.get('f') for sh in self.session.book['sheets'] for cell in sh['cells'].values()):raise UserError('Sortowanie danych w skoroszycie z formułami jest w tej wersji zablokowane, aby nie naruszyć odwołań. Filtry nie zmieniają adresów.')
             rect=self.selected_rect()
@@ -8769,7 +9410,8 @@ def native_ui_types():
                 for c,cell in enumerate(vals,c1):patch[sheet_address(row,c)]=cell
             self.session.apply_cells(self.sheet_id,patch,'Sortowanie danych')
         def make_pivot(self):
-            self.commit_active_editor();rect=self.selected_rect()
+            if not self.commit_active_editor():return
+            rect=self.selected_rect()
             if sheet_rect_count(rect)==1:rect=self.used_rect()
             if not confirm(self,'Tabela przestawna',f'Zakres {self.active_sheet()["name"]}!{sheet_range_name(rect)}. Pierwszy wiersz jest nagłówkiem.\nAnaliza otrzyma lokalną migawkę tych wartości; dalsze zmiany arkusza nie podmienią jej po cichu.'):return
             captured=clone(self.session.book);sid=self.sheet_id
@@ -8781,7 +9423,8 @@ def native_ui_types():
             if sheet_rect_count(rect)==1:rect=self.used_rect()
             if rect[3]<=rect[1]:raise UserError('Zaznacz kolumnę etykiet oraz kolumnę liczb.')
             if rect[2]-rect[0]>2000:raise UserError('Wybierz do 2000 wierszy dla wykresu.')
-            self.commit_active_editor();calc=self.session.calculator;items=[];c=rect[1]
+            if not self.commit_active_editor():return
+            calc=self.session.calculator;items=[];c=rect[1]
             for r in range(rect[0]+1,rect[2]+1):
                 label_=sheet_display(calc.cell(self.sheet_id,r,c));v=calc.cell(self.sheet_id,r,c+1)
                 if isinstance(v,SheetError):raise UserError('Popraw błąd formuły przed wykresem: '+sheet_address(r,c+1)+' '+v.code)
@@ -8794,7 +9437,8 @@ def native_ui_types():
             chart.setMinimumHeight(max(230,len(chart.items)*36+28));scroll=QW.QScrollArea();scroll.setWidgetResizable(True);scroll.setWidget(chart);layout.addWidget(scroll,1)
             layout.addWidget(label('Podgląd do 100 kategorii. Wykres nie jest osadzany w XLSX.',True,True));layout.addWidget(button('Zamknij',dialog.accept));limited_dialog_size(dialog,850,600);dialog.exec();dialog.deleteLater()
         def export_book(self):
-            self.commit_active_editor();book=clone(self.session.book)
+            if not self.commit_active_editor():return
+            book=clone(self.session.book)
             path,_=QW.QFileDialog.getSaveFileName(self,'Zapisz kopię skoroszytu XLSX',book['title']+'.xlsx','Skoroszyt Excel (*.xlsx)')
             if not path:return
             path=str(Path(path).with_suffix('.xlsx'));dest=Path(path).resolve()
@@ -9947,6 +10591,7 @@ def native_ui_types():
                 'rename':'edit','duplicate':'duplicate','delete_analysis':'trash','undo':'undo','redo':'redo','recover':'refresh','quit':'close'}.get(key,'info')
 
         def show_home(self):
+            if not self.sheet_workspace.commit_active_editor():return
             self.database_context=None
             self._sheet_mode=False
             self.browser_context=None;self.home_visible=True;self.welcome.refresh_recent();self.central_stack.setCurrentWidget(self.welcome);self.apply_responsive();animate_reveal(self.welcome.panel)
@@ -9964,7 +10609,8 @@ def native_ui_types():
         def open_database(self,source,obj=None,data=False):
             if self.project_busy or self.closing:return
             if self._sheet_mode and self.sheet_workspace.session:
-                self.sheet_workspace.commit_active_editor();self.sheet_workspace.save_view_state()
+                if not self.sheet_workspace.commit_active_editor():return
+                self.sheet_workspace.save_view_state()
             if not self.authorize(source):return
             self.database_context={'source_id':source['id']};self._sheet_mode=False;self.browser_context=None;self.home_visible=False
             self.database_explorer.open_source(source,obj,data);self.apply_responsive();self.update_actions()
@@ -10195,6 +10841,7 @@ def native_ui_types():
         def fields_key(self,analysis):
             source=self.service.source(analysis['dataset']['source_id']); return digest({'source':source,'dataset':analysis['dataset']})
         def activate(self,aid,load=False):
+            if hasattr(self,'sheet_workspace') and not self.sheet_workspace.commit_active_editor():return
             self.database_context=None
             self._sheet_mode=False
             self.browser_context=None
@@ -10640,7 +11287,7 @@ def native_ui_types():
             for jid in self.service.hub.running(): self.watcher.cancel(jid)
             self.statusBar().showMessage('Wysłano żądanie anulowania. Oczekiwanie na zakończenie operacji w sterowniku.',10000)
         def prompt_unsaved(self):
-            if hasattr(self,'sheet_workspace'):self.sheet_workspace.commit_active_editor()
+            if hasattr(self,'sheet_workspace') and not self.sheet_workspace.commit_active_editor():return False
             self.commit_title()
             if not self.service.dirty(): return True
             box=QW.QMessageBox(self); box.setWindowTitle('Niezapisany projekt'); box.setTextFormat(Qt.TextFormat.PlainText)
@@ -10652,7 +11299,7 @@ def native_ui_types():
             return False
         def save_project(self,as_new=False):
             if hasattr(self,'sheet_workspace'):
-                self.sheet_workspace.commit_active_editor()
+                if not self.sheet_workspace.commit_active_editor():return False
                 if self.sheet_workspace.session and not self.service.document.get('workpads') and self._sheet_mode:self.sheet_workspace.register_book()
             self.commit_title(); path='' if as_new else self.service.project_path
             if not path:
@@ -10778,8 +11425,9 @@ def native_ui_types():
             elif not self.analysis:self.show_sheet_book(sheet_new_book(),register=False)
 
         def show_sheet_book(self,book,sheet_id=None,register=False):
+            if self.project_busy or self.closing:return False
+            if not self.sheet_workspace.commit_active_editor():return False
             self.database_context=None
-            if self.project_busy or self.closing:return
             if len(self.service.document.get('workpads',[]))>=12 and register and not any(b['id']==book['id'] for b in self.service.document['workpads']):raise UserError('Projekt może zawierać do 12 skoroszytów roboczych.')
             if register:
                 candidate=dict(self.service.document,workpads=[*self.service.document.get('workpads',[])])
@@ -10803,10 +11451,12 @@ def native_ui_types():
 
         def new_sheet_book(self):
             if self.project_busy or self._file_intake_active:return
+            if not self.sheet_workspace.commit_active_editor():return
             self.show_sheet_book(sheet_new_book('Skoroszyt '+str(len(self.service.document.get('workpads',[]))+1)),register=True)
             self.service.checkpoint()
 
         def open_sheet_file(self,path):
+            if not self.sheet_workspace.commit_active_editor():return False
             original=str(Path(path).expanduser().resolve())
             existing=next((b for b in self.service.document.get('workpads',[]) if b.get('origin')==original),None)
             if existing:
@@ -10970,7 +11620,7 @@ def native_ui_types():
         if not hasattr(app,'_pivot_wheel_guard'):
             app._pivot_wheel_guard=WheelGuard(app);app.installEventFilter(app._pivot_wheel_guard)
 
-    _NATIVE_TYPES={'TechnologiesDialog':TechnologiesDialog,'TechnologyTableModel':TechnologyTableModel,'DatabaseJoinPage':DatabaseJoinPage,'DatabaseJoinDialog':DatabaseJoinDialog,'DatabaseNode':DatabaseNode,'DatabaseExplorer':DatabaseExplorer,'DatabaseDataModel':DatabaseDataModel,'DatabaseRecordsModel':DatabaseRecordsModel,'DatabaseGraph':DatabaseGraph,'DatabaseTaskQueue':DatabaseTaskQueue,'SheetModel':SheetModel,'SheetGrid':SheetGrid,'SheetWorkspace':SheetWorkspace,'SheetViews':SheetViews,'SheetFormatDialog':SheetFormatDialog,'MainWindow':MainWindow,'ResultTableModel':ResultTableModel,'ResultGrid':ResultGrid,'ResultPane':ResultPane,
+    _NATIVE_TYPES={'SheetInteraction':SheetInteraction,'SheetInput':SheetInput,'TechnologiesDialog':TechnologiesDialog,'TechnologyTableModel':TechnologyTableModel,'DatabaseJoinPage':DatabaseJoinPage,'DatabaseJoinDialog':DatabaseJoinDialog,'DatabaseNode':DatabaseNode,'DatabaseExplorer':DatabaseExplorer,'DatabaseDataModel':DatabaseDataModel,'DatabaseRecordsModel':DatabaseRecordsModel,'DatabaseGraph':DatabaseGraph,'DatabaseTaskQueue':DatabaseTaskQueue,'SheetModel':SheetModel,'SheetGrid':SheetGrid,'SheetWorkspace':SheetWorkspace,'SheetViews':SheetViews,'SheetFormatDialog':SheetFormatDialog,'MainWindow':MainWindow,'ResultTableModel':ResultTableModel,'ResultGrid':ResultGrid,'ResultPane':ResultPane,
                    'PivotBuilder':PivotBuilder,'SourceDialog':SourceDialog,'FilterDialog':FilterDialog,'MeasureDialog':MeasureDialog,
                    'DimensionDialog':DimensionDialog,'ImportDialog':ImportDialog,'WorkbookDialog':WorkbookDialog,'SourceBrowser':SourceBrowser,'DatasetDialog':DatasetDialog,
                    'SettingsDialog':SettingsDialog,'FormDialog':FormDialog,'TitleBar':TitleBar,'WelcomePage':WelcomePage,'WrappedHeading':WrappedHeading,
@@ -12410,6 +13060,159 @@ def technology_license_test_suite():
     return unittest.defaultTestLoader.loadTestsFromTestCase(TechnologyLicenseTests)
 
 
+def sheet_interaction_test_suite():
+    """Pure rules and document transactions; native event delivery is tested separately."""
+    import unittest
+    class SheetInteractionTests(unittest.TestCase):
+        def setUp(self):
+            self.session=SheetSession(sheet_new_book())
+            self.sid=self.session.book['sheets'][0]['id']
+        def draft(self,text='',row=7,col=2):
+            d=sheet_begin_edit(self.session,self.sid,row,col);d.text=text;return d
+        def move(self,cell=(7,2),direction='down',**kwargs):
+            return sheet_next_cell(cell,direction,**kwargs)
+        def test_empty_c8_enter_is_c9(self):
+            before=clone(self.session.book)
+            self.assertEqual(self.move(),(8,2));self.assertEqual(before,self.session.book)
+            self.assertFalse(self.session.history)
+        def test_shift_enter_and_tabs(self):
+            self.assertEqual(self.move(direction='up'),(6,2))
+            self.assertEqual(self.move(direction='right'),(7,3))
+            self.assertEqual(self.move(direction='left'),(7,1))
+        def test_outer_boundaries_do_not_wrap(self):
+            self.assertEqual(self.move((0,0),'up'),(0,0));self.assertEqual(self.move((0,0),'left'),(0,0))
+            end=(SHEET_MAX_ROWS-1,SHEET_MAX_COLS-1)
+            self.assertEqual(self.move(end,'down'),end);self.assertEqual(self.move(end,'right'),end)
+        def test_motion_beyond_initial_virtual_extent(self):
+            self.assertEqual(self.move((999,51),'down'),(1000,51))
+            self.assertEqual(self.move((999,51),'right'),(999,52))
+        def sequence(self,direction,ranges,start,count,**kwargs):
+            result=[]
+            for _ in range(count):
+                start=self.move(start,direction,ranges=ranges,**kwargs);result.append(start)
+            return result
+        def test_enter_traverses_columns_inside_rectangle(self):
+            self.assertEqual(self.sequence('down',((7,2,9,3),),(7,2),6),[(8,2),(9,2),(7,3),(8,3),(9,3),(7,2)])
+        def test_tab_traverses_rows_inside_rectangle(self):
+            self.assertEqual(self.sequence('right',((7,2,9,3),),(7,2),6),[(7,3),(8,2),(8,3),(9,2),(9,3),(7,2)])
+        def test_reverse_range_navigation(self):
+            self.assertEqual(self.move((7,2),'up',ranges=((7,2,9,3),)),(9,3))
+            self.assertEqual(self.move((8,2),'left',ranges=((7,2,9,3),)),(7,3))
+        def test_disjoint_ranges_do_not_include_gap(self):
+            ranges=((0,0,1,0),(0,3,1,3))
+            self.assertEqual(self.sequence('down',ranges,(0,0),4),[(1,0),(0,3),(1,3),(0,0)])
+        def test_overlapping_ranges_are_not_visited_twice(self):
+            ranges=((0,0,2,0),(1,0,3,0))
+            self.assertEqual(self.sequence('down',ranges,(0,0),4),[(1,0),(2,0),(3,0),(0,0)])
+        def test_hidden_rows_and_columns(self):
+            rows=SheetHiddenAxis.from_sections([8,9,10]);cols=SheetHiddenAxis.from_sections([3,4])
+            self.assertEqual(self.move(hidden_rows=rows),(11,2))
+            self.assertEqual(self.move(direction='right',hidden_columns=cols),(7,5))
+            self.assertEqual(self.move((11,2),'up',hidden_rows=rows),(7,2))
+        def test_hidden_sections_inside_selection(self):
+            self.assertEqual(self.sequence('down',((0,0,3,2),),(0,0),4,hidden_rows=SheetHiddenAxis.from_sections([1,2]),hidden_columns=SheetHiddenAxis.from_sections([1])),[(3,0),(0,2),(3,2),(0,0)])
+        def test_all_other_rows_hidden_stays_in_selection(self):
+            self.assertEqual(self.move((0,0),ranges=((0,0,3,0),),hidden_rows=SheetHiddenAxis.from_sections([1,2,3])),(0,0))
+        def test_interval_jump_is_bounded(self):
+            hidden=SheetHiddenAxis(((8,SHEET_MAX_ROWS-2),))
+            self.assertEqual(self.move(hidden_rows=hidden),(SHEET_MAX_ROWS-1,2))
+        def test_axis_compacts_adjacent_hidden_sections(self):
+            self.assertEqual(SheetHiddenAxis.from_sections([3,2,1,7,7,8]).intervals,((1,3),(7,8)))
+        def test_merged_cell_is_one_stop(self):
+            span=((7,2,9,4),)
+            self.assertEqual(self.move(merges=span,ranges=span),(10,2))
+            self.assertEqual(self.move(direction='right',merges=span,ranges=span),(7,5))
+        def test_navigation_enters_merge_anchor(self):
+            self.assertEqual(self.move((6,3),merges=((7,2,9,4),)),(7,2))
+        def test_range_skips_covered_merge_cells(self):
+            ranges=((0,0,2,1),);merges=((0,0,1,1),)
+            self.assertEqual(self.sequence('down',ranges,(0,0),3,merges=merges),[(2,0),(2,1),(0,0)])
+        def test_huge_merge_does_not_enumerate_covered_cells(self):
+            span=((0,0,SHEET_MAX_ROWS-2,SHEET_MAX_COLS-1),)
+            self.assertEqual(self.move((0,0),ranges=((0,0,SHEET_MAX_ROWS-1,SHEET_MAX_COLS-1),),merges=span),(SHEET_MAX_ROWS-1,0))
+        def test_invalid_navigation_is_rejected(self):
+            with self.assertRaises(ValueError):self.move(direction='elsewhere')
+            with self.assertRaises(ValueError):self.move((-1,0))
+            with self.assertRaises(ValueError):self.move(ranges=((0,0,SHEET_MAX_ROWS,2),))
+        def test_random_ranges_match_small_enumerated_reference(self):
+            import random
+            rng=random.Random(721)
+            for _ in range(250):
+                ranges=[]
+                for unused in range(3):
+                    a,b=sorted(rng.sample(range(6),2));c,d=sorted(rng.sample(range(5),2));ranges.append((a,c,b,d))
+                hidden_r=set(rng.sample(range(6),2));hidden_c={rng.randrange(5)}
+                cells={(r,c) for a,b,d,e in ranges for r in range(a,d+1) for c in range(b,e+1) if r not in hidden_r and c not in hidden_c}
+                if len(cells)<2:continue
+                current=rng.choice(sorted(cells))
+                for direction in ('down','up','right','left'):
+                    key=(lambda cell:(cell[1],cell[0])) if direction in ('down','up') else (lambda cell:cell)
+                    ordered=sorted(cells,key=key);step=1 if direction in ('down','right') else -1
+                    expected=ordered[(ordered.index(current)+step)%len(ordered)]
+                    self.assertEqual(self.move(current,direction,ranges=tuple(ranges),hidden_rows=SheetHiddenAxis.from_sections(hidden_r),hidden_columns=SheetHiddenAxis.from_sections(hidden_c),max_rows=6,max_columns=5),expected)
+        def test_accepted_commit_creates_one_history_entry(self):
+            self.assertEqual(sheet_commit_edit(self.session,self.draft('123')),SheetCommitResult(True,True))
+            self.assertEqual(len(self.session.history),1)
+            self.assertEqual(sheet_raw(sheet_find(self.session.book,self.sid)['cells']['C8']),'123')
+        def test_unchanged_commit_preserves_document_and_history(self):
+            self.session.edit(self.sid,7,2,'123');before=clone(self.session.book);count=len(self.session.history)
+            self.assertEqual(sheet_commit_edit(self.session,self.draft('123')),SheetCommitResult(True))
+            self.assertEqual(self.session.book,before);self.assertEqual(len(self.session.history),count)
+        def test_empty_commit_is_not_dirty(self):
+            before=clone(self.session.book);self.assertEqual(sheet_commit_edit(self.session,self.draft()),SheetCommitResult(True))
+            self.assertEqual(self.session.book,before);self.assertFalse(self.session.history)
+        def test_commit_readonly_keeps_draft(self):
+            d=self.draft('abc');before=clone(self.session.book)
+            self.assertFalse(sheet_commit_edit(self.session,d,read_only=True).accepted)
+            self.assertEqual(d.text,'abc');self.assertEqual(self.session.book,before)
+        def test_draft_cannot_write_another_book(self):
+            d=self.draft('abc');other=SheetSession(sheet_new_book())
+            self.assertFalse(sheet_commit_edit(other,d).accepted);self.assertFalse(other.history)
+        def test_draft_detects_concurrent_cell_change(self):
+            d=self.draft('abc');self.session.edit(self.sid,7,2,'other')
+            self.assertFalse(sheet_commit_edit(self.session,d).accepted)
+            self.assertEqual(sheet_raw(sheet_find(self.session.book,self.sid)['cells']['C8']),'other')
+        def test_other_cell_change_does_not_reject_valid_draft(self):
+            d=self.draft('abc');self.session.edit(self.sid,0,0,'other')
+            self.assertTrue(sheet_commit_edit(self.session,d).accepted)
+        def test_structural_change_invalidates_pinned_target(self):
+            d=self.draft('abc');self.session.add_sheet()
+            self.assertFalse(sheet_commit_edit(self.session,d).accepted)
+            self.assertNotIn('C8',sheet_find(self.session.book,self.sid)['cells'])
+        def test_write_limit_failure_is_atomic(self):
+            d=self.draft('abc');before=clone(self.session.book);self.session.available_bytes=lambda:1
+            self.assertFalse(sheet_commit_edit(self.session,d).accepted)
+            self.assertEqual(before,self.session.book);self.assertFalse(self.session.history)
+        def test_calculation_error_is_a_stored_formula_not_failed_edit(self):
+            self.assertTrue(sheet_commit_edit(self.session,self.draft('=1/0')).accepted)
+            self.assertIsInstance(self.session.calculator.cell(self.sid,7,2),SheetError)
+        def test_unicode_commit_undo_redo(self):
+            d=self.draft('Zażółć gęślą jaźń');self.assertTrue(sheet_commit_edit(self.session,d).accepted)
+            self.session.undo();self.assertNotIn('C8',sheet_find(self.session.book,self.sid)['cells'])
+            self.session.redo();self.assertEqual(sheet_raw(sheet_find(self.session.book,self.sid)['cells']['C8']),d.text)
+        def test_cell_change_notifications_do_not_request_book_reset(self):
+            seen=[];self.session.changed=lambda:seen.append(self.session.last_change)
+            self.session.edit(self.sid,7,2,'1');self.session.undo();self.session.redo()
+            self.assertEqual([x.kind for x in seen],['cells']*3)
+            self.assertTrue(all(x.sheet_id==self.sid and x.addresses==('C8',) for x in seen))
+            self.assertEqual(self.session.structure_epoch,0)
+        def test_structure_notification_is_explicit(self):
+            self.session.add_sheet();self.assertEqual(self.session.last_change.kind,'book');self.assertEqual(self.session.structure_epoch,1)
+        def test_no_navigation_or_edit_token_is_persisted(self):
+            d=self.draft('abc');sheet_commit_edit(self.session,d)
+            self.assertNotIn(d.token,dumps(self.session.book));self.assertNotIn('structure_epoch',self.session.book)
+        def test_source_keeps_enter_scoped_and_blocks_failed_save(self):
+            source=Path(__file__).read_text(encoding='utf-8');tree=ast.parse(source)
+            grid=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='SheetGrid')
+            delegate=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='SheetDelegate')
+            self.assertTrue(any(isinstance(n,ast.FunctionDef) and n.name=='event' for n in grid.body))
+            self.assertTrue(any(isinstance(n,ast.FunctionDef) and n.name=='eventFilter' for n in delegate.body))
+            workspace=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='SheetWorkspace')
+            self.assertNotIn('self.formula.returnPressed.connect',ast.unparse(workspace))
+            self.assertIn('if not self.sheet_workspace.commit_active_editor():return False',source)
+    return unittest.defaultTestLoader.loadTestsFromTestCase(SheetInteractionTests)
+
+
 def self_test():
     """No optional packages and no external DB access. Run on the delivered file."""
     import unittest
@@ -12682,7 +13485,7 @@ def self_test():
                 for proc in processes:
                     with contextlib.suppress(subprocess.TimeoutExpired): proc.wait(timeout=5)
     print(f'{APP_NAME} {APP_VERSION} — testy lokalne; Python {platform.python_version()}, SQLite {sqlite3.sqlite_version}',flush=True)
-    suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(CoreTests),gui_contract_test_suite(),file_intake_test_suite(),workbook_test_suite(),sheet_test_suite(),sheet_selection_test_suite(),sheet_contrast_test_suite(),database_explorer_test_suite(),database_join_test_suite(),technology_license_test_suite()])
+    suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(CoreTests),gui_contract_test_suite(),file_intake_test_suite(),workbook_test_suite(),sheet_test_suite(),sheet_selection_test_suite(),sheet_contrast_test_suite(),database_explorer_test_suite(),database_join_test_suite(),technology_license_test_suite(),sheet_interaction_test_suite()])
     result=unittest.TextTestRunner(verbosity=2).run(suite)
     print('Testy rdzenia nie zastępują integracji z H2 / Firebird / Oracle. Testy Qt: --ui-test.',flush=True)
     return 0 if result.wasSuccessful() else 1
@@ -12917,6 +13720,173 @@ def ui_test():
             self.assertTrue(condition(),'Przekroczono czas oczekiwania. '+str(self.errors))
             self.assertFalse(self.errors,str(self.errors))
             self.assertFalse(self.callback_errors,str(self.callback_errors))
+        def navigation_workspace(self, row=7, col=2):
+            ws=self.window.sheet_workspace
+            self.window.activateWindow();ws.select_rect((row,col,row,col));ws.interaction.focus_cell()
+            app.processEvents()
+            return ws
+        def nav_current(self, ws):
+            index=ws.grid.currentIndex();return index.row(),index.column()
+        def nav_editor(self,ws,text):
+            view=ws.views.view_for(*self.nav_current(ws))
+            QTest.keyClick(view,Qt.Key.Key_F2);app.processEvents()
+            editor=QW.QApplication.focusWidget()
+            self.assertIsInstance(editor,ui['SheetInput']);self.assertEqual(editor.objectName(),'cellEditor')
+            QTest.keyClick(editor,Qt.Key.Key_A,Qt.KeyboardModifier.ControlModifier)
+            QTest.keyClicks(editor,text)
+            return editor
+        def nav_pump(self):
+            QTest.qWait(30);app.processEvents();QTest.qWait(30)
+            self.assertFalse(self.callback_errors,str(self.callback_errors))
+        def test_nav_empty_enter_moves_without_dirtying(self):
+            from PySide6.QtTest import QSignalSpy
+            ws=self.navigation_workspace();before=clone(ws.session.book);spy=QSignalSpy(ws.model.modelReset)
+            QTest.keyClick(ws.grid,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(8,2));self.assertEqual(ws.session.book,before)
+            self.assertEqual(spy.count(),0);self.assertFalse(ws.session.history)
+        def test_nav_numeric_keypad_enter(self):
+            ws=self.navigation_workspace()
+            QTest.keyClick(ws.grid,Qt.Key.Key_Enter,Qt.KeyboardModifier.KeypadModifier);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(8,2))
+        def test_nav_shift_enter_and_tab_in_grid(self):
+            ws=self.navigation_workspace()
+            for key,mod,target in ((Qt.Key.Key_Return,Qt.KeyboardModifier.ShiftModifier,(6,2)),
+                                   (Qt.Key.Key_Tab,Qt.KeyboardModifier.NoModifier,(6,3)),
+                                   (Qt.Key.Key_Backtab,Qt.KeyboardModifier.ShiftModifier,(6,2))):
+                QTest.keyClick(ws.grid,key,mod);self.nav_pump();self.assertEqual(self.nav_current(ws),target)
+        def test_nav_two_values_enter_and_history_without_reset(self):
+            from PySide6.QtTest import QSignalSpy
+            ws=self.navigation_workspace();spy=QSignalSpy(ws.model.modelReset)
+            editor=self.nav_editor(ws,'123');QTest.keyClick(editor,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(8,2))
+            editor=self.nav_editor(ws,'456');QTest.keyClick(editor,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(9,2))
+            self.assertEqual(sheet_raw(ws.active_sheet()['cells']['C8']),'123')
+            self.assertEqual(sheet_raw(ws.active_sheet()['cells']['C9']),'456')
+            self.assertEqual(len(ws.session.history),2);self.assertEqual(spy.count(),0)
+        def test_nav_direct_typing_starts_in_next_cell(self):
+            ws=self.navigation_workspace()
+            QTest.keyClick(ws.grid,Qt.Key.Key_1);app.processEvents()
+            editor=QW.QApplication.focusWidget();self.assertEqual(editor.objectName(),'cellEditor')
+            QTest.keyClick(editor,Qt.Key.Key_Return);self.nav_pump()
+            view=ws.views.view_for(*self.nav_current(ws));QTest.keyClick(view,Qt.Key.Key_2);app.processEvents()
+            QTest.keyClick(QW.QApplication.focusWidget(),Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual((sheet_raw(ws.active_sheet()['cells']['C8']),sheet_raw(ws.active_sheet()['cells']['C9'])),('1','2'))
+            self.assertEqual(self.nav_current(ws),(9,2))
+        def test_nav_formula_bar_commit_moves_down(self):
+            ws=self.navigation_workspace();ws.formula.setFocus();app.processEvents()
+            QTest.keyClicks(ws.formula,'=1+2');QTest.keyClick(ws.formula,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(8,2));self.assertEqual(ws.session.calculator.cell(ws.sheet_id,7,2),Decimal(3))
+        def test_nav_formula_bar_reverse_and_tab(self):
+            ws=self.navigation_workspace();ws.formula.setFocus();app.processEvents()
+            QTest.keyClicks(ws.formula,'abc');QTest.keyClick(ws.formula,Qt.Key.Key_Return,Qt.KeyboardModifier.ShiftModifier);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(6,2));ws.formula.setFocus();app.processEvents()
+            QTest.keyClicks(ws.formula,'def');QTest.keyClick(ws.formula,Qt.Key.Key_Tab);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(6,3))
+        def test_nav_cell_edit_tab_does_not_open_another_editor(self):
+            ws=self.navigation_workspace();editor=self.nav_editor(ws,'123')
+            QTest.keyClick(editor,Qt.Key.Key_Tab);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(7,3));self.assertIsNone(ws.interaction.draft)
+            self.assertNotEqual(QW.QApplication.focusWidget().objectName(),'cellEditor')
+        def test_nav_cell_escape_discards_without_history(self):
+            ws=self.navigation_workspace();before=clone(ws.session.book);editor=self.nav_editor(ws,'discard')
+            QTest.keyClick(editor,Qt.Key.Key_Escape);self.nav_pump()
+            self.assertEqual(ws.session.book,before);self.assertEqual(self.nav_current(ws),(7,2));self.assertIsNone(ws.interaction.draft)
+        def test_nav_formula_escape_restores_previous_text(self):
+            ws=self.navigation_workspace();ws.model.setData(ws.model.index(7,2),'original');self.nav_pump()
+            count=len(ws.session.history);ws.formula.setFocus();app.processEvents()
+            QTest.keyClick(ws.formula,Qt.Key.Key_A,Qt.KeyboardModifier.ControlModifier);QTest.keyClicks(ws.formula,'discard')
+            QTest.keyClick(ws.formula,Qt.Key.Key_Escape);self.nav_pump()
+            self.assertEqual(ws.formula.text(),'original');self.assertEqual(len(ws.session.history),count);self.assertEqual(self.nav_current(ws),(7,2))
+        def test_nav_range_enter_retains_range_and_active_cell(self):
+            ws=self.navigation_workspace();ws.select_rect((7,2,9,3));ws.grid.setFocus()
+            for target in ((8,2),(9,2),(7,3),(8,3),(9,3),(7,2)):
+                QTest.keyClick(ws.grid,Qt.Key.Key_Return);self.nav_pump()
+                self.assertEqual(self.nav_current(ws),target);self.assertEqual(ws.selected_rect(),(7,2,9,3))
+        def test_nav_range_edit_does_not_jump_back_on_refresh(self):
+            ws=self.navigation_workspace();ws.select_rect((7,2,9,3));ws.grid.setFocus()
+            QTest.keyClick(ws.grid,Qt.Key.Key_Return);self.nav_pump()
+            editor=self.nav_editor(ws,'123');QTest.keyClick(editor,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(9,2));self.assertEqual(ws.selected_rect(),(7,2,9,3))
+            self.assertEqual(sheet_raw(ws.active_sheet()['cells']['C9']),'123')
+        def test_nav_disjoint_ranges_remain_disjoint(self):
+            ws=self.navigation_workspace(0,0);selection=QC.QItemSelection(ws.model.index(0,0),ws.model.index(1,0))
+            selection.select(ws.model.index(0,3),ws.model.index(1,3))
+            ws.grid.selectionModel().select(selection,QC.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            for target in ((1,0),(0,3),(1,3),(0,0)):
+                QTest.keyClick(ws.grid,Qt.Key.Key_Return);self.nav_pump();self.assertEqual(self.nav_current(ws),target)
+            self.assertFalse(ws.grid.selectionModel().isSelected(ws.model.index(0,1)))
+        def test_nav_hidden_rows_and_columns_are_skipped(self):
+            ws=self.navigation_workspace();ws.grid.setRowHidden(8,True);ws.grid.setColumnHidden(3,True)
+            QTest.keyClick(ws.grid,Qt.Key.Key_Return);self.nav_pump();self.assertEqual(self.nav_current(ws),(9,2))
+            QTest.keyClick(ws.grid,Qt.Key.Key_Tab);self.nav_pump();self.assertEqual(self.nav_current(ws),(9,4))
+        def test_nav_frozen_prefix_is_not_logically_hidden(self):
+            ws=self.navigation_workspace(0,0);ws.set_freeze(2,1);self.nav_pump();ws.select_rect((0,0,0,0));ws.interaction.focus_cell()
+            QTest.keyClick(ws.views.corner,Qt.Key.Key_Return);self.nav_pump();self.assertEqual(self.nav_current(ws),(1,0))
+            QTest.keyClick(ws.views.corner,Qt.Key.Key_Return);self.nav_pump();self.assertEqual(self.nav_current(ws),(2,0))
+            self.assertIs(QW.QApplication.focusWidget(),ws.views.left)
+        def test_nav_frozen_editor_uses_same_commit(self):
+            ws=self.navigation_workspace(0,0);ws.set_freeze(1,1);self.nav_pump();ws.select_rect((0,0,0,0));ws.interaction.focus_cell()
+            editor=self.nav_editor(ws,'value');QTest.keyClick(editor,Qt.Key.Key_Tab);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(0,1));self.assertEqual(sheet_raw(ws.active_sheet()['cells']['A1']),'value')
+            self.assertIs(QW.QApplication.focusWidget(),ws.views.top)
+        def test_nav_merge_skips_covered_cells(self):
+            ws=self.navigation_workspace(0,0)
+            ws.session.checkpoint_command('fixture merge',lambda book:sheet_find(book,ws.sheet_id).update(merges=['A1:B2']))
+            self.nav_pump();ws.select_rect((0,0,1,1));ws.grid.setFocus();QTest.keyClick(ws.grid,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(2,0))
+        def test_nav_rejected_edit_keeps_text_and_cell(self):
+            ws=self.navigation_workspace();ws.session.available_bytes=lambda:1;editor=self.nav_editor(ws,'keep')
+            QTest.keyClick(editor,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(7,2));self.assertEqual(ws.interaction.draft.text,'keep')
+            self.assertTrue(ws.edit_error.isVisible());self.assertNotIn('C8',ws.active_sheet()['cells']);self.assertFalse(ws.session.history)
+            QTest.keyClick(editor,Qt.Key.Key_Escape);self.nav_pump()
+        def test_nav_rejected_edit_blocks_save_and_export(self):
+            from unittest.mock import patch
+            ws=self.navigation_workspace();ws.session.available_bytes=lambda:1;self.nav_editor(ws,'keep')
+            with patch.object(QW.QFileDialog,'getSaveFileName',side_effect=AssertionError('Save chooser must not open')):
+                self.assertFalse(self.window.save_project());ws.export_book()
+            self.assertIsNotNone(ws.interaction.draft);self.assertFalse(ws.session.history)
+            ws.interaction.finish(cancel=True)
+        def test_nav_save_only_commit_does_not_move(self):
+            ws=self.navigation_workspace();self.nav_editor(ws,'123')
+            self.assertTrue(ws.commit_active_editor());self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(7,2));self.assertEqual(len(ws.session.history),1)
+        def test_nav_unchanged_edit_does_not_add_history(self):
+            ws=self.navigation_workspace();ws.model.setData(ws.model.index(7,2),'123');self.nav_pump();count=len(ws.session.history)
+            editor=self.nav_editor(ws,'123');QTest.keyClick(editor,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(len(ws.session.history),count);self.assertEqual(self.nav_current(ws),(8,2))
+        def test_nav_shared_draft_survives_formula_focus_transfer(self):
+            ws=self.navigation_workspace();editor=self.nav_editor(ws,'abc');ws.formula.setFocus();self.nav_pump()
+            self.assertEqual(ws.formula.text(),'abc');self.assertFalse(ws.session.history)
+            QTest.keyClick(ws.formula,Qt.Key.Key_End);QTest.keyClicks(ws.formula,'d');QTest.keyClick(ws.formula,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(sheet_raw(ws.active_sheet()['cells']['C8']),'abcd');self.assertEqual(len(ws.session.history),1)
+        def test_nav_sheet_switch_commits_original_target(self):
+            ws=self.navigation_workspace();original=ws.sheet_id;ws.add_sheet();self.nav_pump();second=ws.sheet_id
+            ws.bind(ws.session,original);ws.select_rect((7,2,7,2));ws.interaction.focus_cell();self.nav_editor(ws,'original sheet')
+            ws.sheet_tabs.setCurrentIndex(next(i for i in range(ws.sheet_tabs.count()) if ws.sheet_tabs.tabData(i)==second));self.nav_pump()
+            self.assertEqual(sheet_raw(sheet_find(ws.session.book,original)['cells']['C8']),'original sheet')
+            self.assertNotIn('C8',sheet_find(ws.session.book,second)['cells'])
+        def test_nav_f6_leaves_grid_without_editing_data(self):
+            ws=self.navigation_workspace();before=clone(ws.session.book)
+            QTest.keyClick(ws.grid,Qt.Key.Key_F6);self.nav_pump();self.assertIs(QW.QApplication.focusWidget(),ws.formula)
+            QTest.keyClick(ws.formula,Qt.Key.Key_F6,Qt.KeyboardModifier.ShiftModifier);self.nav_pump()
+            self.assertIs(QW.QApplication.focusWidget(),ws.grid);self.assertEqual(ws.session.book,before)
+        def test_nav_ime_preedit_enter_is_not_cell_commit(self):
+            ws=self.navigation_workspace();editor=self.nav_editor(ws,'')
+            QC.QCoreApplication.sendEvent(editor,ui['QtGui'].QInputMethodEvent('a',[]))
+            self.assertTrue(editor._sheet_preedit)
+            QTest.keyClick(editor,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(7,2));self.assertIsNotNone(ws.interaction.draft)
+            committed=ui['QtGui'].QInputMethodEvent();committed.setCommitString('a');QC.QCoreApplication.sendEvent(editor,committed)
+            QTest.keyClick(editor,Qt.Key.Key_Return);self.nav_pump();self.assertEqual(self.nav_current(ws),(8,2))
+        def test_nav_dialog_enter_does_not_move_hidden_sheet(self):
+            ws=self.navigation_workspace();dialog=QW.QDialog(self.window);layout=QW.QVBoxLayout(dialog)
+            edit=QW.QLineEdit();button_=QW.QPushButton('OK');button_.setDefault(True);layout.addWidget(edit);layout.addWidget(button_)
+            button_.clicked.connect(dialog.accept);dialog.show();edit.setFocus();app.processEvents()
+            QTest.keyClick(edit,Qt.Key.Key_Return);self.nav_pump()
+            self.assertEqual(self.nav_current(ws),(7,2));dialog.deleteLater()
+
         def database_fixture(self):
             path=self.root/'Cała baza.sqlite3'
             with sqlite3.connect(path) as c:
