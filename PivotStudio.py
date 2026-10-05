@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Pivot Studio 0.7.2 — lokalny arkusz i analizy w jednym pliku.
+"""Pivot Studio 0.7.3 — lokalny arkusz i analizy w jednym pliku.
 
 Uruchomienie: py PivotStudio.py (Windows) / python3 PivotStudio.py.
 Tkinter: wybór PyPI / własnego Artifactory przed pobraniem bibliotek.
@@ -27,6 +27,8 @@ aby otworzyć połączone rekordy według FK. JOIN jest tylko do odczytu.
 0.7.2: wspólny szkic komórki i paska formuły; Enter/Tab, ruch odwrotny,
 Escape, zakresy i zamrożone okienka. Edycja wartości nie resetuje siatki.
 Bez zmian zależności, instalatora, formatu projektu i obliczeń.
+0.7.3: Pomoc → O autorze; własny złoty monogram autora, obrót tylko w
+widocznym aktywnym dialogu. Osadzona geometria, bez sieci i bez nowego intro.
 """
 from __future__ import annotations
 
@@ -69,7 +71,7 @@ from xml.sax.saxutils import escape as xml_escape
 import zipfile
 
 APP_NAME = 'Pivot Studio'
-APP_VERSION = '0.7.2'
+APP_VERSION = '0.7.3'
 PROJECT_VERSION = 4
 PROJECT_APP_ID = 0x50565331
 MAX_BODY = 4 * 1024 * 1024
@@ -5953,6 +5955,169 @@ def filter_technology_rows(report,query='',group='',installed_only=False):
 
 
 
+# --- Author identity and embedded, software-rendered gold mark (0.7.3) ---------
+# Author-supplied mark, ported at the author's request from guziczak/zloto:
+# index.html at ce4fef8c4141b5e5f88af8b10a35f052abcc180a
+# blob 44ad77902baa793fd76984242b63f6fedeff9cbb; outer / inner / cog contours.
+# No Three.js, web renderer, downloaded texture, font, or executable is embedded.
+AUTHOR_NAME = 'Łukasz Guziczak'
+AUTHOR_ROLE = 'AI Engineer & Builder'
+AUTHOR_BIO = ('Projektuję systemy AI, rozwijam własne produkty i skracam drogę '
+              'od pomysłu do działającego rozwiązania.')
+AUTHOR_EMAIL = 'guziczak@proton.me'
+AUTHOR_LINKS = (
+    ('website', 'Strona autora', 'https://guziczak.github.io/zloto/'),
+    ('github', 'GitHub', 'https://github.com/guziczak'),
+    ('linkedin', 'LinkedIn', 'https://www.linkedin.com/in/%C5%82ukasz-guziczak-978a81315/'),
+)
+AUTHOR_LOGO_SOURCE = ('https://github.com/guziczak/zloto/blob/'
+                      'ce4fef8c4141b5e5f88af8b10a35f052abcc180a/index.html')
+AUTHOR_LOGO_OUTER = ((0.,1.68),(-1.46,.84),(-1.46,-.84),(0.,-1.68),(1.46,-.84),(1.46,.84))
+AUTHOR_LOGO_G = ((.7,.68),(0.,1.08),(-.94,.54),(-.94,-.54),(0.,-1.08),(.94,-.54),
+                 (.94,.24),(.02,.24),(.02,-.04),(.66,-.04),(.66,-.38),(0.,-.77),
+                 (-.66,-.38),(-.66,.38),(0.,.77),(.55,.46))
+AUTHOR_LOGO_PERIOD = 12.0
+
+
+def author_link(key: str) -> str:
+    """Only fixed, reviewed HTTPS destinations; no configuration or user data."""
+    for identity, _label, address in AUTHOR_LINKS:
+        if key == identity:
+            return address
+    raise ValueError('Nieznany odsyłacz autora.')
+
+
+def author_motion_allowed(*, visible: bool, active: bool, reduced: bool,
+                          paused: bool, disposed: bool) -> bool:
+    return bool(visible and active and not reduced and not paused and not disposed)
+
+
+def author_polygon_area(points):
+    return .5 * sum(a[0]*b[1]-b[0]*a[1] for a,b in zip(points,points[1:]+points[:1]))
+
+
+def _author_cross(a,b,c):
+    return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
+
+
+def author_triangulate(points):
+    """Bounded ear-clipping for the embedded simple G, not arbitrary user SVG."""
+    points=tuple(points)
+    if not 3<=len(points)<=64 or any(not all(math.isfinite(v) for v in p) for p in points):
+        raise ValueError('Nieprawidłowy kontur znaku.')
+    if author_polygon_area(points)<=1e-10:
+        raise ValueError('Kontur musi być niezdegenerowany i przeciwny do wskazówek zegara.')
+    remaining=list(range(len(points)));triangles=[]
+    for _ in range(len(points)*len(points)):
+        if len(remaining)==3:
+            triangles.append(tuple(remaining));return tuple(triangles)
+        for j,b in enumerate(remaining):
+            a,c=remaining[j-1],remaining[(j+1)%len(remaining)]
+            if _author_cross(points[a],points[b],points[c])<=1e-10:continue
+            others=(i for i in remaining if i not in (a,b,c))
+            if any(all(_author_cross(points[x],points[y],points[i])>=-1e-10
+                       for x,y in ((a,b),(b,c),(c,a))) for i in others):continue
+            triangles.append((a,b,c));remaining.pop(j);break
+        else:raise ValueError('Nie można podzielić konturu znaku.')
+    raise ValueError('Przekroczono limit geometrii znaku.')
+
+
+def _author_offset(points, distance):
+    """Mitered parallel contour: positive distance is to its oriented left."""
+    out=[]
+    for i,(x,y) in enumerate(points):
+        a,b=points[i-1],points[(i+1)%len(points)]
+        u=(x-a[0],y-a[1]);v=(b[0]-x,b[1]-y)
+        lu,lv=math.hypot(*u),math.hypot(*v)
+        if min(lu,lv)<1e-10:raise ValueError('Powtórzony punkt konturu.')
+        n1=(-u[1]/lu,u[0]/lu);n2=(-v[1]/lv,v[0]/lv)
+        denominator=1+n1[0]*n2[0]+n1[1]*n2[1]
+        if denominator<1e-6:raise ValueError('Nieprawidłowy narożnik konturu.')
+        out.append((x+distance*(n1[0]+n2[0])/denominator,
+                    y+distance*(n1[1]+n2[1])/denominator))
+    return tuple(out)
+
+
+@functools.lru_cache(maxsize=1)
+def author_logo_mesh():
+    """Exact author contours; 0.24-unit body, 0.027-unit three-step bevels."""
+    outer=AUTHOR_LOGO_OUTER;inner=tuple((x*.822,y*.822) for x,y in outer)
+    vertices=[];faces=[]
+    def vertex(p,z):
+        vertices.append((p[0],p[1],z));return len(vertices)-1
+    def surface(points,polygons):
+        back=[vertex(p,-.147) for p in points];front=[vertex(p,.147) for p in points]
+        for poly in polygons:
+            faces.append(tuple(front[i] for i in poly))
+            faces.append(tuple(back[i] for i in reversed(poly)))
+    # Quads preserve the open hole; never cap the ring with a filled hexagon.
+    surface(outer+inner,[(i,(i+1)%6,6+(i+1)%6,6+i) for i in range(6)])
+    surface(AUTHOR_LOGO_G,author_triangulate(AUTHOR_LOGO_G))
+    # Outward bevel matches the source extrusion: original profile at the caps.
+    profile=[(-.12-.027*math.cos(k*math.pi/6),.027*math.sin(k*math.pi/6)) for k in range(4)]
+    profile += [(.12+.027*math.cos(k*math.pi/6),.027*math.sin(k*math.pi/6)) for k in reversed(range(4))]
+    for boundary in (outer,tuple(reversed(inner)),AUTHOR_LOGO_G):
+        rails=[[vertex(p,z) for p in _author_offset(boundary,-expansion)] for z,expansion in profile]
+        for lower,upper in zip(rails,rails[1:]):
+            for i in range(len(boundary)):
+                j=(i+1)%len(boundary)
+                faces.append((lower[i],lower[j],upper[j],upper[i]))
+    return tuple(vertices),tuple(faces)
+
+
+def author_logo_frame(angle: float):
+    """Immutable projected faces in painter order, independent of Qt/window state.
+
+    The camera is at (0,0,8); all source vertices remain well in front of its
+    near plane for every rotation. Units are normalized, +y points up in 3D.
+    """
+    if not isinstance(angle,(int,float)) or not math.isfinite(angle):
+        raise ValueError('Nieprawidłowy kąt znaku.')
+    cy,sy=math.cos(angle%math.tau),math.sin(angle%math.tau)
+    tilt=-.10;cx,sx=math.cos(tilt),math.sin(tilt)
+    raw,polygons=author_logo_mesh();vertices=[]
+    for x,y,z in raw:
+        x,z=cy*x+sy*z,-sy*x+cy*z
+        vertices.append((x,cx*y-sx*z,sx*y+cx*z))
+    light=(-.42,.48,.77);ll=math.sqrt(sum(v*v for v in light));light=tuple(v/ll for v in light)
+    half=(-.22,.27,.937);hl=math.sqrt(sum(v*v for v in half));half=tuple(v/hl for v in half)
+    output=[]
+    for polygon in polygons:
+        pts=[vertices[i] for i in polygon];a,b,c=pts[:3]
+        u=tuple(b[i]-a[i] for i in range(3));v=tuple(c[i]-a[i] for i in range(3))
+        normal=(u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0])
+        length=math.sqrt(sum(t*t for t in normal))
+        if length<1e-10:continue
+        normal=tuple(t/length for t in normal)
+        if sum(normal[i]*((8. if i==2 else 0.)-a[i]) for i in range(3))<=0:continue
+        diffuse=max(0.,sum(x*y for x,y in zip(normal,light)))
+        specular=max(0.,sum(x*y for x,y in zip(normal,half)))**22
+        # Two broad studio reflections plus a warm base keep side faces legible.
+        rim=(1-abs(normal[2]))*.12
+        rgb=tuple(round(255*min(1.,max(0.,ambient+power*diffuse+shine*specular+rim)))
+                  for ambient,power,shine in ((.35,.49,.36),(.20,.43,.44),(.07,.23,.50)))
+        projected=tuple((x*8/(8-z),-y*8/(8-z)) for x,y,z in pts)
+        output.append((sum(p[2] for p in pts)/len(pts),projected,rgb))
+    return tuple(sorted(output,key=lambda face:face[0]))
+
+
+def author_system_reduced_motion():
+    """Read Windows' client-area animation preference, never change the setting.
+
+    Other desktops use Pivot's explicit 'Ogranicz animacje' preference. Unknown
+    system support is not represented as a detected OS-wide motion preference.
+    """
+    if sys.platform!='win32':return False
+    try:
+        import ctypes
+        enabled=ctypes.c_int(1)
+        fn=ctypes.WinDLL('user32',use_last_error=True).SystemParametersInfoW
+        fn.argtypes=(ctypes.c_uint,ctypes.c_uint,ctypes.c_void_p,ctypes.c_uint)
+        fn.restype=ctypes.c_int
+        return bool(fn(0x1042,0,ctypes.byref(enabled),0)) and not bool(enabled.value)
+    except (OSError,AttributeError):return False
+
+
 def native_ui_types():
     """Lazy import boundary: workers and core tests never initialize Qt."""
     global _NATIVE_TYPES
@@ -6848,6 +7013,235 @@ def native_ui_types():
             path=QW.QFileDialog.getExistingDirectory(self,'Wybierz katalog',self.edit.text()) if self.directory else QW.QFileDialog.getOpenFileName(self,'Wybierz plik',self.edit.text(),self.filter)[0]
             if path: self.edit.setText(path)
         def text(self): return self.edit.text().strip()
+
+    class GoldenLogoWidget(QW.QWidget):
+        """On-demand software 3D, local geometry only; no work when hidden."""
+        def __init__(self,parent=None):
+            super().__init__(parent)
+            self.setObjectName('authorLogo');self.setMinimumSize(180,180)
+            self.setSizePolicy(QW.QSizePolicy.Policy.Expanding,QW.QSizePolicy.Policy.Expanding)
+            self.setAccessibleName('Złoty monogram G Łukasza Guziczaka w sześciokącie')
+            self.setAccessibleDescription('Obracający się przestrzenny znak autora. Ruch można wstrzymać przyciskiem poniżej.')
+            self._angle=.12;self._paused=False;self._reduced=False;self._surface_active=False;self._disposed=False
+            self._last_tick=0.;self._paint_count=0
+            self._mesh=author_logo_mesh()  # Lazy: created only when O autorze is opened.
+            self._timer=QC.QTimer(self);self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+            self._timer.setInterval(33);self._timer.timeout.connect(self._advance)
+        def sizeHint(self):return QC.QSize(280,290)
+        def set_activity(self,active,reduced=None):
+            self._surface_active=bool(active)
+            if reduced is not None:self._reduced=bool(reduced)
+            self._sync_timer()
+        def set_paused(self,paused):
+            self._paused=bool(paused);self._sync_timer()
+        def _can_animate(self):
+            return author_motion_allowed(visible=self.isVisible(),active=self._surface_active,
+                reduced=self._reduced,paused=self._paused,disposed=self._disposed)
+        def _sync_timer(self):
+            if self._can_animate():
+                if not self._timer.isActive():self._last_tick=time.monotonic();self._timer.start()
+            else:self._timer.stop();self._last_tick=0.
+        def _advance(self):
+            if not self._can_animate():self._sync_timer();return
+            now=time.monotonic();step=min(.08,max(0.,now-self._last_tick));self._last_tick=now
+            self._angle=(self._angle+step*math.tau/AUTHOR_LOGO_PERIOD)%math.tau;self.update()
+        def showEvent(self,event):
+            super().showEvent(event);self._sync_timer()
+        def hideEvent(self,event):
+            self._timer.stop();self._last_tick=0.;super().hideEvent(event)
+        def dispose(self):
+            if self._disposed:return
+            self._disposed=True;self._timer.stop();self._last_tick=0.
+        def paintEvent(self,event):
+            self._paint_count+=1
+            painter=QG.QPainter(self)
+            try:
+                painter.setRenderHints(QG.QPainter.RenderHint.Antialiasing|QG.QPainter.RenderHint.SmoothPixmapTransform)
+                painter.setClipRect(self.rect());painter.setPen(Qt.PenStyle.NoPen)
+                dark=ui_theme()=='dark';width,height=self.width(),self.height()
+                scale=max(1.,min(width/4.25,height/4.55));cx,cy=width/2,height*.45
+                # A restrained warm pool of light, confined to the mark's own area.
+                glow=QG.QRadialGradient(QC.QPointF(cx,cy),min(width,height)*.50)
+                glow.setColorAt(0,QG.QColor(213,178,99,17 if dark else 13));glow.setColorAt(1,QG.QColor(213,178,99,0))
+                painter.setBrush(glow);painter.drawEllipse(QC.QRectF(0,0,width,height))
+                painter.save();painter.translate(cx,cy+1.98*scale);painter.scale(1,.12)
+                # Transform the gradient with the ellipse rather than allocating a blur.
+                ground=QG.QRadialGradient(QC.QPointF(0,0),scale*1.05)
+                ground.setColorAt(0,QG.QColor(0,0,0,85 if dark else 40));ground.setColorAt(1,QG.QColor(0,0,0,0))
+                painter.setBrush(ground);painter.drawEllipse(QC.QRectF(-1.12*scale,-1.12*scale,2.24*scale,2.24*scale));painter.restore()
+                for _depth,points,rgb in author_logo_frame(self._angle):
+                    color=QG.QColor(*rgb)
+                    # One screen-space reflection across coplanar facets: no seams
+                    # or individual triangular highlights on the front of the G.
+                    reflection=QG.QLinearGradient(cx-1.8*scale,cy-1.7*scale,cx+1.8*scale,cy+1.7*scale)
+                    reflection.setColorAt(0,color.darker(120));reflection.setColorAt(.35,color)
+                    reflection.setColorAt(.48,color.lighter(120));reflection.setColorAt(.61,color)
+                    reflection.setColorAt(1,color.darker(112))
+                    brush=QG.QBrush(reflection);painter.setBrush(brush);painter.setPen(QG.QPen(brush,.55))
+                    painter.drawPolygon(QG.QPolygonF([QC.QPointF(cx+x*scale,cy+y*scale) for x,y in points]))
+            finally:painter.end()
+
+    class AuthorTitleBar(QW.QFrame):
+        """Small local caption: native move, no global mouse hook or startup UI."""
+        def __init__(self,dialog):
+            super().__init__(dialog);self._host_dialog=dialog;self._drag_offset=None
+            self.setObjectName('authorCaption');self.setFixedHeight(44)
+            row=QW.QHBoxLayout(self);row.setContentsMargins(20,5,8,5);row.setSpacing(8)
+            caption=label('PIVOT STUDIO  /  O AUTORZE');caption.setObjectName('authorEyebrow')
+            caption.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents);row.addWidget(caption,1)
+            self.close_button=icon_button('close','Zamknij okno O autorze',dialog.reject);row.addWidget(self.close_button)
+        def mousePressEvent(self,event):
+            if event.button()==Qt.MouseButton.LeftButton:
+                handle=self._host_dialog.windowHandle()
+                if handle is not None and handle.startSystemMove():event.accept();return
+                self._drag_offset=event.globalPosition().toPoint()-self._host_dialog.pos();event.accept();return
+            super().mousePressEvent(event)
+        def mouseMoveEvent(self,event):
+            if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+                self._host_dialog.move(event.globalPosition().toPoint()-self._drag_offset);event.accept();return
+            super().mouseMoveEvent(event)
+        def mouseReleaseEvent(self,event):
+            self._drag_offset=None;super().mouseReleaseEvent(event)
+
+    class AboutAuthorDialog(QW.QDialog):
+        """Author-owned mark and identity; transient UI, never part of a project."""
+        def __init__(self,parent):
+            super().__init__(parent);self._disposed=False;self._ready=False;self._compact=None
+            self._host_window=parent;self._reduced=False;self._edge_controller=None
+            self.setObjectName('authorDialog');self.setWindowTitle('O autorze · Pivot Studio')
+            self.setWindowIcon(ui_icon('logo',40));self.setSizeGripEnabled(True)
+            self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            frameless='--system-frame' not in sys.argv and sys.platform!='darwin'
+            if frameless:self.setWindowFlag(Qt.WindowType.FramelessWindowHint,True)
+            self.outer=QW.QVBoxLayout(self);self.outer.setContentsMargins(1,1,1,1);self.outer.setSpacing(0)
+            self.caption=AuthorTitleBar(self);self.outer.addWidget(self.caption)
+            if not frameless:self.caption.hide()
+            self.scroll=QW.QScrollArea();self.scroll.setWidgetResizable(True);self.scroll.setFrameShape(QW.QFrame.Shape.NoFrame)
+            self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.content=QW.QWidget();self.content.setObjectName('authorContent')
+            self.columns=QW.QBoxLayout(QW.QBoxLayout.Direction.LeftToRight,self.content)
+            self.columns.setContentsMargins(24,24,24,22);self.columns.setSpacing(30)
+            self.mark_panel=QW.QFrame();self.mark_panel.setObjectName('authorMarkPanel')
+            mark_layout=QW.QVBoxLayout(self.mark_panel);mark_layout.setContentsMargins(12,12,12,14);mark_layout.setSpacing(8)
+            self.logo=GoldenLogoWidget(self.mark_panel);self.logo.setMinimumHeight(230);mark_layout.addWidget(self.logo,1)
+            signature=label('GUZICZAK');signature.setObjectName('authorSignature');signature.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            signature_font=QG.QFont(signature.font());signature_font.setLetterSpacing(QG.QFont.SpacingType.AbsoluteSpacing,3.2);signature.setFont(signature_font);mark_layout.addWidget(signature)
+            self.pause_button=button('Wstrzymaj obrót',self.toggle_pause);self.pause_button.setObjectName('authorPause')
+            self.pause_button.setAutoDefault(True);self.pause_button.setAccessibleName('Wstrzymaj obracanie złotego logo');mark_layout.addWidget(self.pause_button,0,Qt.AlignmentFlag.AlignHCenter)
+            self.columns.addWidget(self.mark_panel,3)
+            self.info_panel=QW.QWidget();self.info_panel.setObjectName('authorInfo')
+            info=QW.QVBoxLayout(self.info_panel);info.setContentsMargins(0,8,0,8);info.setSpacing(12);info.addStretch(1)
+            role=label(AUTHOR_ROLE);role.setObjectName('authorRole');info.addWidget(role)
+            self.name_label=label(AUTHOR_NAME,False,True);self.name_label.setObjectName('authorName')
+            self.name_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse);info.addWidget(self.name_label)
+            statement=label('Przekuwam AI w wartość.',False,True);statement.setObjectName('authorStatement');info.addWidget(statement)
+            self.bio_label=label(AUTHOR_BIO,True,True);self.bio_label.setObjectName('authorBio')
+            self.bio_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse);info.addWidget(self.bio_label)
+            info.addSpacing(8)
+            links=QW.QGridLayout();links.setSpacing(8);self.link_buttons={}
+            for number,(key,title,url) in enumerate(AUTHOR_LINKS):
+                link=button(title+' ↗',lambda identity=key:self.open_link(identity));link.setObjectName('authorLink')
+                link.setAutoDefault(True);link.setToolTip(url);link.setAccessibleName(title+' — otwórz w przeglądarce')
+                self.link_buttons[key]=link;links.addWidget(link,number//2,number%2)
+            self.copy_email_button=button('Kopiuj e-mail',self.copy_email);self.copy_email_button.setObjectName('authorLink')
+            self.copy_email_button.setAutoDefault(True);self.copy_email_button.setToolTip(AUTHOR_EMAIL);self.copy_email_button.setAccessibleName('Skopiuj e-mail autora: '+AUTHOR_EMAIL)
+            links.addWidget(self.copy_email_button,1,1);links.setColumnStretch(0,1);links.setColumnStretch(1,1);info.addLayout(links)
+            # Always reserved space: copying or a failed link must not shift the card.
+            self.feedback=label('',True,True);self.feedback.setObjectName('authorFeedback');self.feedback.setMinimumHeight(34)
+            self.feedback.setAccessibleName('Wynik działania w oknie autora');info.addWidget(self.feedback);info.addStretch(1)
+            self.columns.addWidget(self.info_panel,4);self.scroll.setWidget(self.content);self.outer.addWidget(self.scroll,1)
+            footer=QW.QFrame();footer.setObjectName('authorFooter');foot=QW.QHBoxLayout(footer);foot.setContentsMargins(24,12,24,16);foot.setSpacing(12)
+            version=label('Pivot Studio '+APP_VERSION+'  ·  Autor aplikacji',True,True);version.setObjectName('authorVersion');foot.addWidget(version,1)
+            self.done_button=button('Wróć do Pivot',self.accept);self.done_button.setObjectName('authorDone');self.done_button.setDefault(True);foot.addWidget(self.done_button)
+            self.outer.addWidget(footer)
+            self._apply_colors();self._ready=True
+            screen=parent.screen() or QW.QApplication.primaryScreen()
+            area=screen.availableGeometry() if screen else QC.QRect(0,0,1024,768)
+            self.setMinimumSize(min(400,max(260,area.width()-40)),min(340,max(240,area.height()-40)))
+            self.resize(min(850,max(280,area.width()-48)),min(510,max(260,area.height()-48)))
+            self._arrange();self.move(area.center()-self.rect().center())
+            if frameless:self._edge_controller=EdgeController(self)
+            QW.QApplication.instance().applicationStateChanged.connect(self._sync_activity)
+        def _apply_colors(self):
+            dark=ui_theme()=='dark';base=UI_THEMES[ui_theme()]
+            gold='#D8BB7D' if dark else '#79551C';panel='#131C17' if dark else '#F4F0E4'
+            line='#394632' if dark else '#C9BA91';text=base['text'];muted=base['muted'];bg=base['bg']
+            self.setStyleSheet('''
+                QDialog#authorDialog { background: @bg; border: 1px solid @line; }
+                QWidget#authorContent, QWidget#authorInfo, QScrollArea { background: @bg; border: 0; }
+                QFrame#authorCaption { background: @bg; border-bottom: 1px solid @line; }
+                QFrame#authorMarkPanel { background: @panel; border: 1px solid @line; border-radius: 16px; }
+                QWidget#authorLogo { background: transparent; border: 0; }
+                QLabel#authorEyebrow { color: @muted; font-size: 10px; font-weight: 600; }
+                QLabel#authorSignature { color: @gold; font-size: 14px; font-weight: 600; }
+                QLabel#authorRole { color: @gold; font-size: 12px; font-weight: 600; }
+                QLabel#authorName { color: @text; font-size: 30px; font-weight: 600; padding: 0; }
+                QLabel#authorStatement { color: @text; font-size: 17px; }
+                QLabel#authorBio { color: @muted; font-size: 13px; }
+                QLabel#authorFeedback, QLabel#authorVersion { color: @muted; font-size: 11px; }
+                QPushButton#authorLink { background: @panel; border: 1px solid @line; border-radius: 7px; padding: 9px 10px; color: @text; }
+                QPushButton#authorLink:hover { border-color: @gold; }
+                QPushButton#authorLink:focus, QPushButton#authorPause:focus { border: 1px solid @gold; }
+                QPushButton#authorPause { background: transparent; border: 1px solid transparent; color: @gold; padding: 5px 10px; font-size: 11px; }
+                QPushButton#authorPause:disabled { color: @muted; }
+                QFrame#authorFooter { border-top: 1px solid @line; background: @bg; }
+                QPushButton#authorDone { background: @gold; color: @done; border: 1px solid @gold; border-radius: 7px; padding: 10px 16px; font-weight: 600; }
+                QPushButton#authorDone:focus { border: 2px solid @text; }
+            '''.replace('@bg',bg).replace('@line',line).replace('@panel',panel).replace('@gold',gold)
+                .replace('@text',text).replace('@muted',muted).replace('@done','#182118' if dark else '#FFFFFF'))
+        def _arrange(self):
+            compact=self.width()<710
+            if compact==self._compact:return
+            self._compact=compact
+            self.columns.setDirection(QW.QBoxLayout.Direction.TopToBottom if compact else QW.QBoxLayout.Direction.LeftToRight)
+            self.columns.setSpacing(18 if compact else 30)
+            self.mark_panel.setMinimumWidth(0 if compact else 240);self.mark_panel.setMaximumWidth(16777215 if compact else 320)
+            self.logo.setMinimumHeight(170 if compact else 230)
+            self.mark_panel.setMaximumHeight(265 if compact else 16777215)
+            self.info_panel.setMinimumWidth(0 if compact else 300)
+        def resizeEvent(self,event):
+            super().resizeEvent(event)
+            if self._ready:self._arrange()
+        def _sync_activity(self,*_):
+            if not self._ready or self._disposed:return
+            root=getattr(getattr(self._host_window,'service',None),'root',None)
+            self._reduced=appearance_preferences(root)['reduced_motion'] or author_system_reduced_motion()
+            app=QW.QApplication.instance()
+            active=self.isVisible() and self.isActiveWindow() and not self.isMinimized() and app.applicationState()==Qt.ApplicationState.ApplicationActive
+            self.logo.set_activity(active,self._reduced)
+            self.pause_button.setEnabled(not self._reduced)
+            self.pause_button.setText('Ograniczone animacje' if self._reduced else 'Wznów obrót' if self.logo._paused else 'Wstrzymaj obrót')
+            self.pause_button.setAccessibleName(self.pause_button.text()+' złotego logo')
+        def showEvent(self,event):
+            super().showEvent(event);self._sync_activity();self.done_button.setFocus(Qt.FocusReason.OtherFocusReason)
+        def changeEvent(self,event):
+            super().changeEvent(event)
+            if event.type() in (QC.QEvent.Type.ActivationChange,QC.QEvent.Type.WindowStateChange):self._sync_activity()
+        def hideEvent(self,event):
+            if self._ready:self.logo.set_activity(False)
+            super().hideEvent(event)
+        def toggle_pause(self):
+            self.logo.set_paused(not self.logo._paused);self._sync_activity()
+        def open_link(self,key):
+            try:
+                url=author_link(key)
+                if not QG.QDesktopServices.openUrl(QC.QUrl(url)):
+                    self.feedback.setText('Nie udało się otworzyć przeglądarki. Adres: '+url)
+                else:self.feedback.setText('Przekazano adres do przeglądarki.')
+            except (ValueError,RuntimeError) as error:self.feedback.setText(str(error))
+        def copy_email(self):
+            QW.QApplication.clipboard().setText(AUTHOR_EMAIL);self.feedback.setText('Skopiowano: '+AUTHOR_EMAIL)
+        def dispose(self):
+            if self._disposed:return
+            self._disposed=True;self.logo.dispose()
+            if self._edge_controller is not None:self._edge_controller.detach()
+            app=QW.QApplication.instance()
+            if app is not None and qt_object_alive(app):
+                with contextlib.suppress(RuntimeError,TypeError):app.applicationStateChanged.disconnect(self._sync_activity)
+        def done(self,result):
+            self.dispose();super().done(result)
+        def closeEvent(self,event):
+            self.dispose();super().closeEvent(event)
 
     class TechnologyTableModel(QC.QAbstractTableModel):
         HEADERS=('Składnik','Wersja','Licencja','Użytek komercyjny','Status')
@@ -10442,6 +10836,7 @@ def native_ui_types():
             self.action('settings','Ustawienia i sterowniki…',self.settings)
             self.action('demo','Otwórz przykład',self.open_demo)
             self.action('info','O programie',self.about)
+            self.action('author','O autorze',self.show_author)
             self.action('technologies','Technologie i licencje…',self.show_technologies)
             self.action('recover','Odzyskaj kopię roboczą…',self.recover)
             self.action('reset_layout','Przywróć układ paneli',self.reset_layout)
@@ -10521,7 +10916,7 @@ def native_ui_types():
             menus={'Plik':['new_book','new','open','save','save_as',None,'export','recover',None,'quit'],
                 'Edycja':['undo','redo','sheet_format',None,'rename','duplicate','delete_analysis'],
                 'Dane':['source','import','analysis','sql','sheet_pivot','sheet_chart'],'Analiza':['run','preview','cancel'],
-                'Narzędzia':['settings'],'Pomoc':['demo','technologies','info']}
+                'Narzędzia':['settings'],'Pomoc':['demo','author','technologies','info']}
             for title,keys in menus.items():
                 menu=root.addMenu(title)
                 for key in keys:
@@ -11378,6 +11773,17 @@ def native_ui_types():
         def settings(self):
             dialog=SettingsDialog(self)
             if dialog.exec()==QW.QDialog.DialogCode.Accepted: self.service.call('settings',{'settings':dialog.value})
+        def show_author(self):
+            if self.closing:return None
+            dialog=getattr(self,'_author_dialog',None)
+            if dialog is not None and qt_object_alive(dialog):
+                dialog.show();dialog.raise_();dialog.activateWindow();return dialog
+            dialog=AboutAuthorDialog(self);self._author_dialog=dialog
+            dialog.finished.connect(self._author_finished)
+            dialog.open()  # Window-modal, without a second nested event loop.
+            return dialog
+        def _author_finished(self,*_):
+            self._author_dialog=None
         def show_technologies(self):
             dialog=TechnologiesDialog(self)
             try:dialog.exec()
@@ -11620,7 +12026,7 @@ def native_ui_types():
         if not hasattr(app,'_pivot_wheel_guard'):
             app._pivot_wheel_guard=WheelGuard(app);app.installEventFilter(app._pivot_wheel_guard)
 
-    _NATIVE_TYPES={'SheetInteraction':SheetInteraction,'SheetInput':SheetInput,'TechnologiesDialog':TechnologiesDialog,'TechnologyTableModel':TechnologyTableModel,'DatabaseJoinPage':DatabaseJoinPage,'DatabaseJoinDialog':DatabaseJoinDialog,'DatabaseNode':DatabaseNode,'DatabaseExplorer':DatabaseExplorer,'DatabaseDataModel':DatabaseDataModel,'DatabaseRecordsModel':DatabaseRecordsModel,'DatabaseGraph':DatabaseGraph,'DatabaseTaskQueue':DatabaseTaskQueue,'SheetModel':SheetModel,'SheetGrid':SheetGrid,'SheetWorkspace':SheetWorkspace,'SheetViews':SheetViews,'SheetFormatDialog':SheetFormatDialog,'MainWindow':MainWindow,'ResultTableModel':ResultTableModel,'ResultGrid':ResultGrid,'ResultPane':ResultPane,
+    _NATIVE_TYPES={'AboutAuthorDialog':AboutAuthorDialog,'GoldenLogoWidget':GoldenLogoWidget,'AuthorTitleBar':AuthorTitleBar,'qt_object_alive':qt_object_alive,'SheetInteraction':SheetInteraction,'SheetInput':SheetInput,'TechnologiesDialog':TechnologiesDialog,'TechnologyTableModel':TechnologyTableModel,'DatabaseJoinPage':DatabaseJoinPage,'DatabaseJoinDialog':DatabaseJoinDialog,'DatabaseNode':DatabaseNode,'DatabaseExplorer':DatabaseExplorer,'DatabaseDataModel':DatabaseDataModel,'DatabaseRecordsModel':DatabaseRecordsModel,'DatabaseGraph':DatabaseGraph,'DatabaseTaskQueue':DatabaseTaskQueue,'SheetModel':SheetModel,'SheetGrid':SheetGrid,'SheetWorkspace':SheetWorkspace,'SheetViews':SheetViews,'SheetFormatDialog':SheetFormatDialog,'MainWindow':MainWindow,'ResultTableModel':ResultTableModel,'ResultGrid':ResultGrid,'ResultPane':ResultPane,
                    'PivotBuilder':PivotBuilder,'SourceDialog':SourceDialog,'FilterDialog':FilterDialog,'MeasureDialog':MeasureDialog,
                    'DimensionDialog':DimensionDialog,'ImportDialog':ImportDialog,'WorkbookDialog':WorkbookDialog,'SourceBrowser':SourceBrowser,'DatasetDialog':DatasetDialog,
                    'SettingsDialog':SettingsDialog,'FormDialog':FormDialog,'TitleBar':TitleBar,'WelcomePage':WelcomePage,'WrappedHeading':WrappedHeading,
@@ -13213,6 +13619,109 @@ def sheet_interaction_test_suite():
     return unittest.defaultTestLoader.loadTestsFromTestCase(SheetInteractionTests)
 
 
+def author_test_suite():
+    """Pure geometry/policy and source regressions; NOT native Qt execution."""
+    import unittest
+    class AuthorTests(unittest.TestCase):
+        def test_author_contours_are_from_zloto_not_pivot(self):
+            self.assertEqual(AUTHOR_LOGO_OUTER,((0.,1.68),(-1.46,.84),(-1.46,-.84),(0.,-1.68),(1.46,-.84),(1.46,.84)))
+            self.assertEqual(len(AUTHOR_LOGO_G),16);self.assertIn((.02,.24),AUTHOR_LOGO_G)
+            self.assertIn('ce4fef8c4141b5e5f88af8b10a35f052abcc180a',AUTHOR_LOGO_SOURCE)
+        def test_author_identity_and_fixed_links(self):
+            self.assertEqual(AUTHOR_NAME,'Łukasz Guziczak');self.assertEqual(AUTHOR_EMAIL,'guziczak@proton.me')
+            for key,title,url in AUTHOR_LINKS:
+                self.assertEqual(author_link(key),url);self.assertTrue(url.startswith('https://'));self.assertTrue(title)
+        def test_arbitrary_link_is_rejected(self):
+            for value in ('file:///tmp/x','https://evil.example','javascript:alert(1)','',None):
+                with self.assertRaises(ValueError):author_link(value)
+        def test_g_triangulation_area(self):
+            points=AUTHOR_LOGO_G;triangles=author_triangulate(points)
+            self.assertEqual(len(triangles),len(points)-2)
+            area=sum(author_polygon_area(tuple(points[i] for i in t)) for t in triangles)
+            self.assertAlmostEqual(area,1.58435,places=8)
+            self.assertAlmostEqual(area,author_polygon_area(points),places=8)
+        def test_g_triangles_do_not_fill_empty_interior(self):
+            # Rays from points in the G's aperture must not meet a cap triangle.
+            triangles=[tuple(AUTHOR_LOGO_G[i] for i in t) for t in author_triangulate(AUTHOR_LOGO_G)]
+            for point in ((-.25,0.),(0.,.50),(.3,.55)):
+                self.assertFalse(any(all(_author_cross(t[i],t[(i+1)%3],point)>=-1e-10 for i in range(3)) for t in triangles))
+        def test_invalid_contours_fail_boundedly(self):
+            for points in ((),((0.,0.),(1.,0.)),((0.,0.),(0.,1.),(1.,0.)),((0.,0.),(float('nan'),0.),(1.,1.))):
+                with self.assertRaises(ValueError):author_triangulate(points)
+        def test_mesh_is_cached_and_bounded(self):
+            first=author_logo_mesh();self.assertIs(first,author_logo_mesh())
+            vertices,faces=first;self.assertLess(len(vertices),500);self.assertLess(len(faces),500)
+            self.assertTrue(all(3<=len(f)<=4 and all(0<=i<len(vertices) for i in f) for f in faces))
+        def test_mesh_has_no_open_edges(self):
+            vertices,faces=author_logo_mesh();positions=[tuple(round(v,9) for v in p) for p in vertices]
+            edges=collections.Counter()
+            for face in faces:
+                for a,b in zip(face,face[1:]+face[:1]):edges[tuple(sorted((positions[a],positions[b])))]+=1
+            self.assertTrue(edges);self.assertEqual(set(edges.values()),{2})
+        def test_mesh_has_real_depth_and_bevel_rails(self):
+            vertices,_=author_logo_mesh();zs=sorted(set(round(v[2],6) for v in vertices))
+            self.assertEqual(len(zs),8);self.assertAlmostEqual(zs[-1]-zs[0],.294)
+            self.assertGreater(max(abs(v[0]) for v in vertices),1.46)
+        def test_projection_all_angles_finite_bounded(self):
+            for i in range(144):
+                faces=author_logo_frame(i*math.tau/144)
+                self.assertTrue(faces);self.assertLessEqual(len(faces),236)
+                for depth,points,rgb in faces:
+                    self.assertTrue(math.isfinite(depth));self.assertTrue(all(math.isfinite(v) and abs(v)<2.25 for p in points for v in p))
+                    self.assertTrue(all(type(v) is int and 0<=v<=255 for v in rgb))
+        def test_rotating_frame_changes(self):
+            self.assertNotEqual(author_logo_frame(.1),author_logo_frame(.8))
+        def test_periodic_pose_matches(self):
+            a=author_logo_frame(.3);b=author_logo_frame(.3+math.tau)
+            self.assertEqual(len(a),len(b))
+            for fa,fb in zip(a,b):
+                self.assertAlmostEqual(fa[0],fb[0]);self.assertEqual(fa[2],fb[2])
+                for pa,pb in zip(fa[1],fb[1]):
+                    for x,y in zip(pa,pb):self.assertAlmostEqual(x,y,places=10)
+        def test_projection_rejects_nonfinite_angle(self):
+            for angle in (float('nan'),float('inf'),float('-inf'),'zero',None):
+                with self.assertRaises(ValueError):author_logo_frame(angle)
+        def test_rendering_never_changes_geometry(self):
+            before=author_logo_mesh()
+            for angle in (0.,1.,2.,3.):author_logo_frame(angle)
+            self.assertEqual(before,author_logo_mesh())
+        def test_motion_all_flags(self):
+            for values in itertools.product((False,True),repeat=5):
+                visible,active,reduced,paused,disposed=values
+                actual=author_motion_allowed(visible=visible,active=active,reduced=reduced,paused=paused,disposed=disposed)
+                self.assertEqual(actual,visible and active and not(reduced or paused or disposed))
+        def test_geometry_has_no_import_effects(self):
+            tree=ast.parse(Path(__file__).read_text('utf-8'))
+            functions=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in ('author_logo_mesh','author_logo_frame')]
+            forbidden={'eval','exec','open','urlopen','Popen','Thread','QApplication'}
+            for node in functions:
+                calls={ast.unparse(n.func).rsplit('.',1)[-1] for n in ast.walk(node) if isinstance(n,ast.Call)}
+                self.assertFalse(calls & forbidden)
+        def test_menu_and_palette_keep_author_on_demand(self):
+            source=Path(__file__).read_text('utf-8')
+            self.assertIn("self.action('author','O autorze',self.show_author)",source)
+            self.assertIn("'Pomoc':['demo','author','technologies','info']",source)
+            native=next(n for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name=='native_ui_types')
+            main=next(n for n in native.body if isinstance(n,ast.ClassDef) and n.name=='MainWindow')
+            constructor=next(n for n in main.body if isinstance(n,ast.FunctionDef) and n.name=='__init__')
+            self.assertNotIn('AboutAuthorDialog(',ast.unparse(constructor))
+        def test_author_qt_attributes_do_not_shadow_base_api(self):
+            self.assertEqual(qt_attribute_collisions(Path(__file__).read_text('utf-8')),[])
+        def test_author_sources_do_not_touch_projects_or_installers(self):
+            tree=ast.parse(Path(__file__).read_text('utf-8'));native=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='native_ui_types')
+            for cls in [n for n in native.body if isinstance(n,ast.ClassDef) and n.name in ('AboutAuthorDialog','AuthorTitleBar','GoldenLogoWidget')]:
+                text=ast.unparse(cls)
+                for forbidden in ('service.call(', 'subprocess.', 'urllib.', 'save_appearance(', 'QWebEngine', 'read_bytes(', '.exec('):
+                    self.assertNotIn(forbidden,text)
+        def test_author_hidden_and_dispose_stop_timer_contract(self):
+            tree=ast.parse(Path(__file__).read_text('utf-8'));native=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='native_ui_types')
+            logo=next(n for n in native.body if isinstance(n,ast.ClassDef) and n.name=='GoldenLogoWidget')
+            for name in ('hideEvent','dispose'):
+                method=next(n for n in logo.body if isinstance(n,ast.FunctionDef) and n.name==name)
+                self.assertIn('self._timer.stop()',ast.unparse(method))
+    return unittest.defaultTestLoader.loadTestsFromTestCase(AuthorTests)
+
+
 def self_test():
     """No optional packages and no external DB access. Run on the delivered file."""
     import unittest
@@ -13485,7 +13994,7 @@ def self_test():
                 for proc in processes:
                     with contextlib.suppress(subprocess.TimeoutExpired): proc.wait(timeout=5)
     print(f'{APP_NAME} {APP_VERSION} — testy lokalne; Python {platform.python_version()}, SQLite {sqlite3.sqlite_version}',flush=True)
-    suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(CoreTests),gui_contract_test_suite(),file_intake_test_suite(),workbook_test_suite(),sheet_test_suite(),sheet_selection_test_suite(),sheet_contrast_test_suite(),database_explorer_test_suite(),database_join_test_suite(),technology_license_test_suite(),sheet_interaction_test_suite()])
+    suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(CoreTests),gui_contract_test_suite(),file_intake_test_suite(),workbook_test_suite(),sheet_test_suite(),sheet_selection_test_suite(),sheet_contrast_test_suite(),database_explorer_test_suite(),database_join_test_suite(),technology_license_test_suite(),sheet_interaction_test_suite(),author_test_suite()])
     result=unittest.TextTestRunner(verbosity=2).run(suite)
     print('Testy rdzenia nie zastępują integracji z H2 / Firebird / Oracle. Testy Qt: --ui-test.',flush=True)
     return 0 if result.wasSuccessful() else 1
@@ -13738,6 +14247,72 @@ def ui_test():
         def nav_pump(self):
             QTest.qWait(30);app.processEvents();QTest.qWait(30)
             self.assertFalse(self.callback_errors,str(self.callback_errors))
+        def open_author_fixture(self):
+            dialog=self.window.show_author();app.processEvents()
+            self.addCleanup(lambda:dialog.dispose() if ui['qt_object_alive'](dialog) else None)
+            return dialog
+        def test_author_menu_action_is_present(self):
+            self.assertEqual(self.window.app_actions['author'].text(),'O autorze')
+        def test_author_dialog_is_single_instance(self):
+            dialog=self.open_author_fixture();self.assertIs(dialog,self.window.show_author());dialog.reject()
+        def test_author_esc_closes_without_editing(self):
+            before=clone(self.service.document);dialog=self.open_author_fixture()
+            QTest.keyClick(dialog,Qt.Key.Key_Escape);app.processEvents()
+            self.assertIsNone(self.window._author_dialog);self.assertEqual(self.service.document,before)
+        def test_author_timer_rotates_only_visible_widget(self):
+            dialog=self.open_author_fixture();logo=dialog.logo
+            logo.set_activity(True,False);old=logo._angle;QTest.qWait(100)
+            self.assertNotEqual(old,logo._angle)
+            logo.hide();old=logo._angle;QTest.qWait(100)
+            self.assertEqual(old,logo._angle);self.assertFalse(logo._timer.isActive());dialog.reject()
+        def test_author_pause_retains_pose(self):
+            dialog=self.open_author_fixture();logo=dialog.logo;logo.set_activity(True,False)
+            logo.set_paused(True);old=logo._angle;QTest.qWait(90)
+            self.assertEqual(old,logo._angle);self.assertFalse(logo._timer.isActive())
+            logo.set_paused(False);self.assertTrue(logo._timer.isActive());dialog.reject()
+        def test_author_reduced_motion_stops_rotation(self):
+            dialog=self.open_author_fixture();logo=dialog.logo;logo.set_activity(True,True)
+            self.assertFalse(logo._timer.isActive());old=logo._angle;QTest.qWait(90)
+            self.assertEqual(old,logo._angle);dialog.reject()
+        def test_author_deactivation_stops_rotation(self):
+            dialog=self.open_author_fixture();logo=dialog.logo;logo.set_activity(True,False);logo.set_activity(False)
+            self.assertFalse(logo._timer.isActive());dialog.reject()
+        def test_author_close_disposes_owned_timer_and_filter(self):
+            dialog=self.open_author_fixture();dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose,False)
+            dialog.reject();app.processEvents()
+            self.assertTrue(dialog._disposed);self.assertTrue(dialog.logo._disposed);self.assertFalse(dialog.logo._timer.isActive())
+            if dialog._edge_controller is not None:self.assertFalse(dialog._edge_controller._installed)
+            dialog.deleteLater()
+        def test_author_compact_layout_and_footer_accessible(self):
+            dialog=self.open_author_fixture();dialog.resize(420,480);app.processEvents()
+            self.assertTrue(dialog._compact);self.assertEqual(dialog.scroll.horizontalScrollBar().maximum(),0)
+            self.assertTrue(dialog.done_button.isVisible());self.assertGreater(dialog.name_label.width(),160);dialog.reject()
+        def test_author_wide_layout_has_separate_mark_and_text(self):
+            dialog=self.open_author_fixture();dialog.resize(850,510);app.processEvents()
+            self.assertFalse(dialog._compact)
+            self.assertLess(dialog.mark_panel.geometry().right(),dialog.info_panel.geometry().left());dialog.reject()
+        def test_author_real_paint_two_poses(self):
+            dialog=self.open_author_fixture();logo=dialog.logo;logo.set_paused(True)
+            logo._angle=.1;first=logo.grab().toImage();logo._angle=.9;second=logo.grab().toImage()
+            self.assertFalse(first.isNull());self.assertNotEqual(first,second);self.assertGreaterEqual(logo._paint_count,2);dialog.reject()
+        def test_author_copy_email(self):
+            previous=app.clipboard().text();dialog=self.open_author_fixture()
+            try:
+                QTest.mouseClick(dialog.copy_email_button,Qt.MouseButton.LeftButton)
+                self.assertEqual(app.clipboard().text(),AUTHOR_EMAIL);self.assertIn(AUTHOR_EMAIL,dialog.feedback.text())
+            finally:app.clipboard().setText(previous);dialog.reject()
+        def test_author_link_failure_stays_in_dialog(self):
+            from unittest import mock
+            dialog=self.open_author_fixture()
+            with mock.patch.object(ui['QtGui'].QDesktopServices,'openUrl',return_value=False) as opener:
+                QTest.mouseClick(dialog.link_buttons['website'],Qt.MouseButton.LeftButton)
+                self.assertTrue(dialog.isVisible());self.assertIn('Nie udało',dialog.feedback.text())
+                self.assertEqual(opener.call_args.args[0].toString(),author_link('website'))
+            dialog.reject()
+        def test_author_reopen_after_close_has_fresh_state(self):
+            first=self.open_author_fixture();first.reject();app.processEvents()
+            second=self.open_author_fixture();self.assertFalse(second._disposed);self.assertFalse(second.logo._paused);second.reject()
+
         def test_nav_empty_enter_moves_without_dirtying(self):
             from PySide6.QtTest import QSignalSpy
             ws=self.navigation_workspace();before=clone(ws.session.book);spy=QSignalSpy(ws.model.modelReset)
@@ -14585,6 +15160,8 @@ def ui_test():
 
 
 THIRD_PARTY = '''Pivot Studio: original application code, MIT License.
+Author monogram: Łukasz Guziczak, embedded at the author's request from
+  https://guziczak.github.io/zloto/ ; a brand mark, not a bundled third-party library.
 Python: PSF License; https://www.python.org/psf/license/
 SQLite: public domain; https://www.sqlite.org/copyright.html
 Open Help > Technologies and licenses for a local version/notice inventory.
