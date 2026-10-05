@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Pivot Studio 0.7.3 — lokalny arkusz i analizy w jednym pliku.
+"""Pivot Studio 0.7.4 — lokalny arkusz i analizy w jednym pliku.
 
 Uruchomienie: py PivotStudio.py (Windows) / python3 PivotStudio.py.
 Tkinter: wybór PyPI / własnego Artifactory przed pobraniem bibliotek.
@@ -29,6 +29,9 @@ Escape, zakresy i zamrożone okienka. Edycja wartości nie resetuje siatki.
 Bez zmian zależności, instalatora, formatu projektu i obliczeń.
 0.7.3: Pomoc → O autorze; własny złoty monogram autora, obrót tylko w
 widocznym aktywnym dialogu. Osadzona geometria, bez sieci i bez nowego intro.
+0.7.4: przygotowanie sterowników przy połączeniu, pamięć źródła pobierania,
+opcjonalne sterowniki od pierwszego startu i restart z potwierdzoną kopią pracy.
+Aktualny złoty znak Przesmyk z /zloto/; poprawki zapisu i eksportu na Windows.
 """
 from __future__ import annotations
 
@@ -71,7 +74,7 @@ from xml.sax.saxutils import escape as xml_escape
 import zipfile
 
 APP_NAME = 'Pivot Studio'
-APP_VERSION = '0.7.3'
+APP_VERSION = '0.7.4'
 PROJECT_VERSION = 4
 PROJECT_APP_ID = 0x50565331
 MAX_BODY = 4 * 1024 * 1024
@@ -103,6 +106,54 @@ class UserError(Exception):
 
 class Cancelled(UserError):
     pass
+
+
+DEPENDENCY_MODULES = {'desktop':'PySide6.QtWidgets', 'oracle':'oracledb',
+                      'firebird':'firebird.driver', 'h2':'jpype', 'secrets':'keyring'}
+DEPENDENCY_NAMES = {'desktop':'interfejsu', 'oracle':'Oracle', 'firebird':'Firebirda',
+                    'h2':'H2', 'secrets':'magazynu poświadczeń'}
+
+
+def dependency_problem(profile, state, details=''):
+    if profile not in DEPENDENCY_MODULES or state not in ('missing','broken','external'):
+        raise UserError('Nieznany składnik przygotowania.')
+    name=DEPENDENCY_NAMES[profile]
+    title=('Obsługa '+name+' nie jest jeszcze przygotowana.' if state=='missing' else
+           'Obsługa '+name+' wymaga naprawy.' if state=='broken' else
+           'Obsługa '+name+' wymaga dodatkowego składnika.')
+    message=('Przygotuj sterownik, aby połączyć się z bazą. Dane połączenia pozostaną zachowane.'
+             if state=='missing' else 'Nie można załadować sterownika lub jednej z jego zależności. Przygotuj sprawdzone środowisko.'
+             if state=='broken' else 'Wskaż wymagany składnik w ustawieniach połączeń. Pobranie pakietu Python go nie zastępuje.')
+    return {'state':state,'profile':profile,'title':title,'message':message,'details':str(details)[:3500]}
+
+
+class DependencyError(UserError):
+    """Typed capability failure, also transported over the worker protocol."""
+    def __init__(self, profile, state='missing', details=''):
+        self.dependency=dependency_problem(profile,state,details)
+        super().__init__(self.dependency['title']+' '+self.dependency['message']+
+                         ('\n'+self.dependency['details'] if details else ''))
+
+
+def dependency_status(profile, settings=None):
+    """Cheap discovery in the running interpreter; the worker verifies the real import.
+
+    A discoverable package is not proof of a working database connection.
+    Native clients are checked when a particular connection requests them.
+    """
+    if profile not in DEPENDENCY_MODULES:
+        return {'state':'ready','profile':profile,'title':'','message':'','details':''}
+    module=DEPENDENCY_MODULES[profile]
+    try:
+        if importlib.util.find_spec(module) is None:
+            return dependency_problem(profile,'missing', 'Brak pakietu '+module+' w interpreterze używanym przez Pivot Studio.')
+    except ModuleNotFoundError as exc:
+        state='missing' if exc.name and (module==exc.name or module.startswith(exc.name+'.')) else 'broken'
+        return dependency_problem(profile,state,str(exc))
+    except Exception as exc:
+        return dependency_problem(profile,'broken',safe_error(exc))
+    return {'state':'ready','profile':profile,'title':'Sterownik dostępny',
+            'message':'Import i połączenie zostaną sprawdzone podczas otwierania źródła.','details':''}
 
 
 def uid() -> str:
@@ -162,9 +213,11 @@ def file_digest(path: Path | str) -> str:
 def require_module(name: str, profile: str):
     try:
         return __import__(name, fromlist=['_'])
-    except ImportError as e:
-        raise UserError(f'Brak biblioteki {name}. Otwórz Ustawienia → instalacja {profile}, '
-                        'a po udanej instalacji uruchom aplikację ponownie.') from e
+    except ModuleNotFoundError as exc:
+        missing=exc.name and (name==exc.name or name.startswith(exc.name+'.'))
+        raise DependencyError(profile,'missing' if missing else 'broken',safe_error(exc)) from exc
+    except Exception as exc:
+        raise DependencyError(profile,'broken',safe_error(exc)) from exc
 
 
 def clean_text(value, limit=512) -> str:
@@ -826,13 +879,28 @@ class OracleAdapter(Adapter):
         oracle = require_module('oracledb','oracle'); o=self.options
         if o.get('mode','thin')=='thick':
             lib=self.runtime.get('oracle_client','')
-            if not lib or not Path(lib).is_dir(): raise UserError('W Ustawieniach wybierz katalog zgodnego Oracle Client dla trybu Thick.')
-            oracle.init_oracle_client(lib_dir=lib)
+            if not lib or not Path(lib).is_dir():
+                raise DependencyError('oracle','external','W ustawieniach wybierz katalog zgodnego Oracle Client dla trybu Thick.')
+            try:oracle.init_oracle_client(lib_dir=lib)
+            except Exception as exc:
+                raise DependencyError('oracle','external','Nie można załadować Oracle Client: '+safe_error(exc,self.password)) from exc
         kw={'host':o.get('host'),'port':o.get('port',1521),'user':o.get('user'),
             'password':self.password,'tcp_connect_timeout':10}
         if o.get('sid'): kw['sid']=o['sid']
         else: kw['service_name']=o.get('service')
-        self.conn=oracle.connect(**kw)
+        try:self.conn=oracle.connect(**kw)
+        except Exception as exc:
+            error=exc.args[0] if exc.args else exc
+            code=getattr(error,'full_code','')
+            hint=''
+            if code in ('ORA-01017','ORA-28000','ORA-28001'):
+                hint='Sprawdź login, hasło i stan konta Oracle. Sterownik jest dostępny. '
+            elif code in ('ORA-01031','ORA-00942'):
+                hint='Konto Oracle nie ma wymaganych uprawnień do wybranego źródła. '
+            elif code.startswith('ORA-125') or code in ('DPY-6000','DPY-6005'):
+                hint='Sprawdź host, port, Service Name/SID oraz dostęp do sieci lub VPN. '
+            if hint:raise UserError(hint+safe_error(exc,self.password)) from exc
+            raise
         self.conn.call_timeout=self.timeout*1000
         def output_handler(cursor,metadata):
             if metadata.type_code==oracle.DB_TYPE_NUMBER:
@@ -869,7 +937,7 @@ class FirebirdAdapter(Adapter):
         fb=require_module('firebird.driver','firebird'); o=self.options
         lib=self.runtime.get('firebird_client','')
         if lib:
-            if not Path(lib).is_file(): raise UserError('Nie znaleziono wybranej biblioteki fbclient.')
+            if not Path(lib).is_file(): raise DependencyError('firebird','external','Nie znaleziono wybranej biblioteki fbclient.')
             fb.driver_config.fb_client_library.value=lib
         database=o.get('database','')
         if not database: raise UserError('Wpisz alias lub ścieżkę bazy Firebird.')
@@ -945,10 +1013,10 @@ class H2Adapter(Adapter):
     kind='h2'
     def connect(self):
         jp=require_module('jpype','h2'); jar=self.runtime.get('h2_jar','')
-        if not jar or not Path(jar).is_file(): raise UserError('W Ustawieniach wybierz JAR H2 2.x. Potrzebna jest też zgodna 64-bitowa Java.')
+        if not jar or not Path(jar).is_file(): raise DependencyError('h2','external','W ustawieniach wybierz JAR H2 2.x. Potrzebna jest też zgodna 64-bitowa Java.')
         if not jp.isJVMStarted():
             try: jp.startJVM(classpath=[str(Path(jar).resolve())],convertStrings=True)
-            except Exception as e: raise UserError('Nie można uruchomić Javy: '+str(e)) from e
+            except Exception as e: raise DependencyError('h2','external','Nie można uruchomić Javy: '+safe_error(e)) from e
         o=self.options; mode=o.get('mode','file')
         if mode=='file':
             path=Path(o.get('path','')).expanduser().resolve()
@@ -1514,7 +1582,7 @@ class ProjectStore:
             conn.execute('INSERT OR REPLACE INTO project VALUES(1,?)',(dumps(project),));conn.commit()
             conn.execute('VACUUM');conn.close()
             if tmp.stat().st_size>MAX_PROJECT:raise UserError('Projekt przekracza 128 MB.')
-            with tmp.open('rb') as f:os.fsync(f.fileno())
+            with tmp.open('r+b') as f:os.fsync(f.fileno())
             if path.exists() and file_digest(path)!=expected:raise UserError('Projekt zmienił się podczas zapisu. Nie nadpisano go.')
             if legacy:
                 backup=path.with_name(path.stem+'.przed-v'+str(PROJECT_VERSION)+'-'+uid()[:8]+'.pivot')
@@ -2222,7 +2290,7 @@ def export_result(result_path,destination,fmt,cancelled=None):
                 for i,(k,v) in enumerate(info,1):
                     xml+=f'<row r="{i}" ht="44" customHeight="1">'+xlsx_cell('A'+str(i),pack(k),1)+xlsx_cell('B'+str(i),pack(v),11)+'</row>'
                 z.writestr('xl/worksheets/sheet2.xml',xml+'</sheetData></worksheet>')
-        with open(temp,'rb') as f: os.fsync(f.fileno())
+        with open(temp,'r+b') as f: os.fsync(f.fileno())
         os.replace(temp,destination)
         return {'path':str(destination),'rows':meta['row_count'],'metadata_path':str(destination.with_suffix('.csv.meta.json')) if fmt=='csv' else ''}
     finally:
@@ -3160,7 +3228,9 @@ def worker_main():
             except Exception as exc:
                 is_cancel=event.is_set() or isinstance(exc,Cancelled)
                 message='Anulowano wykonanie lub przekroczono limit czasu. Poprzedni wynik zachowano.' if is_cancel else safe_error(exc,request.get('password',''))
-                send({'id':jid,'event':'error','message':message,'cancelled':is_cancel})
+                failure={'id':jid,'event':'error','message':message,'cancelled':is_cancel}
+                if isinstance(exc,DependencyError) and not is_cancel:failure['dependency']=exc.dependency
+                send(failure)
             finally:
                 if watchdog: watchdog.cancel()
                 if adapter:
@@ -3226,6 +3296,7 @@ class WorkerClient:
                     elif message.get('event')=='error':
                         job.update(status='cancelled' if message.get('cancelled') else 'error',
                                    error=message.get('message','Błąd sterownika'),ended=utcnow()); self.busy=None
+                        if isinstance(message.get('dependency'),dict):job['dependency']=message['dependency']
         finally:
             with self.hub.lock:
                 if self.busy and self.busy in self.hub.jobs:
@@ -3429,6 +3500,53 @@ def sheet_view_colors(style, overrides=None, theme='dark', *, selected=False, cu
 
 PUBLIC_INDEX = 'https://pypi.org/simple'
 _BOOTSTRAP_ACTIVE = False
+INSTALL_PROFILE_LABELS = {'desktop':'Pivot Studio','oracle':'Oracle','firebird':'Firebird','h2':'H2',
+                          'secrets':'magazynu poświadczeń','drivers':'baz danych','all':'wszystkich funkcji'}
+OPTIONAL_INSTALL_PROFILES = ('oracle','firebird','h2','secrets')
+
+
+def installer_profile_problem(profile,version=None):
+    if profile not in INSTALL_PROFILE_LABELS:return 'Nieznany profil instalacji.'
+    version=tuple(version or sys.version_info[:2])
+    if not (3,10)<=version<(3,15) or sys.maxsize<=2**32:return 'Wymagany Python 3.10–3.14, 64-bit.'
+    if profile=='firebird' and version<(3,11):
+        return 'Sterownik Firebird wymaga Pythona 3.11 lub nowszego. Pozostałe funkcje mogą działać bez niego.'
+    return ''
+
+
+class OptionalPreparationError(UserError):
+    """A verified runtime is available; optional additions need a user decision."""
+    def __init__(self,marker,failures):
+        self.marker=dict(marker);self.failures=dict(failures)
+        names=', '.join(INSTALL_PROFILE_LABELS[key] for key in failures)
+        super().__init__('Pivot Studio jest gotowe. Nie przygotowano: '+names+'.\n'+
+                         '\n'.join(INSTALL_PROFILE_LABELS[key]+': '+message for key,message in failures.items()))
+
+
+def prepare_bootstrap_environment(profile,*,include_drivers=False,optional_profiles=None,prepare=None,**options):
+    """Publish a checked desktop first; each optional failure keeps the last checked generation."""
+    prepare=prepare or install_environment
+    if not include_drivers:return prepare(profile,**options)
+    selected=tuple(OPTIONAL_INSTALL_PROFILES if optional_profiles is None else optional_profiles)
+    if profile!='desktop' or not set(selected)<=set(OPTIONAL_INSTALL_PROFILES):raise UserError('Nieznany profil instalacji.')
+    marker=load_runtime_marker(options.get('root'))
+    if not marker or marker.get('version')!=APP_VERSION or 'desktop' not in marker.get('profiles',[]):
+        marker=prepare('desktop',**options)
+    failures={};cancel=options.get('cancel');progress=options.get('progress',lambda _:None)
+    for optional in selected:
+        if cancel is not None and cancel.is_set():raise Cancelled('Przerwano przygotowanie dodatków. Sprawdzone środowisko pozostaje gotowe.')
+        if optional in marker.get('profiles',[]):continue
+        problem=installer_profile_problem(optional)
+        if problem:failures[optional]=problem;progress(problem);continue
+        optional_options=dict(options);stage=options.get('stage')
+        if stage:optional_options['stage']=lambda key,text,label=INSTALL_PROFILE_LABELS[optional]:stage(key,label+': '+text)
+        try:marker=prepare(optional,**optional_options)
+        except Cancelled:raise
+        except Exception as exc:
+            failures[optional]=installation_redactor(options.get('source'))(str(exc))
+            progress(INSTALL_PROFILE_LABELS[optional]+': '+failures[optional])
+    if failures:raise OptionalPreparationError(marker,failures)
+    return marker
 
 
 def appearance_preferences(root=None):
@@ -3507,6 +3625,30 @@ def save_package_source(source,root=None):
     atomic_bytes(Path(root or runtime_root())/'source.json',json.dumps({'version':1,'source':safe},ensure_ascii=False,indent=2).encode('utf-8'))
 
 
+def package_source_identity(source):
+    return digest({k:source.get(k,'') for k in ('mode','index_url','username','ca_file','proxy','wheel_dir')})
+
+
+def reuse_verified_wheels(marker,root,destination,source):
+    """Reuse only bytes from a checked generation of the same explicitly selected source."""
+    if (not marker or marker.get('version')!=APP_VERSION or marker.get('source_identity')!=package_source_identity(source)
+        or marker.get('python_version')!=list(sys.version_info[:2])):return []
+    try:
+        generation=Path(marker['python']).resolve().parent.parent
+        generation.relative_to(Path(root).resolve())
+        lockfile=generation/'requirements.lock'
+        if file_digest(lockfile)!=marker.get('lock_sha256'):return []
+        rows=[line.split(' --hash=sha256:',1) for line in lockfile.read_text('utf-8').splitlines()]
+        if any(len(row)!=2 or not re.fullmatch(r'[0-9a-f]{64}',row[1]) for row in rows):return []
+        by_hash={sha:package for package,sha in rows};constraints=[]
+        for wheel in (generation/'wheels').glob('*.whl'):
+            expected=by_hash.get(file_digest(wheel))
+            if expected:
+                shutil.copyfile(wheel,Path(destination)/wheel.name);constraints.append(expected)
+        return sorted(set(constraints))
+    except (OSError,KeyError,ValueError):return []
+
+
 def installer_environment(source=None):
     env=dict(os.environ)
     for k in tuple(env):
@@ -3540,6 +3682,7 @@ cfg=json.loads(sys.stdin.readline())
 s=cfg['source']
 args=['pip','--isolated','download','--disable-pip-version-check','--no-input','--only-binary=:all:',
       '--no-cache-dir','--progress-bar','off','--retries','2','--timeout','30','--dest',cfg['dest']]
+if cfg.get('reuse'):args+=['--find-links',cfg['dest'],'--constraint',cfg['constraints']]
 if s['mode']=='offline':args+=['--no-index','--find-links',s['wheel_dir']]
 else:
     u=urlsplit(s['index_url'])
@@ -3609,6 +3752,12 @@ def install_environment(profile,root=None,wheelhouse=None,progress=print,*,sourc
     Source password crosses stdin only, never OS arguments, files or child env.
     Download hashes lock these downloaded bytes; they are NOT publisher signatures.
     """
+    problem=installer_profile_problem(profile)
+    if problem:raise UserError(problem)
+    requested=set(OPTIONAL_INSTALL_PROFILES) if profile=='drivers' else set(REQUIREMENTS) if profile=='all' else {profile}
+    for key in requested:
+        problem=installer_profile_problem(key)
+        if problem:raise UserError(problem)
     root=private_dir(Path(root or runtime_root())); cancel=cancel or threading.Event(); stage=stage or (lambda *_:None)
     if source is None:
         source=package_source('offline',wheel_dir=str(wheelhouse)) if wheelhouse else load_package_source(root)
@@ -3671,9 +3820,10 @@ def install_environment(profile,root=None,wheelhouse=None,progress=print,*,sourc
         with installation_lock(root,cancel):
             check(); previous=load_runtime_marker(root)
             profiles=set(previous.get('profiles',[]))&set(REQUIREMENTS) if previous else set()
-            requested={'oracle','firebird','h2','secrets'} if profile=='drivers' else set(REQUIREMENTS) if profile=='all' else {profile}
-            if not requested<=set(REQUIREMENTS):raise UserError('Nieznany profil instalacji.')
             profiles|=requested; profiles.add('desktop')
+            for key in profiles:
+                problem=installer_profile_problem(key)
+                if problem:raise UserError(problem)
             save_package_source(source,root)
             generation=root/('py'+str(sys.version_info.major)+str(sys.version_info.minor)+'-'+uid()[:8]);private_dir(generation)
             py=generation/('Scripts/python.exe' if os.name=='nt' else 'bin/python')
@@ -3681,8 +3831,12 @@ def install_environment(profile,root=None,wheelhouse=None,progress=print,*,sourc
             if os.name=='nt' and base.name.lower()=='pythonw.exe':base=base.with_name('python.exe')
             stage('environment','Tworzę prywatne środowisko Pythona.');run([base,'-I','-m','venv',generation],timeout=180)
             wheels=private_dir(generation/'wheels'); packages=[p for x in sorted(profiles) for p in REQUIREMENTS[x]]
+            constraints=reuse_verified_wheels(previous,root,wheels,source)
+            constraints_file=generation/'previous-versions.txt'
+            if constraints:atomic_bytes(constraints_file,('\n'.join(constraints)+'\n').encode('utf-8'))
             stage('download','Pobieram biblioteki z wybranego źródła.');emit('Źródło: '+(source['wheel_dir'] if source['mode']=='offline' else source['index_url']))
-            run([py,'-I','-u','-c',_PIP_DOWNLOAD_CODE],payload={'source':source,'packages':packages,'dest':str(wheels)},timeout=1800)
+            run([py,'-I','-u','-c',_PIP_DOWNLOAD_CODE],payload={'source':source,'packages':packages,'dest':str(wheels),
+                'reuse':bool(constraints),'constraints':str(constraints_file)},timeout=1800)
             check();lines=[]
             for whl in sorted(wheels.glob('*.whl')):
                 bits=whl.name.split('-');lines.append(f'{bits[0].replace("_","-")}=={bits[1]} --hash=sha256:{file_digest(whl)}')
@@ -3693,12 +3847,16 @@ def install_environment(profile,root=None,wheelhouse=None,progress=print,*,sourc
                 '--no-index','--find-links',wheels,'--require-hashes','-r',lockfile])
             stage('verify','Sprawdzam spójność zależności i rzeczywiste importy.')
             run([py,'-I','-m','pip','--isolated','check'])
-            modules=['from PySide6 import QtCore, QtGui, QtWidgets, QtSvg']
-            for key,code in [('oracle','import oracledb'),('firebird','import firebird.driver'),('h2','import jpype'),('secrets','import keyring')]:
-                if key in profiles:modules.append(code)
-            run([py,'-I','-c','; '.join(modules)+"; print('Importy bibliotek: OK')"],timeout=90)
+            desktop_imports='from PySide6 import QtCore, QtGui, QtWidgets, QtSvg'
+            if 'secrets' in profiles:desktop_imports+='; import keyring'
+            run([py,'-I','-c',desktop_imports+"; print('Importy interfejsu: OK')"],timeout=90)
+            # Drivers run in isolated workers. Qt's import hook must not participate
+            # in their probes (notably dateutil/six imported by Firebird on Windows).
+            for key,code in [('oracle','import oracledb'),('firebird','import firebird.driver'),('h2','import jpype')]:
+                if key in profiles:run([py,'-I','-c',code+f"; print('Import {key}: OK')"],timeout=90)
             check();marker={'python':str(py),'profiles':sorted(profiles),'version':APP_VERSION,'installed':utcnow(),
-                'platform':platform.platform(),'lock_sha256':file_digest(lockfile)}
+                'platform':platform.platform(),'python_version':list(sys.version_info[:2]),
+                'lock_sha256':file_digest(lockfile),'source_identity':package_source_identity(source)}
             atomic_bytes(root/'current.json',json.dumps(marker,indent=2).encode())
             stage('ready','Środowisko jest gotowe.');emit('Gotowe. Poprzednie środowisko pozostaje na dysku.');return marker
     finally:
@@ -4077,6 +4235,77 @@ class ApplicationService:
             with contextlib.suppress(FileNotFoundError): self.recovery_path.unlink()
         # Windows workers may still be closing result files. Only remove our own random session.
         with contextlib.suppress(OSError): shutil.rmtree(self.session)
+
+def prepare_restart_handoff(service, context=None):
+    """Save and read back an isolated restart copy before touching the live GUI.
+
+    Only document data and source identity cross the restart. Passwords, trust,
+    SQL authorization and active jobs never do. The original save target and
+    dirty state are retained so a private recovery copy cannot masquerade as a
+    successful save to the user's project file.
+    """
+    context=context or {}
+    with service.lock:
+        if service.hub.running():raise UserError('Zakończ lub anuluj zadania przed ponownym uruchomieniem.')
+        if any(j.get('status')=='running' for j in service.local_jobs.values()):
+            raise UserError('Przygotowanie bibliotek jeszcze trwa.')
+        marker=load_runtime_marker()
+        if not marker:raise UserError('Nie znaleziono przygotowanego środowiska. Bieżąca sesja pozostaje otwarta.')
+        source_id=''
+        if context.get('generation',service.generation)==service.generation:
+            source=next((s for s in service.document['sources'] if s['id']==context.get('source_id')),None)
+            if source and context.get('source_fingerprint')==digest(source):source_id=source['id']
+        directory=private_dir(service.recovery_dir/'restarts'/uid())
+        snapshot,checksum=ProjectStore.save(directory/'document.pivot',service.document)
+        restored,verified=ProjectStore.load(snapshot,service.resource_dir)
+        if verified!=checksum or digest(restored)!=digest(validate_project(service.document)):
+            raise UserError('Nie potwierdzono kopii roboczej. Nie zamknięto programu.')
+        manifest={'version':1,'snapshot_sha256':checksum,'project_path':service.project_path,
+                  'disk_digest':service.disk_digest,'saved_fingerprint':service.saved_fingerprint,
+                  'source_id':source_id,'created':utcnow()}
+        path=directory/'handoff.json';atomic_bytes(path,dumps(manifest).encode('utf-8'))
+        return {'path':str(path),'ready_path':str(directory/'ready'),'python':marker['python'],
+                'cancel_path':str(directory/'cancelled'),'data_root':str(service.root),'source_id':source_id}
+
+
+def load_restart_handoff(service, path):
+    path=Path(path).expanduser().resolve()
+    base=(service.recovery_dir/'restarts').resolve()
+    if (path.name!='handoff.json' or not re.fullmatch('[a-f0-9]{32}',path.parent.name)
+        or path.parent.parent!=base or not path.is_file() or path.stat().st_size>16384):
+        raise UserError('Nieprawidłowa kopia ponownego uruchomienia.')
+    if (path.parent/'cancelled').exists():raise Cancelled('Ponowne uruchomienie zostało anulowane przez poprzednią sesję.')
+    try:
+        value=json.loads(path.read_text('utf-8'))
+        if not isinstance(value,dict) or value.get('version')!=1:raise ValueError()
+        if set(value)!={'version','snapshot_sha256','project_path','disk_digest','saved_fingerprint','source_id','created'}:raise ValueError()
+        for key in ('snapshot_sha256','saved_fingerprint'):
+            if not isinstance(value[key],str) or (value[key] and not re.fullmatch('[a-f0-9]{64}',value[key])):raise ValueError()
+        if value['disk_digest'] is not None and not re.fullmatch('[a-f0-9]{64}',str(value['disk_digest'])):raise ValueError()
+        if not isinstance(value['project_path'],str) or len(value['project_path'])>2048:raise ValueError()
+        document,checksum=ProjectStore.load(path.parent/'document.pivot',service.resource_dir)
+        if checksum!=value['snapshot_sha256']:raise ValueError()
+    except (ValueError,TypeError,KeyError,OSError) as exc:
+        raise UserError('Nie potwierdzono kopii ponownego uruchomienia. Poprzednia sesja pozostaje dostępna.') from exc
+    service.document=document;service.project_path=value['project_path'];service.disk_digest=value['disk_digest']
+    service.saved_fingerprint=value['saved_fingerprint'];service.generation+=1
+    service.trusted.clear();service.trusted_sql.clear();service.secrets.memory.clear();service.checkpoint()
+    source_id=value['source_id'] if any(s['id']==value['source_id'] for s in document['sources']) else ''
+    return {'source_id':source_id,'ready_path':str(path.parent/'ready'),'cancel_path':str(path.parent/'cancelled')}
+
+
+def launch_restart(handoff):
+    """Launch verified new runtime; the caller closes only after the paint ack."""
+    path=Path(handoff['path']).resolve();python=Path(handoff['python'])
+    if not path.is_file() or not python.is_file():raise UserError('Brak kopii roboczej lub przygotowanego interpretera.')
+    if os.name=='nt' and python.with_name('pythonw.exe').is_file():python=python.with_name('pythonw.exe')
+    env=installer_environment();env['PIVOTSTUDIO_RUNTIME']='1';env['_PIVOT_GUI_DETACHED']='1'
+    with (path.parent/'startup.log').open('ab') as log:
+        return subprocess.Popen([str(python),str(Path(__file__).resolve()),'--no-bootstrap','--no-runtime',
+                                 '--data-dir',handoff['data_root'],'--resume',str(path)],
+                                stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,
+                                env=env,creationflags=CREATE_NO_WINDOW)
+
 
 # ======================== 8. NATYWNY INTERFEJS QT WIDGETS ====================
 
@@ -5533,7 +5762,7 @@ def sheet_export_xlsx(book,path,*,allow_loss=False,allow_formula_errors=False,ca
             archive.writestr('[Content_Types].xml',sheet_package_xml(cts))
         with zipfile.ZipFile(tmp) as check:
             if check.testzip() is not None:raise UserError('Nie potwierdzono poprawności eksportu.')
-        with open(tmp,'rb') as stream:os.fsync(stream.fileno())
+        with open(tmp,'r+b') as stream:os.fsync(stream.fileno())
         os.replace(tmp,destination)
         return {'path':str(destination),'formula_errors':errors,'warnings':book['warnings']}
     finally:
@@ -5565,10 +5794,11 @@ def sheet_range_to_sqlite(book,sid,rect,directory,header=True):
     numeric=[all(v is None or isinstance(v,(int,float,Decimal)) and not isinstance(v,bool) for v in values) and any(v is not None for v in values) for values in zip(*rows)]
     path=private_dir(Path(directory))/(uid()+'.sqlite');tmp=path.with_suffix('.part')
     try:
-        with sqlite3.connect(tmp) as db:
-            db.execute('CREATE TABLE dane ('+', '.join(qident(n)+(' DECIMAL_TEXT' if isnum else ' TEXT') for n,isnum in zip(names,numeric))+')')
-            db.executemany('INSERT INTO dane VALUES ('+','.join('?' for _ in names)+')',
-                          [[str(v) if v is not None else None for v in row] for row in rows])
+        with contextlib.closing(sqlite3.connect(tmp)) as db:
+            with db:
+                db.execute('CREATE TABLE dane ('+', '.join(qident(n)+(' DECIMAL_TEXT' if isnum else ' TEXT') for n,isnum in zip(names,numeric))+')')
+                db.executemany('INSERT INTO dane VALUES ('+','.join('?' for _ in names)+')',
+                              [[str(v) if v is not None else None for v in row] for row in rows])
         os.replace(tmp,path)
     finally:
         with contextlib.suppress(FileNotFoundError):tmp.unlink()
@@ -5956,10 +6186,10 @@ def filter_technology_rows(report,query='',group='',installed_only=False):
 
 
 # --- Author identity and embedded, software-rendered gold mark (0.7.3) ---------
-# Author-supplied mark, ported at the author's request from guziczak/zloto:
-# index.html at ce4fef8c4141b5e5f88af8b10a35f052abcc180a
-# blob 44ad77902baa793fd76984242b63f6fedeff9cbb; outer / inner / cog contours.
-# No Three.js, web renderer, downloaded texture, font, or executable is embedded.
+# Author-supplied Przesmyk mark, ported from the live /zloto/ page, 2026-10-05.
+# Exact assets.logo contours and geometry/brand extrusion: two separate castings.
+# The data digest below identifies the deployed geometry independently of Git HEAD.
+# No web renderer, downloaded texture, font, or executable is embedded.
 AUTHOR_NAME = 'Łukasz Guziczak'
 AUTHOR_ROLE = 'AI Engineer & Builder'
 AUTHOR_BIO = ('Projektuję systemy AI, rozwijam własne produkty i skracam drogę '
@@ -5970,12 +6200,54 @@ AUTHOR_LINKS = (
     ('github', 'GitHub', 'https://github.com/guziczak'),
     ('linkedin', 'LinkedIn', 'https://www.linkedin.com/in/%C5%82ukasz-guziczak-978a81315/'),
 )
-AUTHOR_LOGO_SOURCE = ('https://github.com/guziczak/zloto/blob/'
-                      'ce4fef8c4141b5e5f88af8b10a35f052abcc180a/index.html')
-AUTHOR_LOGO_OUTER = ((0.,1.68),(-1.46,.84),(-1.46,-.84),(0.,-1.68),(1.46,-.84),(1.46,.84))
-AUTHOR_LOGO_G = ((.7,.68),(0.,1.08),(-.94,.54),(-.94,-.54),(0.,-1.08),(.94,-.54),
-                 (.94,.24),(.02,.24),(.02,-.04),(.66,-.04),(.66,-.38),(0.,-.77),
-                 (-.66,-.38),(-.66,.38),(0.,.77),(.55,.46))
+AUTHOR_LOGO_SOURCE = 'https://guziczak.github.io/zloto/'
+AUTHOR_LOGO_SHA256 = '21d35146c7863d91a707da9f93a2359773b15fedb9265681bdbb92f6ade40268'
+AUTHOR_LOGO_CONTOURS = (
+    (
+        (0.134361,0.927517),(0.065489,0.923785),(-0.002957,0.915718),(-0.070722,0.90341),
+        (-0.13755,0.886957),(-0.203185,0.866452),(-0.267372,0.841991),(-0.329855,0.813669),
+        (-0.39038,0.781579),(-0.448689,0.745817),(-0.504528,0.706478),(-0.557641,0.663655),
+        (-0.607772,0.617443),(-0.654667,0.567938),(-0.698068,0.515234),(-0.737722,0.459425),
+        (-0.773372,0.400606),(-0.804763,0.338872),(-0.831639,0.274317),(-0.855932,0.203557),
+        (-0.873676,0.132456),(-0.884965,0.061184),(-0.889893,-0.010088),(-0.888555,-0.081189),
+        (-0.881046,-0.151949),(-0.867461,-0.222199),(-0.847893,-0.291767),(-0.822439,-0.360483),
+        (-0.791192,-0.428177),(-0.754246,-0.494678),(-0.711698,-0.559816),(-0.663641,-0.623421),
+        (-0.61017,-0.685322),(-0.55138,-0.745349),(-0.487364,-0.803332),(-0.418219,-0.8591),
+        (-0.344039,-0.912483),(-0.031239,-0.498483),(-0.077144,-0.459902),(-0.119756,-0.420857),
+        (-0.159017,-0.381396),(-0.19487,-0.341565),(-0.227259,-0.301413),(-0.256128,-0.260986),
+        (-0.281418,-0.220333),(-0.303074,-0.179499),(-0.321039,-0.138533),(-0.335255,-0.097481),
+        (-0.345667,-0.056392),(-0.352217,-0.015312),(-0.354848,0.025711),(-0.353504,0.066629),
+        (-0.348128,0.107397),(-0.338663,0.147966),(-0.325052,0.188288),(-0.307239,0.228317),
+        (-0.292838,0.256775),(-0.277216,0.283909),(-0.260344,0.309754),(-0.242195,0.334351),
+        (-0.22274,0.357736),(-0.20195,0.379947),(-0.179797,0.401022),(-0.156253,0.421),
+        (-0.131289,0.439917),(-0.104877,0.457812),(-0.076988,0.474723),(-0.047594,0.490688),
+        (-0.016667,0.505743),(0.015821,0.519928),(0.0499,0.53328),(0.085597,0.545837),
+        (0.122942,0.557637),(0.161961,0.568717),(0.474761,0.623917),
+    ),
+    (
+        (0.492725,0.571865),(0.179925,0.157865),(0.227118,0.125251),(0.270562,0.091862),
+        (0.310259,0.057772),(0.346207,0.023057),(0.378407,-0.012206),(0.406859,-0.047943),
+        (0.431562,-0.084077),(0.452518,-0.120533),(0.469725,-0.157235),(0.483184,-0.194108),
+        (0.492896,-0.231075),(0.498859,-0.268061),(0.501073,-0.304991),(0.49954,-0.341788),
+        (0.494259,-0.378376),(0.485229,-0.414681),(0.472451,-0.450626),(0.455925,-0.486135),
+        (0.440167,-0.512895),(0.423567,-0.538016),(0.406134,-0.561567),(0.387878,-0.583613),
+        (0.368808,-0.604219),(0.348933,-0.623454),(0.328263,-0.641382),(0.306807,-0.658071),
+        (0.284575,-0.673585),(0.261577,-0.687993),(0.237821,-0.701359),(0.213318,-0.71375),
+        (0.188076,-0.725233),(0.162106,-0.735873),(0.135416,-0.745737),(0.108016,-0.754892),
+        (0.079916,-0.763402),(0.051125,-0.771335),(-0.096075,-0.936935),(-0.019791,-0.947784),
+        (0.055555,-0.952849),(0.129709,-0.952311),(0.202414,-0.94635),(0.273416,-0.935145),
+        (0.342459,-0.918876),(0.409286,-0.897723),(0.473644,-0.871867),(0.535275,-0.841485),
+        (0.593925,-0.80676),(0.649338,-0.76787),(0.701259,-0.724995),(0.749431,-0.678315),
+        (0.793599,-0.62801),(0.833509,-0.57426),(0.868903,-0.517244),(0.899527,-0.457143),
+        (0.925125,-0.394135),(0.947819,-0.323171),(0.963907,-0.254394),(0.973596,-0.187774),
+        (0.977094,-0.123284),(0.974611,-0.060896),(0.966355,-0.00058),(0.952533,0.057692),
+        (0.933353,0.113947),(0.909025,0.168215),(0.879756,0.220523),(0.845755,0.270901),
+        (0.807229,0.319376),(0.764387,0.365977),(0.717437,0.410732),(0.666588,0.45367),
+        (0.612048,0.494819),(0.554024,0.534208),
+    ),
+)
+AUTHOR_LOGO_DEPTH = .16
+AUTHOR_LOGO_BEVEL = .018
 AUTHOR_LOGO_PERIOD = 12.0
 
 
@@ -6001,9 +6273,9 @@ def _author_cross(a,b,c):
 
 
 def author_triangulate(points):
-    """Bounded ear-clipping for the embedded simple G, not arbitrary user SVG."""
+    """Bounded ear-clipping for the two embedded, concave Przesmyk contours."""
     points=tuple(points)
-    if not 3<=len(points)<=64 or any(not all(math.isfinite(v) for v in p) for p in points):
+    if not 3<=len(points)<=128 or any(not all(math.isfinite(v) for v in p) for p in points):
         raise ValueError('Nieprawidłowy kontur znaku.')
     if author_polygon_area(points)<=1e-10:
         raise ValueError('Kontur musi być niezdegenerowany i przeciwny do wskazówek zegara.')
@@ -6040,24 +6312,19 @@ def _author_offset(points, distance):
 
 @functools.lru_cache(maxsize=1)
 def author_logo_mesh():
-    """Exact author contours; 0.24-unit body, 0.027-unit three-step bevels."""
-    outer=AUTHOR_LOGO_OUTER;inner=tuple((x*.822,y*.822) for x,y in outer)
+    """Source castings, including their open passage, depth and inset bevels."""
     vertices=[];faces=[]
     def vertex(p,z):
         vertices.append((p[0],p[1],z));return len(vertices)-1
-    def surface(points,polygons):
-        back=[vertex(p,-.147) for p in points];front=[vertex(p,.147) for p in points]
-        for poly in polygons:
-            faces.append(tuple(front[i] for i in poly))
-            faces.append(tuple(back[i] for i in reversed(poly)))
-    # Quads preserve the open hole; never cap the ring with a filled hexagon.
-    surface(outer+inner,[(i,(i+1)%6,6+(i+1)%6,6+i) for i in range(6)])
-    surface(AUTHOR_LOGO_G,author_triangulate(AUTHOR_LOGO_G))
-    # Outward bevel matches the source extrusion: original profile at the caps.
-    profile=[(-.12-.027*math.cos(k*math.pi/6),.027*math.sin(k*math.pi/6)) for k in range(4)]
-    profile += [(.12+.027*math.cos(k*math.pi/6),.027*math.sin(k*math.pi/6)) for k in reversed(range(4))]
-    for boundary in (outer,tuple(reversed(inner)),AUTHOR_LOGO_G):
-        rails=[[vertex(p,z) for p in _author_offset(boundary,-expansion)] for z,expansion in profile]
+    half=AUTHOR_LOGO_DEPTH/2;bevel=AUTHOR_LOGO_BEVEL
+    for boundary in AUTHOR_LOGO_CONTOURS:
+        # Same mitered inner contour and four depth levels as extrudeLogo().
+        inner=_author_offset(boundary,bevel)
+        rails=[[vertex(p,z) for p in contour] for contour,z in
+               ((inner,-half),(boundary,-half+bevel),(boundary,half-bevel),(inner,half))]
+        # Qt fills a concave cap as one path. Internal triangulation edges would
+        # otherwise accumulate antialiasing seams across the polished surface.
+        faces.append(tuple(rails[-1]));faces.append(tuple(reversed(rails[0])))
         for lower,upper in zip(rails,rails[1:]):
             for i in range(len(boundary)):
                 j=(i+1)%len(boundary)
@@ -6083,9 +6350,11 @@ def author_logo_frame(angle: float):
     half=(-.22,.27,.937);hl=math.sqrt(sum(v*v for v in half));half=tuple(v/hl for v in half)
     output=[]
     for polygon in polygons:
-        pts=[vertices[i] for i in polygon];a,b,c=pts[:3]
-        u=tuple(b[i]-a[i] for i in range(3));v=tuple(c[i]-a[i] for i in range(3))
-        normal=(u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0])
+        pts=[vertices[i] for i in polygon];a=pts[0]
+        # Newell's area vector also handles a concave cap whose first corner
+        # turns inward; using only its first triangle would flip the back face.
+        edges=tuple(zip(pts,pts[1:]+pts[:1]))
+        normal=tuple(sum(p[j]*q[k]-p[k]*q[j] for p,q in edges) for j,k in ((1,2),(2,0),(0,1)))
         length=math.sqrt(sum(t*t for t in normal))
         if length<1e-10:continue
         normal=tuple(t/length for t in normal)
@@ -6548,11 +6817,15 @@ def native_ui_types():
                 try:
                     if job['status']=='done':
                         if done: done(job.get('value'))
-                    elif error: error(job.get('error','Zadanie anulowano.'))
+                    elif error: error(QtFailure(job.get('error','Zadanie anulowano.'),job.get('dependency')))
                     else: alert(self.parent(),'Nie wykonano operacji',job.get('error','Zadanie anulowano.'))
                 except Exception as exc: alert(self.parent(),'Błąd obsługi wyniku',safe_error(exc))
                 self.changed.emit()
         def cancel(self,jid): self.service.call('cancel',{'id':jid})
+
+    class QtFailure(str):
+        def __new__(cls,message,dependency=None):
+            value=super().__new__(cls,message);value.dependency=clone(dependency) if dependency else None;return value
 
     class ResultTableModel(QC.QAbstractTableModel):
         """Full virtual row range, asynchronous pages, precise numeric transport."""
@@ -6990,7 +7263,7 @@ def native_ui_types():
             self.form=QW.QFormLayout();self.form.setSpacing(12);self.form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft|Qt.AlignmentFlag.AlignVCenter)
             self.form.setFieldGrowthPolicy(QW.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
             self.form.setRowWrapPolicy(QW.QFormLayout.RowWrapPolicy.WrapLongRows);self.body_layout.addLayout(self.form)
-            self.scroll=QW.QScrollArea();self.scroll.setWidgetResizable(True);self.scroll.setWidget(self.body);self.scroll.setFrameShape(QW.QFrame.Shape.NoFrame);root.addWidget(self.scroll,1)
+            self.content_scroll=QW.QScrollArea();self.content_scroll.setWidgetResizable(True);self.content_scroll.setWidget(self.body);self.content_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);root.addWidget(self.content_scroll,1)
             self.error_label=label('',False,True);self.error_label.setObjectName('error');self.error_label.hide()
             self.buttons=QW.QDialogButtonBox(QW.QDialogButtonBox.StandardButton.Ok|QW.QDialogButtonBox.StandardButton.Cancel)
             ok=self.buttons.button(QW.QDialogButtonBox.StandardButton.Ok);ok.setText('Zastosuj');ok.setObjectName('primary');ok.setMinimumWidth(120)
@@ -7020,9 +7293,9 @@ def native_ui_types():
             super().__init__(parent)
             self.setObjectName('authorLogo');self.setMinimumSize(180,180)
             self.setSizePolicy(QW.QSizePolicy.Policy.Expanding,QW.QSizePolicy.Policy.Expanding)
-            self.setAccessibleName('Złoty monogram G Łukasza Guziczaka w sześciokącie')
+            self.setAccessibleName('Złoty sygnet Przesmyk Łukasza Guziczaka')
             self.setAccessibleDescription('Obracający się przestrzenny znak autora. Ruch można wstrzymać przyciskiem poniżej.')
-            self._angle=.12;self._paused=False;self._reduced=False;self._surface_active=False;self._disposed=False
+            self._angle=.18;self._paused=False;self._reduced=False;self._surface_active=False;self._disposed=False
             self._last_tick=0.;self._paint_count=0
             self._mesh=author_logo_mesh()  # Lazy: created only when O autorze is opened.
             self._timer=QC.QTimer(self);self._timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -7059,24 +7332,26 @@ def native_ui_types():
                 painter.setRenderHints(QG.QPainter.RenderHint.Antialiasing|QG.QPainter.RenderHint.SmoothPixmapTransform)
                 painter.setClipRect(self.rect());painter.setPen(Qt.PenStyle.NoPen)
                 dark=ui_theme()=='dark';width,height=self.width(),self.height()
-                scale=max(1.,min(width/4.25,height/4.55));cx,cy=width/2,height*.45
+                scale=max(1.,min(width/2.55,height/2.8));cx,cy=width/2,height*.46
                 # A restrained warm pool of light, confined to the mark's own area.
                 glow=QG.QRadialGradient(QC.QPointF(cx,cy),min(width,height)*.50)
                 glow.setColorAt(0,QG.QColor(213,178,99,17 if dark else 13));glow.setColorAt(1,QG.QColor(213,178,99,0))
                 painter.setBrush(glow);painter.drawEllipse(QC.QRectF(0,0,width,height))
-                painter.save();painter.translate(cx,cy+1.98*scale);painter.scale(1,.12)
+                painter.save();painter.translate(cx,cy+1.17*scale);painter.scale(1,.10)
                 # Transform the gradient with the ellipse rather than allocating a blur.
                 ground=QG.QRadialGradient(QC.QPointF(0,0),scale*1.05)
                 ground.setColorAt(0,QG.QColor(0,0,0,85 if dark else 40));ground.setColorAt(1,QG.QColor(0,0,0,0))
                 painter.setBrush(ground);painter.drawEllipse(QC.QRectF(-1.12*scale,-1.12*scale,2.24*scale,2.24*scale));painter.restore()
                 for _depth,points,rgb in author_logo_frame(self._angle):
                     color=QG.QColor(*rgb)
-                    # One screen-space reflection across coplanar facets: no seams
-                    # or individual triangular highlights on the front of the G.
-                    reflection=QG.QLinearGradient(cx-1.8*scale,cy-1.7*scale,cx+1.8*scale,cy+1.7*scale)
-                    reflection.setColorAt(0,color.darker(120));reflection.setColorAt(.35,color)
-                    reflection.setColorAt(.48,color.lighter(120));reflection.setColorAt(.61,color)
-                    reflection.setColorAt(1,color.darker(112))
+                    # A continuous studio reflection across each casting. Moving
+                    # its band with the pose avoids a highlight painted onto gold.
+                    shift=math.sin(self._angle*2)*.24*scale
+                    reflection=QG.QLinearGradient(cx-.95*scale+shift,cy-.85*scale,cx+.95*scale+shift,cy+.85*scale)
+                    reflection.setColorAt(0,color.darker(185));reflection.setColorAt(.23,color.darker(120))
+                    reflection.setColorAt(.40,color.lighter(132));reflection.setColorAt(.48,color.lighter(173))
+                    reflection.setColorAt(.57,color);reflection.setColorAt(.79,color.lighter(124))
+                    reflection.setColorAt(1,color.darker(155))
                     brush=QG.QBrush(reflection);painter.setBrush(brush);painter.setPen(QG.QPen(brush,.55))
                     painter.drawPolygon(QG.QPolygonF([QC.QPointF(cx+x*scale,cy+y*scale) for x,y in points]))
             finally:painter.end()
@@ -7430,6 +7705,7 @@ def native_ui_types():
             self.remember=QW.QCheckBox('Zapisz w systemowym magazynie haseł (nie w projekcie)')
             self.form.addRow('Hasło',self.password); self.form.addRow(self.remember)
             self.note=label('',True,True); self.add_widget(self.note)
+            self.driver_card=DependencyCard(window,self);self.add_widget(self.driver_card)
             self.test_button=button('Testuj połączenie',self.test_connection); self.test_label=label('',True,True)
             self.add_widget(horizontal(self.test_button,self.test_label))
             self.kind.currentIndexChanged.connect(self.switch_kind)
@@ -7446,6 +7722,8 @@ def native_ui_types():
                    'firebird':'Firebird 3+. Biblioteka fbclient jest wymagana; jej ścieżkę możesz wskazać w Ustawieniach.',
                    'oracle':'Wymagane konto z uprawnieniami odczytu. Thin nie wymaga Oracle Client; Thick konfiguruje się w Ustawieniach.'}
             self.note.setText(notes[kind])
+            issue=dependency_status(kind,self._host_window.service.settings)
+            self.driver_card.set_issue(issue if issue['state']!='ready' else None,self.original if self.original and self.original['kind']==kind else None)
             if kind=='h2':
                 local=self.inputs[kind]['mode'].currentData()=='file'
                 for key in ('path','host','port','database'):
@@ -7474,16 +7752,26 @@ def native_ui_types():
                                     'kind':kind,'options':options})
             return {'source':source,'password':self.password.text(),'remember':self.remember.isChecked()}
         def test_connection(self):
+            if self.test_job:return
             try:
                 data=self.read(); source=data['source']; password=data['password']
+                def form_signature(value):return digest([{k:v for k,v in value['source'].items() if k!='id'},value['password'],value['remember']])
+                tested_form=form_signature(data);tested_generation=self._host_window.service.generation
                 if not password and self.original: password=self._host_window.service.secrets.get(self.original)
                 jid=self._host_window.service.hub.submit('test',{},source,password,self._host_window.service.settings,
                                                     timeout=int(self._host_window.service.settings.get('timeout',60)))
                 self.test_job=jid; self.test_button.setEnabled(False); self.buttons.button(QW.QDialogButtonBox.StandardButton.Ok).setEnabled(False)
                 self.test_label.setText('Sprawdzanie sterownika i odczytu metadanych…')
                 def finished(value=None,error=''):
+                    if self.test_job!=jid:return
                     self.test_job=''; self.test_button.setEnabled(True); self.buttons.button(QW.QDialogButtonBox.StandardButton.Ok).setEnabled(True)
-                    self.test_label.setText(error or f'Połączono. Dostępne obiekty: {value["tables"]}.')
+                    try:current_form=form_signature(self.read())
+                    except UserError:current_form=None
+                    if current_form!=tested_form or tested_generation!=self._host_window.service.generation:
+                        self.test_label.setText('Dane połączenia zmieniły się podczas testu. Sprawdź bieżące ustawienia ponownie.');return
+                    issue=getattr(error,'dependency',None)
+                    if issue:self.driver_card.set_issue(issue,self.original)
+                    self.test_label.setText(str(error) if error else f'Połączono. Dostępne obiekty: {value["tables"]}.')
                 self._host_window.watcher.watch({'job_id':jid},lambda value:finished(value),lambda text:finished(error=text),title='Test połączenia')
             except Exception as exc: self.test_label.setText(safe_error(exc))
         def reject(self):
@@ -8195,9 +8483,105 @@ def native_ui_types():
             if self.context:self._host.analyze_sheet(self.context['source_id'],self.context['sheet_id'])
 
 
+    class DependencyCoordinator(QC.QObject):
+        """One installer process for every Qt entry point; never imports repaired code."""
+        changed=QC.Signal()
+        prepared=QC.Signal()
+        def __init__(self,window):
+            super().__init__(window);self._host=window;self.process=None;self.profile='';self.state='idle';self.message='';self.details='';self.context=None;self.result_path=None
+            self.poller=QC.QTimer(self);self.poller.setInterval(250);self.poller.timeout.connect(self.poll)
+        @property
+        def busy(self):return self.state=='running'
+        def start(self,profile,repair=False,source=None):
+            if self.busy:return False
+            self.profile=profile;self.context={'generation':self._host.service.generation}
+            if source:self.context.update(source_id=source['id'],source_fingerprint=digest(source))
+            try:
+                py=Path(sys.executable)
+                if os.name=='nt' and py.with_name('pythonw.exe').is_file():py=py.with_name('pythonw.exe')
+                directory=private_dir(runtime_root());self.result_path=directory/('setup-result-'+uid()+'.json');logpath=directory/'setup-window.log'
+                arguments=[str(py),str(Path(__file__).resolve()),'--setup','--install',profile,'--setup-only','--setup-result',str(self.result_path)]
+                if repair:arguments.append('--repair')
+                with logpath.open('ab') as out:
+                    self.process=subprocess.Popen(arguments,stdin=subprocess.DEVNULL,stdout=out,stderr=subprocess.STDOUT,env=installer_environment(),creationflags=CREATE_NO_WINDOW)
+                self.state='running';self.message='Przygotowanie sterowników w osobnym oknie. Możesz dalej pracować.';self.details='Dziennik przygotowania: '+str(logpath);self.poller.start();self.changed.emit();return True
+            except Exception as exc:
+                self.state='failed';self.message='Nie udało się otworzyć przygotowania sterowników.';self.details=safe_error(exc);self.changed.emit();return False
+        def poll(self):
+            if self.process is None or self.process.poll() is None:return
+            self.poller.stop()
+            try:
+                result=json.loads(self.result_path.read_text('utf-8')) if self.result_path and self.result_path.is_file() else {}
+                if self.process.returncode==0 and result.get('status')=='ready':
+                    self.state='restart';self.message='Sterowniki przygotowane. Zapisz pracę i uruchom aplikację ponownie, aby ich użyć.'
+                elif result.get('status')=='cancelled':self.state='cancelled';self.message='Przygotowanie anulowano. Bieżąca sesja pozostaje bez zmian.'
+                else:self.state='failed';self.message='Przygotowanie nie zakończyło się poprawnie. Możesz spróbować ponownie.'
+            except (OSError,ValueError):self.state='failed';self.message='Nie można potwierdzić przygotowania sterowników. Otwórz szczegóły i spróbuj ponownie.'
+            finally:
+                if self.result_path:
+                    with contextlib.suppress(OSError):self.result_path.unlink()
+            self.changed.emit()
+            if self.state=='restart':self.prepared.emit()
+
+    class DependencyCard(QW.QFrame):
+        def __init__(self,window,parent=None):
+            super().__init__(parent);self._host=window;self.issue=None;self.source=None;self.setObjectName('welcomeCard')
+            self.setSizePolicy(QW.QSizePolicy.Policy.Expanding,QW.QSizePolicy.Policy.Maximum)
+            box=QW.QVBoxLayout(self);box.setContentsMargins(18,16,18,16);box.setSpacing(10)
+            self.heading=label('');self.heading.setObjectName('sectionTitle');box.addWidget(self.heading)
+            self.explanation=label('',False,True);self.explanation.setTextFormat(Qt.TextFormat.PlainText);box.addWidget(self.explanation)
+            self.prepare_button=button('Przygotuj sterownik',self.prepare,True);self.details_button=button('Szczegóły',self.show_details)
+            box.addWidget(horizontal(self.prepare_button,self.details_button,None));self.hide()
+            window.dependencies.changed.connect(self.refresh)
+        def set_issue(self,issue,source=None):
+            self.issue=clone(issue) if issue else None;self.source=clone(source) if source else None
+            self.refresh()
+        def refresh(self):
+            if not self.issue:self.hide();return
+            self.show();coordinator=self._host.dependencies;state=self.issue['state'];profile=self.issue.get('profile','')
+            applies=coordinator.profile in (profile,'drivers','all')
+            self.heading.setText(self.issue.get('title','Sterownik bazy danych'))
+            self.explanation.setText(self.issue.get('message',''))
+            self.prepare_button.setText('Napraw sterownik' if state=='broken' else 'Ustawienia klienta' if state=='external' else 'Połącz' if state=='ready' else 'Przygotuj sterownik')
+            self.prepare_button.setEnabled(not coordinator.busy)
+            if coordinator.busy:
+                self.explanation.setText(self.issue.get('message','')+'\n'+coordinator.message)
+                if applies:self.prepare_button.setText('Przygotowywanie…')
+            elif applies and coordinator.state=='restart':
+                self.explanation.setText(coordinator.message);self.prepare_button.setText('Zapisz i uruchom ponownie')
+            elif applies and coordinator.state in ('failed','cancelled'):
+                self.explanation.setText(self.issue.get('message','')+'\n'+coordinator.message)
+        def prepare(self):
+            if not self.issue:return
+            coordinator=self._host.dependencies
+            if coordinator.busy:return
+            if coordinator.state=='restart' and coordinator.profile in (self.issue.get('profile'),'drivers','all'):
+                self._host.restart_after_preparation();return
+            if self.issue['state']=='external':self._host.settings();return
+            if self.issue['state']=='ready':
+                if self.source:self._host.guard(lambda:self._host.open_database(self._host.service.source(self.source['id'])))
+                return
+            parent=self.parentWidget()
+            while parent is not None and not isinstance(parent,SourceDialog):parent=parent.parentWidget()
+            if parent is not None:
+                try:
+                    value=parent.read();saved=self._host.service.call('source_save',value)['source']
+                    parent.original=clone(saved);self.source=clone(saved);self._host.refresh_navigation()
+                    parent.test_label.setText('Zapisano definicję połączenia. Hasło pozostaje wyłącznie w sesji lub wybranym magazynie haseł.')
+                except Exception as exc:
+                    parent.test_label.setText(safe_error(exc));return
+            coordinator.start(self.issue['profile'],self.issue['state']=='broken',self.source)
+        def show_details(self):
+            if not self.issue:return
+            dialog=FormDialog('Sterownik — szczegóły',self._host);text=QW.QPlainTextEdit();text.setReadOnly(True)
+            text.setPlainText(str(self.issue.get('details',''))+'\n\n'+self._host.dependencies.details)
+            dialog.add_widget(text);dialog.buttons.button(QW.QDialogButtonBox.StandardButton.Cancel).hide();limited_dialog_size(dialog,660,390)
+            try:dialog.exec()
+            finally:dialog.deleteLater()
+
     class SettingsDialog(FormDialog):
         def __init__(self,window):
-            super().__init__('Ustawienia studia',window);self._host_window=window;self.installer=None;settings=window.service.settings
+            super().__init__('Ustawienia studia',window);self._host_window=window;settings=window.service.settings
             self.h2=PathField(settings.get('h2_jar',''),'Sterownik H2 (*.jar)')
             self.firebird=PathField(settings.get('firebird_client',''),'Klient Firebird (*.dll *.so *.dylib);;Wszystkie pliki (*)')
             self.oracle=PathField(settings.get('oracle_client',''),directory=True)
@@ -8209,32 +8593,31 @@ def native_ui_types():
                 src=load_package_source();text=('Publiczne PyPI' if src['mode']=='pypi' else 'Offline: '+src['wheel_dir'] if src['mode']=='offline' else 'Artifactory: '+src['index_url']) if src else 'Źródło nie zostało jeszcze wybrane.'
             except UserError as exc:text=str(exc)
             self.source_note=label(text,True,True);self.add_widget(self.source_note)
-            self.profile=combo({'desktop':'Interfejs PySide6','oracle':'Sterownik Oracle','firebird':'Sterownik Firebird','h2':'Sterownik H2 / JPype','secrets':'Magazyn haseł','all':'Wszystkie biblioteki'},'all')
+            self.profile=combo({'drivers':'Sterowniki baz danych','desktop':'Interfejs PySide6','oracle':'Sterownik Oracle','firebird':'Sterownik Firebird','h2':'Sterownik H2 / JPype','secrets':'Magazyn haseł','all':'Wszystkie biblioteki'},'drivers')
             self.install_button=button('Wybierz źródło i przygotuj…',self.install,True);self.add_widget(horizontal(self.profile,self.install_button))
             self.note=label('Otworzy się osobne okno Tkinter: PyPI albo Twój adres Artifactory. Hasło podajesz tylko na czas instalacji. Po przygotowaniu uruchom Pivot ponownie.',True,True);self.add_widget(self.note)
             diag=diagnostics(settings)
             for name,key in [('Oracle','oracle'),('Firebird','firebird'),('H2 / JPype','h2'),('Magazyn haseł','keyring')]:
-                self.add_widget(horizontal(label(name),None,label('Dostępny w tej sesji' if diag[key] else 'Nie zainstalowano',True)))
+                self.add_widget(horizontal(label(name),None,label('Pakiet wykryty; sprawdzany przy użyciu' if diag[key] else 'Nie zainstalowano',True)))
             self.add_widget(label('Java: '+(diag['java'] or 'nie znaleziona w PATH'),True,True))
             self.buttons.button(QW.QDialogButtonBox.StandardButton.Ok).setText('Zapisz ustawienia')
-            self.poller=QC.QTimer(self);self.poller.setInterval(400);self.poller.timeout.connect(self.poll_installer)
+            window.dependencies.changed.connect(self.poll_installer);self.poll_installer()
             limited_dialog_size(self,760,710)
         def read(self):return {'h2_jar':self.h2.text(),'oracle_client':self.oracle.text(),'firebird_client':self.firebird.text(),'timeout':self.timeout.value()}
         def install(self):
-            if self.installer and self.installer.poll() is None:return
             try:
-                self._host_window.service.call('settings',{'settings':self.read()});py=Path(sys.executable)
-                if os.name=='nt' and py.with_name('pythonw.exe').is_file():py=py.with_name('pythonw.exe')
-                logpath=private_dir(runtime_root())/'setup-window.log'
-                with logpath.open('ab') as out:
-                    self.installer=subprocess.Popen([str(py),str(Path(__file__).resolve()),'--setup','--install',self.profile.currentData(),'--setup-only'],
-                        stdin=subprocess.DEVNULL,stdout=out,stderr=subprocess.STDOUT,env=installer_environment(),creationflags=CREATE_NO_WINDOW)
-                self.install_button.setEnabled(False);self.note.setText('Okno wyboru źródła jest otwarte. Bieżący projekt pozostaje w aplikacji.');self.poller.start()
+                coordinator=self._host_window.dependencies
+                if coordinator.state=='restart':
+                    self.accept()
+                    if self.result()==QW.QDialog.DialogCode.Accepted:QC.QTimer.singleShot(0,self._host_window.restart_after_preparation)
+                    return
+                self._host_window.service.call('settings',{'settings':self.read()})
+                coordinator.start(self.profile.currentData(),repair=True)
             except Exception as exc:self.note.setText(safe_error(exc))
         def poll_installer(self):
-            if self.installer and self.installer.poll() is not None:
-                self.poller.stop();self.install_button.setEnabled(True)
-                self.note.setText('Okno przygotowania zostało zamknięte. Po udanej instalacji uruchom ponownie Pivot, aby użyć nowych bibliotek.' if self.installer.returncode==0 else 'Przygotowanie nie zakończyło się poprawnie. Szczegóły: '+str(runtime_root()/'setup-window.log'))
+            coordinator=self._host_window.dependencies;self.install_button.setEnabled(not coordinator.busy);self.profile.setEnabled(not coordinator.busy)
+            self.install_button.setText('Zapisz i uruchom ponownie' if coordinator.state=='restart' else 'Wybierz źródło i przygotuj…')
+            if coordinator.message:self.note.setText(coordinator.message)
 
     class BarChart(QW.QWidget):
         def __init__(self,parent=None):
@@ -9904,7 +10287,7 @@ def native_ui_types():
                     title='Odczyt struktury bazy' if q['operation']=='database_catalog' else 'Odczyt strony danych')
             except Exception as exc:
                 self._active=None
-                if self._live(q):q['failed'](safe_error(exc))
+                if self._live(q):q['failed'](QtFailure(safe_error(exc),getattr(exc,'dependency',None)))
                 self._timer.start(0)
 
     class DatabaseRecordsModel(QC.QAbstractTableModel):
@@ -10452,7 +10835,7 @@ def native_ui_types():
         def __init__(self,window):
             super().__init__(window);self._host_window=window;self.source=None;self.catalog=None;self._cache={};self._objects={};self._wanted=None;self._epoch=0;self._selected='';self._graph_focus='';self._busy_catalog=False;self._data_pages={};self._tree_items={}
             self.queue=DatabaseTaskQueue(window);self.setObjectName('databaseExplorer')
-            outer=QW.QVBoxLayout(self);outer.setContentsMargins(22,14,22,12);outer.setSpacing(10)
+            outer=QW.QVBoxLayout(self);outer.setContentsMargins(22,14,22,12);outer.setSpacing(10);outer.setAlignment(Qt.AlignmentFlag.AlignTop)
             top=QW.QHBoxLayout();self.title=label('Baza danych');self.title.setObjectName('sectionTitle');self.title.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);top.addWidget(self.title,1)
             back=button('Arkusz',window.return_to_sheet);back.setObjectName('quietButton');top.addWidget(back)
             top.addWidget(icon_button('refresh','Odśwież całą strukturę',lambda:self.reload(True)));top.addWidget(icon_button('stop','Anuluj odczyt struktury',self.cancel_catalog))
@@ -10461,6 +10844,7 @@ def native_ui_types():
             self.saved_joins_menu=menu.addMenu('Zapisane połączenia tabel');self.saved_joins_menu.aboutToShow.connect(self.refresh_saved_joins)
             menu.addAction('Edytuj połączenie…',lambda:window.guard(lambda:window.add_source(self.source)));self.more.setMenu(menu);top.addWidget(self.more);outer.addLayout(top)
             self.status=label('Otwórz bazę, aby zobaczyć wszystkie jej obiekty.',True);self.status.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);outer.addWidget(self.status)
+            self.driver_card=DependencyCard(window,self);outer.addWidget(self.driver_card)
             self.tabs=QW.QTabWidget();self.tabs.setDocumentMode(True);self.tabs.setObjectName('resultTabs');outer.addWidget(self.tabs,1)
             # One shared search/filter row lives inside Structure, not in the global toolbar.
             structure=QW.QWidget();layout=QW.QVBoxLayout(structure);layout.setContentsMargins(0,10,0,0);layout.setSpacing(9)
@@ -10513,10 +10897,14 @@ def native_ui_types():
             self.data_empty=label('Otwórz tabelę lub widok dwuklikiem w Strukturze. Dane pojawią się w osobnych kartach.',True,True);dh.addWidget(self.data_empty);dh.addWidget(self.data_tabs,1)
             self.tabs.addTab(data_host,ui_icon('table'),'Dane')
             self.warning=label('',False,True);self.warning.setObjectName('error');self.warning.hide();outer.addWidget(self.warning)
+            self._unconnected_space=QW.QWidget();outer.addWidget(self._unconnected_space,1);self._unconnected_space.hide()
             self.search.textChanged.connect(self.filter_tree);self.schemas.currentIndexChanged.connect(self.filter_tree);self.system.toggled.connect(self.filter_tree)
             self.tabs.currentChanged.connect(self.tab_changed)
             self._filter_timer=QC.QTimer(self);self._filter_timer.setSingleShot(True);self._filter_timer.setInterval(120);self._filter_timer.timeout.connect(self._apply_filter)
             self.select_object('')
+        def show_unconnected(self,source,issue):
+            self.reset();self.source=clone(source);self.title.setText(source['name']);self.title.setToolTip(source['name'])
+            self.status.setText('Nie połączono z bazą.');self.driver_card.set_issue(issue,source);self.tabs.hide();self._unconnected_space.show()
         def open_source(self,source,obj=None,data=False):
             self._wanted=(obj,data) if obj else None
             if self.source and digest(source)==digest(self.source):
@@ -10529,6 +10917,11 @@ def native_ui_types():
             self.title.setText(source['name']);self.title.setToolTip(source['name']);self.tabs.setCurrentIndex(0);self.reload(False)
         def reload(self,force=False):
             if not self.source:return
+            issue=dependency_status(self.source['kind'],self._host_window.service.settings)
+            if issue['state']!='ready':self.show_unconnected(self.source,issue);return
+            if digest(self.source) not in self._host_window.service.trusted:
+                if not self._host_window.authorize(self.source):return
+            self.driver_card.set_issue(None);self.tabs.show();self._unconnected_space.hide()
             self._epoch+=1;epoch=self._epoch;key=digest(self.source);self._busy_catalog=True;self.warning.hide();self.status.setText('Odczytuję strukturę. Zawartość tabel nie jest pobierana.')
             if not force and key in self._cache:self._busy_catalog=False;self.more.setEnabled(True);self.accept_catalog(self._cache[key]);return
             self.more.setEnabled(False)
@@ -10539,7 +10932,11 @@ def native_ui_types():
                 self.more.setEnabled(True);self.accept_catalog(value)
             def failed(text):
                 if epoch!=self._epoch:return
-                self._busy_catalog=False;self.more.setEnabled(True);self.warning.setText(text);self.warning.show();self.status.setText('Nie ukończono odczytu struktury.'+(' Widoczny jest poprzedni katalog.' if self.catalog else ''))
+                self._busy_catalog=False;self.more.setEnabled(True)
+                issue=getattr(text,'dependency',None)
+                if issue:
+                    self.driver_card.set_issue(issue,self.source);self.tabs.setVisible(bool(self.catalog));self._unconnected_space.setVisible(not self.catalog);self.warning.hide();self.status.setText('Nie połączono z bazą.');return
+                self.warning.setText(str(text));self.warning.show();self.tabs.setVisible(bool(self.catalog));self._unconnected_space.setVisible(not self.catalog);self.status.setText('Nie ukończono odczytu struktury. Widoczny jest poprzedni katalog.' if self.catalog else 'Nie połączono z bazą. Sprawdź szczegóły błędu i spróbuj ponownie.')
             def progress(job):
                 if epoch==self._epoch:self.status.setText(job.get('stage','Odczyt struktury…'))
             self.queue.submit(self,'database_catalog',self.source,{},loaded,failed,progress)
@@ -10547,6 +10944,7 @@ def native_ui_types():
             self._epoch+=1;self._busy_catalog=False;self.queue.cancel_owner(self);self.more.setEnabled(True)
             self.status.setText('Anulowano odczyt struktury.'+(' Zachowano wcześniejszy katalog.' if self.catalog else ''))
         def accept_catalog(self,catalog):
+            self.driver_card.set_issue(None);self.tabs.show();self._unconnected_space.hide()
             fresh_objects={o['id']:o for o in catalog['objects']}
             for oid,page in self._data_pages.items():
                 if isinstance(page,DatabaseJoinPage):
@@ -10654,7 +11052,7 @@ def native_ui_types():
                 self.details.setCurrentIndex(0 if columns else 3 if obj['definition'] else 4)
             else:
                 self.definition.setPlainText('Wybierz dowolny obiekt, aby zobaczyć jego definicję. Nic nie zostanie wykonane.')
-                cat=self.catalog or {};summary='Otwarta jest baza, nie pojedyncza analiza.\n\n'+ '\n'.join(cat.get('scope',[]))
+                cat=self.catalog or {};summary=('Otwarta jest baza, nie pojedyncza analiza.' if self.catalog else 'Nie połączono z bazą; katalog nie został jeszcze odczytany.')+'\n\n'+ '\n'.join(cat.get('scope',[]))
                 summary+='\n\n'+ '\n'.join(DATABASE_KINDS.get(k,k)+': '+str(v) for k,v in cat.get('counts',{}).items())
                 summary+='\n\nStruktura nie jest kopią wszystkich rekordów. Tabele otwierasz dwuklikiem; zapytania są tylko do odczytu.'
                 if cat.get('warnings'):summary+='\n\nProblemy odczytu:\n'+'\n'.join(cat['warnings'])
@@ -10772,7 +11170,7 @@ def native_ui_types():
             self._epoch+=1;self.queue.clear()
             while self.data_tabs.count():self.close_data(0)
             self._busy_catalog=False;self.catalog=None;self.source=None;self._objects={};self._selected='';self._wanted=None;self._graph_focus=''
-            self.tree_model.clear();self._tree_items={};self.warning.hide();self.more.setEnabled(True);self.select_object('')
+            self.tree_model.clear();self._tree_items={};self.warning.hide();self.more.setEnabled(True);self.select_object('');self.driver_card.set_issue(None);self.tabs.show();self._unconnected_space.hide()
         def dispose(self):self.reset();self._cache.clear();self._filter_timer.stop()
 
 
@@ -10786,6 +11184,8 @@ def native_ui_types():
             self.closing=False;self.loading=False;self.project_busy=False;self.detail_windows=[];self.chart_epoch=0
             self.browser_context=None;self.home_visible=False;self.builder_requested=True;self.sources_requested=False;self._responsive_busy=False;self._file_intake_active=False
             self.tasks=AsyncTasks(self);self.watcher=JobWatcher(service,self)
+            self.dependencies=DependencyCoordinator(self);self.dependencies.prepared.connect(self.offer_dependency_restart)
+            self._restart_process=None;self._restart_handoff=None;self._restart_confirmed=False
             self.tasks.changed.connect(self.update_job_status);self.watcher.changed.connect(self.update_job_status)
             self.ui_settings=QC.QSettings(str(service.root/'native-window.ini'),QC.QSettings.Format.IniFormat)
             self.show_hidden_sheets=False
@@ -10793,6 +11193,8 @@ def native_ui_types():
             self.progress=QW.QProgressBar();self.progress.setRange(0,0);self.progress.setFixedSize(70,3);self.progress.hide()
             self.statusBar().addPermanentWidget(self.progress);self.badge=label('Źródła tylko do odczytu',True);self.statusBar().addPermanentWidget(self.badge)
             self.statusBar().setSizeGripEnabled(True);self.statusBar().showMessage('Gotowe')
+            self.restart_button=button('Zapisz i uruchom ponownie',self.restart_after_preparation);self.restart_button.hide();self.statusBar().addPermanentWidget(self.restart_button)
+            self.dependencies.changed.connect(lambda:self.restart_button.setVisible(self.dependencies.state=='restart'))
             self.setMinimumSize(800,520);limited_dialog_size(self,1450,890)
             geometry=self.ui_settings.value('atelierGeometry')
             if geometry:self.restoreGeometry(geometry)
@@ -10813,6 +11215,56 @@ def native_ui_types():
             try: return fn()
             except Exception as exc: self.report(safe_error(exc))
         def report(self,text): self.statusBar().showMessage(text,10000); alert(self,'Pivot Studio',text)
+        def offer_dependency_restart(self):
+            if self.closing:return
+            self.statusBar().showMessage(self.dependencies.message,15000)
+            if QW.QApplication.activeModalWidget() is not None:return
+            box=QW.QMessageBox(self);box.setWindowTitle('Sterowniki gotowe');box.setText('Sterowniki zostały przygotowane. Zapiszemy prywatną kopię bieżącej pracy i przywrócimy ją po ponownym uruchomieniu.')
+            box.setInformativeText('Po restarcie ponownie potwierdzisz dostęp do bazy. Hasła nie są zapisywane w kopii projektu.')
+            restart=box.addButton('Zapisz i uruchom ponownie',QW.QMessageBox.ButtonRole.AcceptRole);later=box.addButton('Później',QW.QMessageBox.ButtonRole.RejectRole);box.setDefaultButton(later);box.exec()
+            if box.clickedButton()==restart:self.restart_after_preparation()
+        def restart_after_preparation(self):
+            if self.closing or self.project_busy or self._restart_process is not None:return False
+            if QW.QApplication.activeModalWidget() is not None:
+                self.statusBar().showMessage('Zapisz lub zamknij otwarte okno, a następnie wybierz „Zapisz i uruchom ponownie” na dole aplikacji.',15000);return False
+            if self.dependencies.state!='restart':return False
+            if self.service.hub.running() or self.tasks.pending or any(j['status']=='running' for j in self.service.local_jobs.values()):
+                self.statusBar().showMessage('Zakończ lub anuluj bieżące zadania przed ponownym uruchomieniem.',12000);return False
+            if not self.sheet_workspace.commit_active_editor():return False
+            if self.sheet_workspace.session:
+                self.sheet_workspace.save_view_state()
+                if not self.service.document.get('workpads') and self._sheet_mode:self.sheet_workspace.register_book()
+            self.commit_title()
+            handoff=self.blocking_io(lambda:prepare_restart_handoff(self.service,self.dependencies.context),'Zapisywanie pracy przed restartem')
+            if handoff is None:return False
+            try:
+                self._restart_process=launch_restart(handoff);self._restart_handoff=handoff;self._restart_started=time.monotonic()
+                self.project_busy=True;self.centralWidget().setEnabled(False);self.update_actions();self.restart_button.setEnabled(False)
+                self._restart_timer=QC.QTimer(self);self._restart_timer.setInterval(100);self._restart_timer.timeout.connect(self.poll_restart);self._restart_timer.start()
+                self.statusBar().showMessage('Uruchamianie nowej sesji. Bieżące okno pozostaje otwarte do potwierdzenia.');return True
+            except Exception as exc:self.report('Nie udało się uruchomić nowej sesji. Praca pozostaje w tym oknie. '+safe_error(exc));return False
+        def poll_restart(self):
+            process=self._restart_process
+            if process is None:return
+            ready=Path(self._restart_handoff['ready_path']).is_file() and process.poll() is None
+            if ready:
+                self._restart_timer.stop();self._restart_confirmed=True;self.project_busy=False;self.close();return
+            if process.poll() is None and time.monotonic()-self._restart_started<30:return
+            cancel_path=Path(self._restart_handoff.get('cancel_path',str(Path(self._restart_handoff['path']).with_name('cancelled'))))
+            try:atomic_bytes(cancel_path,b'cancelled')
+            except OSError:
+                # This is only our unacknowledged child, never an existing session.
+                if process.poll() is None:
+                    with contextlib.suppress(OSError):process.terminate()
+            self._restart_timer.stop();self._restart_process=None;self.project_busy=False;self.centralWidget().setEnabled(True);self.restart_button.setEnabled(True);self.update_actions()
+            self.report('Nowa sesja nie potwierdziła uruchomienia. Twoja praca pozostaje w tym oknie; możesz ponowić restart.')
+        def resume_prepared_source(self,source_id):
+            try:source=self.service.source(source_id)
+            except UserError:return
+            issue=dependency_status(source['kind'],self.service.settings)
+            if issue['state']=='ready':issue=dict(issue,title='Połączenie czeka na potwierdzenie',message='Praca została przywrócona. Wybierz Połącz, aby potwierdzić odczyt bazy i podać hasło.')
+            self.database_context={'source_id':source['id']};self._sheet_mode=False;self.browser_context=None;self.home_visible=False
+            self.database_explorer.show_unconnected(source,issue);self.apply_responsive();self.update_actions()
         def build_actions(self):
             SP=QW.QStyle.StandardPixmap
             self.action('new','Nowy',self.new_project,'Ctrl+N',SP.SP_FileIcon)
@@ -11006,6 +11458,10 @@ def native_ui_types():
             if self._sheet_mode and self.sheet_workspace.session:
                 if not self.sheet_workspace.commit_active_editor():return
                 self.sheet_workspace.save_view_state()
+            issue=dependency_status(source['kind'],self.service.settings)
+            if issue['state']!='ready':
+                self.database_context={'source_id':source['id']};self._sheet_mode=False;self.browser_context=None;self.home_visible=False
+                self.database_explorer.show_unconnected(source,issue);self.apply_responsive();self.update_actions();return
             if not self.authorize(source):return
             self.database_context={'source_id':source['id']};self._sheet_mode=False;self.browser_context=None;self.home_visible=False
             self.database_explorer.open_source(source,obj,data);self.apply_responsive();self.update_actions()
@@ -11772,7 +12228,9 @@ def native_ui_types():
             self.service.call('recover',{'id':entries[index]['id'],'discard':True}); self.reset_project_views()
         def settings(self):
             dialog=SettingsDialog(self)
-            if dialog.exec()==QW.QDialog.DialogCode.Accepted: self.service.call('settings',{'settings':dialog.value})
+            try:
+                if dialog.exec()==QW.QDialog.DialogCode.Accepted:self.service.call('settings',{'settings':dialog.value})
+            finally:dialog.deleteLater()
         def show_author(self):
             if self.closing:return None
             dialog=getattr(self,'_author_dialog',None)
@@ -11805,6 +12263,8 @@ def native_ui_types():
                 event.accept();return
             if self.project_busy or self._file_intake_active:
                 event.ignore(); return
+            if self.dependencies.busy:
+                self.statusBar().showMessage('Zakończ lub anuluj przygotowanie w oknie instalatora przed zamknięciem aplikacji.',12000);event.ignore();return
             if self.service.hub.running() or any(j['status']=='running' for j in self.service.local_jobs.values()):
                 alert(self,'Trwa zadanie','Anuluj lub zakończ zadania przed zamknięciem. Nie przerywamy siłowo operacji sterownika H2.'); event.ignore(); return
             if self.tasks.pending:
@@ -11816,7 +12276,7 @@ def native_ui_types():
                     QC.QTimer.singleShot(150,retry_close)
                 event.ignore(); return
             try:
-                if not self.prompt_unsaved(): event.ignore(); return
+                if not self._restart_confirmed and not self.prompt_unsaved(): event.ignore(); return
                 self.service.call('quit',{'discard':True})
             except Exception as exc: self.report(safe_error(exc)); event.ignore(); return
             self.closing=True;self.database_explorer.dispose()
@@ -12030,6 +12490,7 @@ def native_ui_types():
                    'PivotBuilder':PivotBuilder,'SourceDialog':SourceDialog,'FilterDialog':FilterDialog,'MeasureDialog':MeasureDialog,
                    'DimensionDialog':DimensionDialog,'ImportDialog':ImportDialog,'WorkbookDialog':WorkbookDialog,'SourceBrowser':SourceBrowser,'DatasetDialog':DatasetDialog,
                    'SettingsDialog':SettingsDialog,'FormDialog':FormDialog,'TitleBar':TitleBar,'WelcomePage':WelcomePage,'WrappedHeading':WrappedHeading,
+                   'DependencyCoordinator':DependencyCoordinator,'DependencyCard':DependencyCard,'QtFailure':QtFailure,
                    'CalculationsDialog':CalculationsDialog,'EdgeController':EdgeController,'AsyncTasks':AsyncTasks,'JobWatcher':JobWatcher,'configure_app':configure_app,
                    'FileDropController':FileDropController,'FileDropOverlay':FileDropOverlay,'FileJobDialog':FileJobDialog,
                    'mime_local_file_paths':mime_local_file_paths,'QtCore':QC,'QtGui':QG,'QtWidgets':QW}
@@ -12074,6 +12535,13 @@ def qt_attribute_collisions(source):
                   and isinstance(node.args[1],ast.Constant) and node.args[1].value in reserved):
                 conflicts.append((cls.name,node.args[1].value,node.lineno))
     return sorted(set(conflicts))
+
+
+@contextlib.contextmanager
+def test_sqlite_connection(path):
+    # sqlite3.Connection.__exit__ commits/rolls back, but does not close the file.
+    with contextlib.closing(sqlite3.connect(path)) as connection:
+        with connection:yield connection
 
 
 def gui_contract_test_suite():
@@ -12228,7 +12696,7 @@ def file_intake_test_suite():
             path=self.root/'Arkusze #1 100%.XLSX';create_intake_test_xlsx(path);return path
         def db(self):
             path=self.root/'Baza Łódź #1.sqlite3'
-            with sqlite3.connect(path) as db:
+            with test_sqlite_connection(path) as db:
                 db.execute('CREATE TABLE sprzedaż (id INTEGER, kwota INTEGER)');db.execute('INSERT INTO sprzedaż VALUES (1,20)')
                 db.execute('CREATE VIEW podgląd AS SELECT * FROM sprzedaż')
             return path
@@ -12368,7 +12836,7 @@ def file_intake_test_suite():
             preview=job['value'];payload={'path':str(path),'options':options,'columns':preview['columns'],'file_state':preview['file_state']}
             job=self.wait_job(service,service.call('import',payload));self.assertEqual(job['status'],'done',job)
             self.assertEqual(job['value']['rows'],2)
-            with sqlite3.connect(job['value']['path']) as db:
+            with test_sqlite_connection(job['value']['path']) as db:
                 rows=db.execute('SELECT * FROM dane ORDER BY Id').fetchall()
             self.assertEqual(rows,[('001','Łódź','12.5'),('002','Żary','7.5')]);self.assertEqual(file_digest(path),before)
             self.assertEqual(len(service.document['analyses']),1)
@@ -12420,7 +12888,7 @@ def workbook_test_suite():
         def reference(self,source,index=0):return workbook_reference(source,source['workbook']['sheets'][index]['id'])
         def rows(self,source,index=0,ref=None):
             _,v=workbook_version(source,ref or self.reference(source,index))
-            with sqlite3.connect(v['path']) as db:return db.execute('SELECT * FROM dane ORDER BY rowid').fetchall()
+            with test_sqlite_connection(v['path']) as db:return db.execute('SELECT * FROM dane ORDER BY rowid').fetchall()
         def service(self):
             service=ApplicationService(self.root/('app-'+uid()));self.services.append(service);return service
         def wait(self,service,response,status='done'):
@@ -12495,7 +12963,7 @@ def workbook_test_suite():
             with self.assertRaisesRegex(UserError,'odpowiada'):verify_workbook_copy(source)
         def test_tampered_extract_is_not_queried(self):
             source=self.prepare(self.stage());reference=self.reference(source);_,v=workbook_version(source,reference)
-            with sqlite3.connect(v['path']) as db:db.execute("UPDATE dane SET Nazwa='changed'")
+            with test_sqlite_connection(v['path']) as db:db.execute("UPDATE dane SET Nazwa='changed'")
             adapter=WorkbookAdapter(source);adapter.bind_dataset(reference)
             with self.assertRaisesRegex(UserError,'zmienione'):adapter.connect()
         def test_named_range_and_header_row(self):
@@ -12561,7 +13029,7 @@ def workbook_test_suite():
             project,_=ProjectStore.load(path,self.root/'restored-selected');restored=project['sources'][0]
             self.assertTrue(restored['options']['path'].startswith('@'));self.assertEqual(len(self.rows(restored)),2)
             with self.assertRaisesRegex(UserError,'nie została dołączona'):verify_workbook_copy(restored)
-            with sqlite3.connect(path) as db:
+            with test_sqlite_connection(path) as db:
                 resources=db.execute('select count(*) from resources').fetchone()[0]
             self.assertEqual(resources,1)
         def test_real_worker_relink_requires_identical_bytes(self):
@@ -12586,7 +13054,7 @@ def workbook_test_suite():
             self.assertEqual(self.rows(source),[('001',)])
         def test_save_rejects_tampered_immutable_extract(self):
             service=self.service();source=self.add(service);_,version=workbook_version(source,self.reference(source))
-            with sqlite3.connect(version['path']) as db:db.execute("UPDATE dane SET Nazwa='inna'")
+            with test_sqlite_connection(version['path']) as db:db.execute("UPDATE dane SET Nazwa='inna'")
             with self.assertRaisesRegex(UserError,'zmieniona'):service.call('project_save',{'path':str(self.root/'bad.pivot'),'include_data':True})
             self.assertFalse((self.root/'bad.pivot').exists())
         def test_save_rejects_modified_workbook_copy(self):
@@ -12598,7 +13066,7 @@ def workbook_test_suite():
             directory=Path(value['directory']);self.assertTrue(directory.is_dir());service.workbooks.close();self.assertFalse(directory.exists())
         def test_v1_saved_project_backup_before_upgrade(self):
             project=new_project();path=self.root/'legacy.pivot';ProjectStore.save(path,project)
-            with sqlite3.connect(path) as db:
+            with test_sqlite_connection(path) as db:
                 db.execute('PRAGMA user_version=1')
                 raw=json.loads(db.execute('select document from project where id=1').fetchone()[0]);raw['version']=1
                 db.execute('update project set document=? where id=1',(dumps(raw),));db.commit()
@@ -12781,14 +13249,14 @@ def sheet_test_suite():
         def test_range_snapshot_for_pivot(self):
             for a,v in [('A1','Name'),('B1','Amount'),('A2','x'),('B2','0.10'),('A3','y'),('B3','=B2*2')]:self.put(a,v)
             source,analysis=sheet_range_to_sqlite(self.book,self.sid,(0,0,2,1),self.root)
-            with sqlite3.connect(source['options']['path']) as db:
+            with test_sqlite_connection(source['options']['path']) as db:
                 self.assertEqual(db.execute('SELECT * FROM dane').fetchall(),[('x','0.10'),('y','0.20')])
             self.put('B2',99)
-            with sqlite3.connect(source['options']['path']) as db:self.assertEqual(db.execute('SELECT Amount FROM dane LIMIT 1').fetchone()[0],'0.10')
+            with test_sqlite_connection(source['options']['path']) as db:self.assertEqual(db.execute('SELECT Amount FROM dane LIMIT 1').fetchone()[0],'0.10')
         def test_snapshot_names_unique_after_truncation(self):
             self.put('A1','a'*120);self.put('B1','a'*119+'b');self.put('A2',1);self.put('B2',2)
             source,_=sheet_range_to_sqlite(self.book,self.sid,(0,0,1,1),self.root)
-            with sqlite3.connect(source['options']['path']) as db:names=[c[1] for c in db.execute('PRAGMA table_info(dane)')]
+            with test_sqlite_connection(source['options']['path']) as db:names=[c[1] for c in db.execute('PRAGMA table_info(dane)')]
             self.assertEqual(len(set(names)),2);self.assertTrue(all(len(n)<=100 for n in names))
         def test_snapshot_rejects_error_without_partial_file(self):
             self.put('A1','Header');self.put('A2','=1/0')
@@ -12836,7 +13304,7 @@ def database_explorer_test_suite():
         def setUp(self):
             self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
             self.path=self.root/'Próba #1 100% struktura.sqlite3'
-            with sqlite3.connect(self.path) as c:
+            with test_sqlite_connection(self.path) as c:
                 c.executescript('''
                 CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT UNIQUE, parent_id INTEGER REFERENCES parent(id));
                 CREATE TABLE detail(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE,
@@ -12863,7 +13331,7 @@ def database_explorer_test_suite():
             return database_page(self.adapter(),dict(object={'schema':'main','name':name,'kind':'view' if name.endswith('_view') else 'table'},**options))
         def test_catalog_matches_every_sqlite_schema_object(self):
             cat=self.catalog()
-            with sqlite3.connect(self.path) as c:
+            with test_sqlite_connection(self.path) as c:
                 expected=set(c.execute('SELECT type,name FROM sqlite_schema'))
                 for typ,name in list(expected):
                     if typ=='table':expected.update(('index',r[1]) for r in c.execute('PRAGMA index_list('+qident(name)+')'))
@@ -12912,7 +13380,7 @@ def database_explorer_test_suite():
             obj=self.obj(self.catalog(),'codes');pk=next(k for k in obj['keys'] if k['kind']=='PRIMARY KEY')
             self.assertEqual(pk['columns'],['b','a']);self.assertTrue(all(not c['nullable'] for c in obj['columns']))
         def test_integer_alias_not_nullable_but_text_pk_can_be(self):
-            with sqlite3.connect(self.path) as c:
+            with test_sqlite_connection(self.path) as c:
                 c.execute('CREATE TABLE text_pk(id TEXT PRIMARY KEY)');c.execute('CREATE TABLE desc_pk(id INTEGER PRIMARY KEY DESC)')
             cat=self.catalog();self.assertFalse(self.obj(cat,'parent')['columns'][0]['nullable'])
             self.assertTrue(self.obj(cat,'text_pk')['columns'][0]['nullable']);self.assertTrue(self.obj(cat,'desc_pk')['columns'][0]['nullable'])
@@ -12922,19 +13390,19 @@ def database_explorer_test_suite():
         def test_self_relationship_preserved(self):
             cat=self.catalog();oid=self.obj(cat,'parent')['id'];self.assertTrue(any(e['source']==oid==e['target'] for e in cat['relations']))
         def test_sqlite_identifier_case_not_false_missing_relation(self):
-            with sqlite3.connect(self.path) as c:c.execute('CREATE TABLE capital(p INTEGER REFERENCES PARENT(ID))')
+            with test_sqlite_connection(self.path) as c:c.execute('CREATE TABLE capital(p INTEGER REFERENCES PARENT(ID))')
             cat=self.catalog();oid=self.obj(cat,'capital')['id'];fk=next(e for e in cat['relations'] if e['source']==oid)
             self.assertTrue(fk['resolved']);self.assertEqual(fk['target_columns'],['id'])
         def test_missing_target_is_marked_not_inferred(self):
-            with sqlite3.connect(self.path) as c:c.execute('CREATE TABLE orphan(parent_id INTEGER REFERENCES absent(id))')
+            with test_sqlite_connection(self.path) as c:c.execute('CREATE TABLE orphan(parent_id INTEGER REFERENCES absent(id))')
             cat=self.catalog();edge=next(e for e in cat['relations'] if e['target_table']=='absent')
             self.assertFalse(edge['resolved']);self.assertEqual(edge['target'],'');self.assertTrue(edge['declared'])
         def test_missing_target_column_is_unresolved(self):
-            with sqlite3.connect(self.path) as c:c.execute('CREATE TABLE broken(p INTEGER REFERENCES parent(absent))')
+            with test_sqlite_connection(self.path) as c:c.execute('CREATE TABLE broken(p INTEGER REFERENCES parent(absent))')
             cat=self.catalog();edge=next(e for e in cat['relations'] if e['target_columns']==['absent'])
             self.assertFalse(edge['resolved']);self.assertTrue(edge['target'])
         def test_similar_column_name_does_not_invent_fk(self):
-            with sqlite3.connect(self.path) as c:c.execute('CREATE TABLE unlinked(parent_id INTEGER)')
+            with test_sqlite_connection(self.path) as c:c.execute('CREATE TABLE unlinked(parent_id INTEGER)')
             cat=self.catalog();oid=self.obj(cat,'unlinked')['id'];self.assertFalse(any(e['source']==oid for e in cat['relations']))
         def test_partial_expression_and_unique_indexes(self):
             cat=self.catalog();part=self.obj(cat,'ix_partial','index');expr=self.obj(cat,'ix_expr','index')
@@ -12948,11 +13416,11 @@ def database_explorer_test_suite():
             cat=self.catalog();self.assertIn('CHECK(amount>=0)',self.obj(cat,'detail')['definition'])
             trigger=self.obj(cat,'on_detail','trigger');self.assertEqual(trigger['parent'],'detail');self.assertIn('AFTER INSERT',trigger['definition'])
         def test_invalid_view_is_explicit_partial_catalog(self):
-            with sqlite3.connect(self.path) as c:c.execute('CREATE VIEW invalid_view AS SELECT * FROM not_here')
+            with test_sqlite_connection(self.path) as c:c.execute('CREATE VIEW invalid_view AS SELECT * FROM not_here')
             cat=self.catalog();self.assertFalse(cat['complete']);self.assertTrue(self.obj(cat,'invalid_view','view')['problems'])
         def test_quoted_names_remain_identifiers(self):
             name='Dane "Łódź\' %; --'
-            with sqlite3.connect(self.path) as c:
+            with test_sqlite_connection(self.path) as c:
                 c.execute('CREATE TABLE '+qident(name)+'('+qident('X "Y\'')+' TEXT)');c.execute('INSERT INTO '+qident(name)+' VALUES(?)',['wartość'])
             obj=self.obj(self.catalog(),name);page=database_page(self.adapter(),{'object':obj})
             self.assertEqual(page['rows'][0][0]['v'],'wartość')
@@ -12991,10 +13459,10 @@ def database_explorer_test_suite():
         def test_filter_finite_values_only(self):
             with self.assertRaises(UserError):self.page(filters=[{'column':'amount','op':'eq','numeric':True,'value':'NaN'}])
         def test_null_and_zero_stay_distinct(self):
-            with sqlite3.connect(self.path) as c:c.execute('UPDATE detail SET amount=NULL WHERE id=1')
+            with test_sqlite_connection(self.path) as c:c.execute('UPDATE detail SET amount=NULL WHERE id=1')
             self.assertIsNone(self.page()['rows'][0][3]);self.assertEqual(database_cell_text(pack(0)),'0');self.assertEqual(database_cell_text(None),'NULL')
         def test_long_values_and_blobs_are_marked_not_silently_cut(self):
-            with sqlite3.connect(self.path) as c:
+            with test_sqlite_connection(self.path) as c:
                 c.execute('CREATE TABLE payload(id INTEGER PRIMARY KEY, content, other)')
                 c.execute('INSERT INTO payload VALUES(1,?,?)',['x'*(MAX_CELL_TEXT+10),b'abc'])
             page=self.page('payload');self.assertIn('skrócony',page['rows'][0][1]['v']);self.assertEqual(page['rows'][0][2]['v'],'[BLOB: 3 bajtów]')
@@ -13053,11 +13521,11 @@ def database_explorer_test_suite():
             svc,source=self.service();svc.trusted.clear()
             with self.assertRaises(UserError):svc.call('database_catalog',{'source_id':source['id']})
         def test_opening_route_does_not_call_analysis_dialog(self):
-            tree=ast.parse(Path(__file__).read_text());main=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='MainWindow')
+            tree=ast.parse(Path(__file__).read_text('utf-8'));main=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='MainWindow')
             fn=next(n for n in main.body if isinstance(n,ast.FunctionDef) and n.name=='open_local_sqlite');body=ast.unparse(fn)
             self.assertIn('open_database',body);self.assertNotIn('DatasetDialog',body);self.assertNotIn('add_local_analysis',body)
         def test_no_qt_inherited_method_collisions(self):
-            self.assertEqual(qt_attribute_collisions(Path(__file__).read_text()),[])
+            self.assertEqual(qt_attribute_collisions(Path(__file__).read_text('utf-8')),[])
         def test_metadata_read_scope_authorizer_denies_writes(self):
             for op in (sqlite3.SQLITE_INSERT,sqlite3.SQLITE_UPDATE,sqlite3.SQLITE_DELETE,sqlite3.SQLITE_ATTACH):
                 self.assertEqual(sqlite_metadata_authorizer(op,'x','y','main',None),sqlite3.SQLITE_DENY)
@@ -13072,7 +13540,7 @@ def database_join_test_suite():
     class DatabaseJoinTests(unittest.TestCase):
         def setUp(self):
             self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name);self.path=self.root/'łączenia.sqlite3';self.adapters=[];self.services=[]
-            with sqlite3.connect(self.path) as db:
+            with test_sqlite_connection(self.path) as db:
                 db.executescript('''
                     CREATE TABLE operations(operation_id TEXT PRIMARY KEY NOT NULL,state TEXT,amount NUMERIC);
                     CREATE TABLE events(id INTEGER PRIMARY KEY,operation_id TEXT REFERENCES operations(operation_id),state TEXT,field_id TEXT);
@@ -13131,11 +13599,11 @@ def database_join_test_suite():
             page=self.page(self.plan(('details','codes')))
             self.assertEqual(self.values(page,'codes · label'),['one','two',None]);self.assertIn(' AND ',page['sql'])
         def test_composite_implicit_target(self):
-            with sqlite3.connect(self.path) as c:c.executescript("CREATE TABLE impl(id INTEGER PRIMARY KEY,a TEXT,b INTEGER,FOREIGN KEY(a,b) REFERENCES codes);INSERT INTO impl VALUES(1,'x',2);")
+            with test_sqlite_connection(self.path) as c:c.executescript("CREATE TABLE impl(id INTEGER PRIMARY KEY,a TEXT,b INTEGER,FOREIGN KEY(a,b) REFERENCES codes);INSERT INTO impl VALUES(1,'x',2);")
             self.catalog=DatabaseInspector(self.adapter()).read();self.objects.update({o['name']:o for o in self.catalog['objects'] if o['kind']=='table'})
             page=self.page(self.plan(('impl','codes')));self.assertEqual(self.values(page,'codes · label'),['two'])
         def test_parent_collation_controls_text_match(self):
-            with sqlite3.connect(self.path) as c:c.executescript("CREATE TABLE pc(k TEXT PRIMARY KEY COLLATE NOCASE NOT NULL);CREATE TABLE cc(id INTEGER PRIMARY KEY,k TEXT COLLATE BINARY REFERENCES pc(k));INSERT INTO pc VALUES('AbC');INSERT INTO cc VALUES(1,'abc');")
+            with test_sqlite_connection(self.path) as c:c.executescript("CREATE TABLE pc(k TEXT PRIMARY KEY COLLATE NOCASE NOT NULL);CREATE TABLE cc(id INTEGER PRIMARY KEY,k TEXT COLLATE BINARY REFERENCES pc(k));INSERT INTO pc VALUES('AbC');INSERT INTO cc VALUES(1,'abc');")
             self.catalog=DatabaseInspector(self.adapter()).read();self.objects.update({o['name']:o for o in self.catalog['objects'] if o['kind']=='table'})
             self.assertEqual(self.values(self.page(self.plan(('cc','pc'))),'pc · k'),['AbC'])
         def test_duplicate_fk_requires_explicit_choice(self):
@@ -13151,20 +13619,20 @@ def database_join_test_suite():
             p=self.plan(('attachments','events','operations'));page=self.page(p)
             self.assertEqual(len(p['relations']),2);self.assertEqual(len(page['rows']),2);self.assertEqual(self.values(page,'operations · state'),['ready','ready'])
         def test_cycle_is_not_reduced_without_confirmation(self):
-            with sqlite3.connect(self.path) as c:c.executescript('CREATE TABLE ax(id INTEGER PRIMARY KEY,b INTEGER REFERENCES bx(id),c INTEGER REFERENCES cx(id));CREATE TABLE bx(id INTEGER PRIMARY KEY,c INTEGER REFERENCES cx(id));CREATE TABLE cx(id INTEGER PRIMARY KEY);')
+            with test_sqlite_connection(self.path) as c:c.executescript('CREATE TABLE ax(id INTEGER PRIMARY KEY,b INTEGER REFERENCES bx(id),c INTEGER REFERENCES cx(id));CREATE TABLE bx(id INTEGER PRIMARY KEY,c INTEGER REFERENCES cx(id));CREATE TABLE cx(id INTEGER PRIMARY KEY);')
             cat=DatabaseInspector(self.adapter()).read();ids=[o['id'] for o in cat['objects'] if o['name'] in ('ax','bx','cx')]
             with self.assertRaises(DatabaseJoinChoice):database_join_plan(cat,ids)
         def test_no_inferred_relationship(self):
-            with sqlite3.connect(self.path) as c:c.executescript('CREATE TABLE similar(id INTEGER PRIMARY KEY,operation_id TEXT);')
+            with test_sqlite_connection(self.path) as c:c.executescript('CREATE TABLE similar(id INTEGER PRIMARY KEY,operation_id TEXT);')
             cat=DatabaseInspector(self.adapter()).read();ids=[o['id'] for o in cat['objects'] if o['name'] in ('similar','operations')]
             with self.assertRaises(DatabaseJoinChoice):database_join_plan(cat,ids)
         def test_live_removed_fk_rejected_before_data_select(self):
             p=self.plan()
-            with sqlite3.connect(self.path) as c:c.executescript('DROP TABLE events;CREATE TABLE events(id INTEGER PRIMARY KEY,operation_id TEXT,state TEXT,field_id TEXT);')
+            with test_sqlite_connection(self.path) as c:c.executescript('DROP TABLE events;CREATE TABLE events(id INTEGER PRIMARY KEY,operation_id TEXT,state TEXT,field_id TEXT);')
             with self.assertRaisesRegex(UserError,'Klucz'):self.page(p)
         def test_live_changed_columns_rejected(self):
             p=self.plan()
-            with sqlite3.connect(self.path) as c:c.execute('ALTER TABLE events ADD COLUMN new_column TEXT')
+            with test_sqlite_connection(self.path) as c:c.execute('ALTER TABLE events ADD COLUMN new_column TEXT')
             with self.assertRaisesRegex(UserError,'Struktura'):self.page(p)
         def test_stale_type_rejected(self):
             p=self.plan();p['objects'][0]['columns'][0]['type']='TEXT'
@@ -13195,17 +13663,17 @@ def database_join_test_suite():
         def test_blob_preview_does_not_transfer_blob(self):
             page=self.page(self.plan(('attachments','events')));self.assertEqual(self.values(page,'attachments · body'),['[BLOB: 3 bajtów]','[BLOB: 1 bajtów]'])
         def test_parent_text_affinity_is_not_replaced_by_child_numeric_affinity(self):
-            with sqlite3.connect(self.path) as c:
+            with test_sqlite_connection(self.path) as c:
                 c.executescript("CREATE TABLE pa(k TEXT PRIMARY KEY NOT NULL);CREATE TABLE ch(id INTEGER PRIMARY KEY,k INTEGER REFERENCES pa(k));INSERT INTO pa VALUES('01');INSERT INTO ch VALUES(1,1);")
             cat=DatabaseInspector(self.adapter()).read();ids=[o['id'] for o in cat['objects'] if o['name'] in ('pa','ch')]
             page=self.page(database_join_plan(cat,ids));self.assertEqual(self.values(page,'pa · k'),[None])
         def test_fk_source_identifier_case_is_canonical(self):
-            with sqlite3.connect(self.path) as c:
+            with test_sqlite_connection(self.path) as c:
                 c.executescript('CREATE TABLE caps(ID INTEGER PRIMARY KEY,OP TEXT,FOREIGN KEY(op) REFERENCES OPERATIONS(OPERATION_ID));INSERT INTO caps VALUES(1,\'op1\');')
             cat=DatabaseInspector(self.adapter()).read();ids=[o['id'] for o in cat['objects'] if o['name'] in ('caps','operations')]
             page=self.page(database_join_plan(cat,ids));self.assertEqual(self.values(page,'operations · state'),['ready'])
         def test_multiple_join_pages_are_bounded_and_stable(self):
-            with sqlite3.connect(self.path) as c:
+            with test_sqlite_connection(self.path) as c:
                 c.executemany('INSERT INTO events VALUES(?,?,?,?)',[(i,'op1','bulk',str(i)) for i in range(6,456)])
             p=self.plan();first=self.page(p);second=self.page(p,offset=200);last=self.page(p,offset=400)
             self.assertEqual((len(first['rows']),len(second['rows']),len(last['rows'])),(200,200,55))
@@ -13245,7 +13713,7 @@ def database_join_test_suite():
             with self.assertRaises(UserError):database_join_validate(p)
         def test_quoted_identifiers_and_reserved_words(self):
             parent='select "from';child="Kid ' SQL";key='odd " key'
-            with sqlite3.connect(self.path) as c:
+            with test_sqlite_connection(self.path) as c:
                 c.execute('CREATE TABLE '+qident(parent)+'('+qident(key)+' TEXT PRIMARY KEY NOT NULL)')
                 c.execute('CREATE TABLE '+qident(child)+'(id INTEGER PRIMARY KEY,k TEXT REFERENCES '+qident(parent)+'('+qident(key)+'))')
                 c.execute('INSERT INTO '+qident(parent)+' VALUES(?)',['a']);c.execute('INSERT INTO '+qident(child)+' VALUES(1,?)',['a'])
@@ -13291,7 +13759,7 @@ def database_join_test_suite():
             self.assertEqual(result['join_views'],[]);self.assertEqual(result['sources'],p['sources']);self.assertEqual(result['version'],PROJECT_VERSION)
         def test_v3_disk_backup_before_new_format(self):
             p=new_project();p['version']=3;p.pop('join_views');target=self.root/'old.pivot'
-            with sqlite3.connect(target) as c:
+            with test_sqlite_connection(target) as c:
                 c.executescript('CREATE TABLE project(id INTEGER PRIMARY KEY,document TEXT);CREATE TABLE history(id INTEGER PRIMARY KEY,created TEXT,document TEXT);CREATE TABLE resources(id TEXT PRIMARY KEY,checksum TEXT,data BLOB);')
                 c.execute(f'PRAGMA application_id={PROJECT_APP_ID}');c.execute('PRAGMA user_version=3');c.execute('INSERT INTO project VALUES(1,?)',[dumps(p)])
             old=target.read_bytes();project,checksum=ProjectStore.load(target,self.root/'res');ProjectStore.save(target,project,expected=checksum)
@@ -13320,13 +13788,13 @@ def database_join_test_suite():
             objs=[{'id':str(i),'name':'T'+str(i),'schema':'main'} for i in range(120)];sizes={o['id']:(320,180) for o in objs};t=time.monotonic()
             p=database_graph_layout(objs,[],sizes,1360);self.assertEqual(len(p),120);self.assertLess(time.monotonic()-t,1)
         def test_graph_ui_has_no_automatic_fit_in_show_plan(self):
-            tree=ast.parse(Path(__file__).read_text());cls=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='DatabaseGraph')
+            tree=ast.parse(Path(__file__).read_text('utf-8'));cls=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='DatabaseGraph')
             method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='show_plan')
             self.assertFalse(any(isinstance(n,ast.Attribute) and n.attr in ('fit_map','fitInView') for n in ast.walk(method)))
         def test_graph_handles_enter_locally_and_preserves_same_plan(self):
-            text=Path(__file__).read_text();self.assertIn('openSelection.emit(self.selected_ids())',text);self.assertIn("(topology,source_key,view_key)==(self._plan_key,self._source_key,self._view_key)",text)
+            text=Path(__file__).read_text('utf-8');self.assertIn('openSelection.emit(self.selected_ids())',text);self.assertIn("(topology,source_key,view_key)==(self._plan_key,self._source_key,self._view_key)",text)
         def test_qt_names_are_not_shadowed(self):
-            self.assertEqual(qt_attribute_collisions(Path(__file__).read_text()),[])
+            self.assertEqual(qt_attribute_collisions(Path(__file__).read_text('utf-8')),[])
     return unittest.defaultTestLoader.loadTestsFromTestCase(DatabaseJoinTests)
 
 
@@ -13403,7 +13871,7 @@ def technology_license_test_suite():
             d=self.package();d.files=None;row=next(r for r in self.inventory([d])['rows'] if r['name']=='keyring')
             self.assertIn('Brak spisu',row['notice_status'])
         def test_notice_hash_and_read_exact_bytes(self):
-            p=self.root/'LICENSE';p.write_text('License fixture ©\n',encoding='utf-8');d=self.package(paths=['LICENSE'])
+            p=self.root/'LICENSE';p.write_bytes('License fixture ©\n'.encode('utf-8'));d=self.package(paths=['LICENSE'])
             row=next(r for r in self.inventory([d])['rows'] if r['name']=='keyring');note=row['notices'][0]
             self.assertEqual(read_license_notice(note),'License fixture ©\n');self.assertEqual(note['sha256'],file_digest(p))
         def test_notice_changed_after_scan_is_rejected(self):
@@ -13624,9 +14092,10 @@ def author_test_suite():
     import unittest
     class AuthorTests(unittest.TestCase):
         def test_author_contours_are_from_zloto_not_pivot(self):
-            self.assertEqual(AUTHOR_LOGO_OUTER,((0.,1.68),(-1.46,.84),(-1.46,-.84),(0.,-1.68),(1.46,-.84),(1.46,.84)))
-            self.assertEqual(len(AUTHOR_LOGO_G),16);self.assertIn((.02,.24),AUTHOR_LOGO_G)
-            self.assertIn('ce4fef8c4141b5e5f88af8b10a35f052abcc180a',AUTHOR_LOGO_SOURCE)
+            self.assertEqual(tuple(map(len,AUTHOR_LOGO_CONTOURS)),(75,74))
+            encoded=json.dumps(AUTHOR_LOGO_CONTOURS,separators=(',',':')).encode('utf-8')
+            self.assertEqual(hashlib.sha256(encoded).hexdigest(),AUTHOR_LOGO_SHA256)
+            self.assertEqual(AUTHOR_LOGO_SOURCE,'https://guziczak.github.io/zloto/')
         def test_author_identity_and_fixed_links(self):
             self.assertEqual(AUTHOR_NAME,'Łukasz Guziczak');self.assertEqual(AUTHOR_EMAIL,'guziczak@proton.me')
             for key,title,url in AUTHOR_LINKS:
@@ -13634,24 +14103,24 @@ def author_test_suite():
         def test_arbitrary_link_is_rejected(self):
             for value in ('file:///tmp/x','https://evil.example','javascript:alert(1)','',None):
                 with self.assertRaises(ValueError):author_link(value)
-        def test_g_triangulation_area(self):
-            points=AUTHOR_LOGO_G;triangles=author_triangulate(points)
-            self.assertEqual(len(triangles),len(points)-2)
-            area=sum(author_polygon_area(tuple(points[i] for i in t)) for t in triangles)
-            self.assertAlmostEqual(area,1.58435,places=8)
-            self.assertAlmostEqual(area,author_polygon_area(points),places=8)
-        def test_g_triangles_do_not_fill_empty_interior(self):
-            # Rays from points in the G's aperture must not meet a cap triangle.
-            triangles=[tuple(AUTHOR_LOGO_G[i] for i in t) for t in author_triangulate(AUTHOR_LOGO_G)]
-            for point in ((-.25,0.),(0.,.50),(.3,.55)):
+        def test_przesmyk_triangulation_preserves_both_castings(self):
+            for points in AUTHOR_LOGO_CONTOURS:
+                triangles=author_triangulate(points)
+                self.assertEqual(len(triangles),len(points)-2)
+                area=sum(author_polygon_area(tuple(points[i] for i in t)) for t in triangles)
+                self.assertGreater(area,.5)
+                self.assertAlmostEqual(area,author_polygon_area(points),places=8)
+        def test_przesmyk_triangles_leave_the_passage_open(self):
+            triangles=[tuple(points[i] for i in t) for points in AUTHOR_LOGO_CONTOURS for t in author_triangulate(points)]
+            for point in ((0.,0.),(.10,.10),(.05,.40),(.10,-.40)):
                 self.assertFalse(any(all(_author_cross(t[i],t[(i+1)%3],point)>=-1e-10 for i in range(3)) for t in triangles))
         def test_invalid_contours_fail_boundedly(self):
             for points in ((),((0.,0.),(1.,0.)),((0.,0.),(0.,1.),(1.,0.)),((0.,0.),(float('nan'),0.),(1.,1.))):
                 with self.assertRaises(ValueError):author_triangulate(points)
         def test_mesh_is_cached_and_bounded(self):
             first=author_logo_mesh();self.assertIs(first,author_logo_mesh())
-            vertices,faces=first;self.assertLess(len(vertices),500);self.assertLess(len(faces),500)
-            self.assertTrue(all(3<=len(f)<=4 and all(0<=i<len(vertices) for i in f) for f in faces))
+            vertices,faces=first;self.assertLess(len(vertices),650);self.assertLess(len(faces),800)
+            self.assertTrue(all(3<=len(f)<=75 and all(0<=i<len(vertices) for i in f) for f in faces))
         def test_mesh_has_no_open_edges(self):
             vertices,faces=author_logo_mesh();positions=[tuple(round(v,9) for v in p) for p in vertices]
             edges=collections.Counter()
@@ -13660,17 +14129,24 @@ def author_test_suite():
             self.assertTrue(edges);self.assertEqual(set(edges.values()),{2})
         def test_mesh_has_real_depth_and_bevel_rails(self):
             vertices,_=author_logo_mesh();zs=sorted(set(round(v[2],6) for v in vertices))
-            self.assertEqual(len(zs),8);self.assertAlmostEqual(zs[-1]-zs[0],.294)
-            self.assertGreater(max(abs(v[0]) for v in vertices),1.46)
+            self.assertEqual(len(zs),4);self.assertAlmostEqual(zs[-1]-zs[0],.16)
+            self.assertAlmostEqual(max(v[0] for v in vertices),.977094)
+            self.assertAlmostEqual(zs[-1]-zs[-2],.018)
         def test_projection_all_angles_finite_bounded(self):
             for i in range(144):
                 faces=author_logo_frame(i*math.tau/144)
-                self.assertTrue(faces);self.assertLessEqual(len(faces),236)
+                self.assertTrue(faces);self.assertLessEqual(len(faces),450)
                 for depth,points,rgb in faces:
                     self.assertTrue(math.isfinite(depth));self.assertTrue(all(math.isfinite(v) and abs(v)<2.25 for p in points for v in p))
                     self.assertTrue(all(type(v) is int and 0<=v<=255 for v in rgb))
         def test_rotating_frame_changes(self):
             self.assertNotEqual(author_logo_frame(.1),author_logo_frame(.8))
+        def test_only_the_facing_cap_of_each_casting_is_visible(self):
+            # A concave polygon's first corner need not have its winding.
+            # Rendering both caps leaks the back surface across the front bevel.
+            for angle in (0.,.18,.9,math.pi,math.pi+.3):
+                caps=[face for face in author_logo_frame(angle) if len(face[1])>4]
+                self.assertEqual(len(caps),2)
         def test_periodic_pose_matches(self):
             a=author_logo_frame(.3);b=author_logo_frame(.3+math.tau)
             self.assertEqual(len(a),len(b))
@@ -13722,6 +14198,106 @@ def author_test_suite():
     return unittest.defaultTestLoader.loadTestsFromTestCase(AuthorTests)
 
 
+def dependency_restart_test_suite():
+    import unittest
+    from unittest.mock import patch, Mock
+    class DependencyRestartTests(unittest.TestCase):
+        def setUp(self):
+            self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+            self.root=Path(self.temp.name);self.service=ApplicationService(self.root/'app')
+            self.addCleanup(self.service.close)
+            self.marker={'python':sys.executable,'profiles':['desktop','oracle'],'version':APP_VERSION}
+        def source(self):
+            value=validate_source({'kind':'oracle','name':'Test Oracle',
+                'options':{'host':'db.example.invalid','user':'reader','service':'example'}})
+            self.service.document['sources'].append(value);return value
+        def handoff(self,context=None):
+            with patch(__name__+'.load_runtime_marker',return_value=self.marker):
+                return prepare_restart_handoff(self.service,context)
+        def test_missing_package_is_distinct_from_missing_transitive_dependency(self):
+            for missing,state in [('oracledb','missing'),('cryptography','broken')]:
+                with self.subTest(missing=missing),patch.dict(globals(),__import__=Mock(side_effect=ModuleNotFoundError('missing',name=missing))):
+                    try:require_module('oracledb','oracle')
+                    except DependencyError as exc:self.assertEqual(exc.dependency['state'],state)
+                    else:self.fail('Expected a typed dependency failure')
+        def test_broken_binary_import_is_repairable(self):
+            with patch.dict(globals(),__import__=Mock(side_effect=OSError('DLL unavailable'))):
+                with self.assertRaises(DependencyError) as caught:require_module('oracledb','oracle')
+            self.assertEqual(caught.exception.dependency['state'],'broken')
+        def test_discovery_does_not_claim_connection_is_established(self):
+            with patch('importlib.util.find_spec',return_value=object()):status=dependency_status('oracle')
+            self.assertEqual(status['state'],'ready');self.assertIn('podczas otwierania',status['message'])
+        def test_discovery_absent_parent_is_missing_not_broken(self):
+            with patch('importlib.util.find_spec',side_effect=ModuleNotFoundError('missing',name='firebird')):
+                self.assertEqual(dependency_status('firebird')['state'],'missing')
+        def test_arbitrary_install_profile_cannot_enter_problem_payload(self):
+            with self.assertRaises(UserError):dependency_problem('random-package','missing')
+        def test_restart_restores_unsaved_document_without_secrets_or_trust(self):
+            source=self.source();self.service.trusted.add(digest(source));self.service.trusted_sql.add('test')
+            self.service.secrets.memory['test']='DO_NOT_PERSIST_THIS_SECRET'
+            book=sheet_new_book();book['sheets'][0]['cells']['A1']=sheet_cell_input('123')
+            self.service.document['workpads'].append(book);self.service.document['active_workpad']=book['id']
+            context={'generation':self.service.generation,'source_id':source['id'],'source_fingerprint':digest(source)}
+            handoff=self.handoff(context)
+            for file in Path(handoff['path']).parent.iterdir():self.assertNotIn(b'DO_NOT_PERSIST_THIS_SECRET',file.read_bytes())
+            restored=ApplicationService(self.root/'app');self.addCleanup(restored.close)
+            resume=load_restart_handoff(restored,handoff['path'])
+            self.assertEqual(resume['source_id'],source['id']);self.assertTrue(restored.dirty())
+            self.assertEqual(digest(restored.document),digest(self.service.document))
+            self.assertFalse(restored.trusted);self.assertFalse(restored.trusted_sql);self.assertFalse(restored.secrets.memory)
+        def test_restart_preserves_original_save_conflict_guard(self):
+            source=self.source();self.service.call('project_save',{'path':str(self.root/'original.pivot')})
+            expected=self.service.disk_digest;source['name']='Changed after save';handoff=self.handoff()
+            restored=ApplicationService(self.root/'app');self.addCleanup(restored.close)
+            load_restart_handoff(restored,handoff['path'])
+            self.assertEqual(restored.project_path,self.service.project_path)
+            self.assertEqual(restored.disk_digest,expected);self.assertTrue(restored.dirty())
+            self.assertEqual(file_digest(restored.project_path),expected)
+        def test_stale_source_or_project_cannot_resume_connection(self):
+            source=self.source();context={'generation':self.service.generation,'source_id':source['id'],'source_fingerprint':digest(source)}
+            source['name']='Changed';self.assertEqual(self.handoff(context)['source_id'],'')
+            context['source_fingerprint']=digest(source);self.service.generation+=1
+            self.assertEqual(self.handoff(context)['source_id'],'')
+        def test_failed_save_never_produces_handoff(self):
+            with patch(__name__+'.ProjectStore.save',side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):self.handoff()
+            self.assertEqual(list((self.service.recovery_dir/'restarts').glob('*/handoff.json')),[])
+        def test_modified_restart_snapshot_is_rejected(self):
+            handoff=self.handoff();snapshot=Path(handoff['path']).parent/'document.pivot'
+            with test_sqlite_connection(snapshot) as connection:connection.execute('PRAGMA user_version=3')
+            with self.assertRaises(UserError):load_restart_handoff(self.service,handoff['path'])
+        def test_restart_rejects_manifest_outside_private_directory(self):
+            path=self.root/'handoff.json';path.write_text('{}',encoding='utf-8')
+            with self.assertRaises(UserError):load_restart_handoff(self.service,path)
+        def test_restart_requires_verified_runtime_and_idle_jobs(self):
+            with patch(__name__+'.load_runtime_marker',return_value=None):
+                with self.assertRaises(UserError):prepare_restart_handoff(self.service)
+            with patch.object(self.service.hub,'running',return_value=['job']):
+                with self.assertRaises(UserError):self.handoff()
+        def test_worker_transports_dependency_problem(self):
+            if dependency_status('oracle')['state']!='missing':self.skipTest('Oracle is installed in this interpreter')
+            source=self.source();jid=self.service.hub.submit('database_catalog',{},source)
+            worker=self.service.hub.jobs[jid]['worker'];deadline=time.monotonic()+12
+            while time.monotonic()<deadline:
+                result=self.service.hub.poll(jid)
+                if result['status']!='running':break
+                time.sleep(.02)
+            self.assertEqual(result['status'],'error',result)
+            self.assertEqual(result['dependency']['profile'],'oracle');self.assertEqual(result['dependency']['state'],'missing')
+            worker.close();worker.process.wait(timeout=5)
+        def test_windows_project_and_spreadsheet_export_are_writable(self):
+            path,_=ProjectStore.save(self.root/'test.pivot',new_project())
+            self.assertTrue(Path(path).is_file())
+            book=sheet_new_book();sheet=book['sheets'][0]
+            sheet['cells']={'A1':sheet_cell_input('Amount'),'A2':sheet_cell_input('2')}
+            target=self.root/'test.xlsx';sheet_export_xlsx(book,target)
+            self.assertTrue(target.is_file())
+            source,_=sheet_range_to_sqlite(book,sheet['id'],(0,0,1,0),self.root)
+            self.assertTrue(Path(source['options']['path']).is_file())
+            self.assertEqual(list(self.root.glob('*.part')),[])
+    return unittest.defaultTestLoader.loadTestsFromTestCase(DependencyRestartTests)
+
+
 def self_test():
     """No optional packages and no external DB access. Run on the delivered file."""
     import unittest
@@ -13729,7 +14305,7 @@ def self_test():
         def setUp(self):
             self.temp=tempfile.TemporaryDirectory(); self.root=Path(self.temp.name)
             self.db=self.root/'source.sqlite'
-            with sqlite3.connect(self.db) as c:
+            with test_sqlite_connection(self.db) as c:
                 c.execute('CREATE TABLE sales(region TEXT,product TEXT,day DATE_TEXT,amount DECIMAL_TEXT,client TEXT,n INTEGER)')
                 c.executemany('INSERT INTO sales VALUES(?,?,?,?,?,?)',[
                     ('A','x','2026-01-01','0.1','C1',1),('A','x','2026-02-01','0.2','C1',2),
@@ -13769,7 +14345,7 @@ def self_test():
             a=json.loads(dumps(self.a)); a['filters']=[{'field':'day','grain':'month','op':'eq','value':'2026-02'}]
             m,p,_=self.pivot(validate_analysis(a)); self.assertEqual(self.value(m,p,None,'sum'),Decimal('.2'))
         def test_decimal_equivalence_grouping_and_unique(self):
-            with sqlite3.connect(self.db) as c:
+            with test_sqlite_connection(self.db) as c:
                 c.executemany('INSERT INTO sales(amount) VALUES(?)',[('1',),('1.0',),('1.00',),('-0',)])
             a=validate_analysis({'dataset':self.a['dataset'],'rows':[{'field':'amount'}],
                                  'measures':[{'id':'d','agg':'count_distinct','field':'amount'},{'id':'n','agg':'count_rows'}]})
@@ -13778,7 +14354,7 @@ def self_test():
             self.assertEqual(values.count('1'),1); self.assertEqual(values.count('0'),1)
             total=next(r for r in p['rows'] if r['total']); self.assertEqual(Decimal(total['v'][1]['v']),5)
         def test_text_dimensions_stable_with_nocase_source(self):
-            with sqlite3.connect(self.db) as c:
+            with test_sqlite_connection(self.db) as c:
                 c.execute('CREATE TABLE mixed(name TEXT COLLATE NOCASE,day DATE_TEXT)')
                 c.executemany('INSERT INTO mixed VALUES(?,?)',[('abc','2026-01-01'),('ABC','2026-02-01')])
             a=validate_analysis({'dataset':{'source_id':self.source['id'],'table':'mixed'},
@@ -13825,7 +14401,7 @@ def self_test():
             meta=run_preview(self.adapter(),a,out,filters,drill=True); self.assertEqual(meta['row_count'],2)
             self.assertIn('NOWEJ',meta['warnings'][-1])
         def test_preview_limit_is_explicit(self):
-            with sqlite3.connect(self.db) as c: c.executemany('INSERT INTO sales(region) VALUES(?)',[('X',)]*1200)
+            with test_sqlite_connection(self.db) as c: c.executemany('INSERT INTO sales(region) VALUES(?)',[('X',)]*1200)
             path=self.root/'preview.sqlite'; meta=run_preview(self.adapter(),self.a,path)
             self.assertEqual(meta['row_count'],1000); self.assertFalse(meta['complete'])
         def test_readonly_sqlite(self):
@@ -13856,13 +14432,13 @@ def self_test():
             p,_=ProjectStore.save(self.root/'packed.pivot',doc,include_data=True,owned_roots=[self.root])
             loaded,_=ProjectStore.load(p,self.root/'extracted'); ep=Path(loaded['sources'][0]['options']['path'])
             self.assertNotEqual(ep,self.db)
-            with sqlite3.connect(ep) as c: self.assertEqual(c.execute('SELECT count(*) FROM sales').fetchone()[0],6)
+            with test_sqlite_connection(ep) as c: self.assertEqual(c.execute('SELECT count(*) FROM sales').fetchone()[0],6)
         def test_csv_import_exact_and_leading_zero(self):
             p=self.root/'source.csv'; p.write_text('ID;Kwota\n001;0,1\n002;0,2\n',encoding='utf-8-sig')
             opts={'delimiter':';','encoding':'utf-8-sig','decimal':',','header':True}
             preview=import_preview(p,opts); self.assertEqual(preview['columns'][0]['type'],'text')
             target=self.root/'import.sqlite'; import_file(p,opts,preview['columns'],target)
-            with sqlite3.connect(target) as c:
+            with test_sqlite_connection(target) as c:
                 rows=c.execute('SELECT * FROM dane').fetchall(); self.assertEqual(rows,[('001','0.1'),('002','0.2')])
         def test_import_does_not_silently_coerce(self):
             p=self.root/'bad.csv'; p.write_text('x\n12\nabc\n'); out=self.root/'bad.sqlite'
@@ -13929,7 +14505,7 @@ def self_test():
             self.assertEqual(len(rows),3); self.assertEqual(len(rows[0]),2)
             self.assertEqual(rows[1][0],page['rows'][0]['v'][0]['v'])
         def test_copy_across_unloaded_pages(self):
-            with sqlite3.connect(self.db) as c:
+            with test_sqlite_connection(self.db) as c:
                 c.executemany('INSERT INTO sales(region,amount,n) VALUES(?,?,?)',[(f'R{i:04d}',str(i),i) for i in range(240)])
             a=validate_analysis({'dataset':self.a['dataset'],'rows':[{'field':'region'}],
                                   'measures':[{'id':'s','agg':'sum','field':'amount'}]})
@@ -13995,6 +14571,7 @@ def self_test():
                     with contextlib.suppress(subprocess.TimeoutExpired): proc.wait(timeout=5)
     print(f'{APP_NAME} {APP_VERSION} — testy lokalne; Python {platform.python_version()}, SQLite {sqlite3.sqlite_version}',flush=True)
     suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(CoreTests),gui_contract_test_suite(),file_intake_test_suite(),workbook_test_suite(),sheet_test_suite(),sheet_selection_test_suite(),sheet_contrast_test_suite(),database_explorer_test_suite(),database_join_test_suite(),technology_license_test_suite(),sheet_interaction_test_suite(),author_test_suite()])
+    suite.addTests(dependency_restart_test_suite())
     result=unittest.TextTestRunner(verbosity=2).run(suite)
     print('Testy rdzenia nie zastępują integracji z H2 / Firebird / Oracle. Testy Qt: --ui-test.',flush=True)
     return 0 if result.wasSuccessful() else 1
@@ -14208,6 +14785,10 @@ def ui_test():
     ui=native_ui_types(); QC=ui['QtCore']; QW=ui['QtWidgets']; Qt=QC.Qt
     from PySide6.QtTest import QTest
     app=QW.QApplication.instance() or QW.QApplication(['PivotStudio-ui-test'])
+    if os.name=='nt' and app.platformName()=='offscreen' and not ui['QtGui'].QFontDatabase.families():
+        fonts=Path(os.environ.get('SystemRoot','C:/Windows'))/'Fonts'
+        for name in ('segoeui.ttf','segoeuib.ttf','seguisb.ttf'):
+            if (fonts/name).is_file():ui['QtGui'].QFontDatabase.addApplicationFont(str(fonts/name))
     ui['configure_app'](app); app.setQuitOnLastWindowClosed(False)
     class NativeTests(unittest.TestCase):
         def setUp(self):
@@ -14464,13 +15045,128 @@ def ui_test():
 
         def database_fixture(self):
             path=self.root/'Cała baza.sqlite3'
-            with sqlite3.connect(path) as c:
+            with contextlib.closing(sqlite3.connect(path)) as c,c:
                 c.executescript('CREATE TABLE parent(id INTEGER PRIMARY KEY,name TEXT);CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent(id));CREATE VIEW names AS SELECT name FROM parent;INSERT INTO parent VALUES(1,\'test\');INSERT INTO child VALUES(2,1);')
             return path
         def open_database_fixture(self):
             path=self.database_fixture();self.window.open_local_sqlite(str(path))
             self.wait(lambda:bool(self.window.database_explorer.catalog))
             return path,self.window.database_explorer
+        def dependency_fixture(self):
+            return self.service.call('source_save',{'source':{'id':uid(),'name':'Oracle test','kind':'oracle','options':{'host':'example.invalid','port':1521,'service':'demo','user':'reader','mode':'thin'}},'password':''})['source']
+        def test_dependency_missing_card_precedes_authorization(self):
+            from unittest import mock
+            source=self.dependency_fixture();issue={'state':'missing','profile':'oracle','title':'Oracle','message':'Brak sterownika','details':'oracledb'}
+            with mock.patch(__name__+'.dependency_status',return_value=issue),mock.patch.object(self.window,'authorize') as authorize,mock.patch.object(self.service.hub,'submit') as submit:
+                self.window.open_database(source)
+                self.assertFalse(authorize.called);self.assertFalse(submit.called)
+                ex=self.window.database_explorer;self.assertFalse(ex.driver_card.isHidden());self.assertTrue(ex.tabs.isHidden());self.assertEqual(ex.driver_card.prepare_button.text(),'Przygotuj sterownik')
+                self.assertEqual(self.window.database_context,{'source_id':source['id']})
+        def test_dependency_structured_failure_not_message_matching(self):
+            from unittest import mock
+            source=self.dependency_fixture();ex=self.window.database_explorer;self.service.trusted.add(digest(source));callbacks=[]
+            ready={'state':'ready','profile':'oracle','title':'Oracle','message':'','details':''}
+            with mock.patch(__name__+'.dependency_status',return_value=ready),mock.patch.object(ex.queue,'submit',side_effect=lambda owner,op,src,args,done,failed,progress:callbacks.append(failed)):
+                self.window.open_database(source);callbacks.pop()('Network error mentioning oracledb')
+                self.assertTrue(ex.driver_card.isHidden());self.assertFalse(ex.warning.isHidden())
+                ex.reload();callbacks.pop()(ui['QtFailure']('Import failed',dict(ready,state='broken',message='Sterownik uszkodzony')))
+                self.assertFalse(ex.driver_card.isHidden());self.assertEqual(ex.driver_card.prepare_button.text(),'Napraw sterownik');self.assertTrue(ex.warning.isHidden())
+        def test_dependency_one_installer_and_verified_completion(self):
+            from unittest import mock
+            coordinator=self.window.dependencies;coordinator.prepared.disconnect(self.window.offer_dependency_restart);prepared=[];coordinator.prepared.connect(lambda:prepared.append(True))
+            process=mock.Mock();process.poll.return_value=None;process.returncode=0
+            with mock.patch(__name__+'.runtime_root',return_value=self.root/'runtime'),mock.patch(__name__+'.subprocess.Popen',return_value=process) as launch:
+                self.assertTrue(coordinator.start('oracle'));self.assertFalse(coordinator.start('h2'));self.assertEqual(launch.call_count,1)
+                coordinator.result_path.write_text(json.dumps({'status':'ready'}),encoding='utf-8');process.poll.return_value=0;coordinator.poll()
+                self.assertEqual(coordinator.state,'restart');self.assertEqual(prepared,[True]);self.assertFalse(self.service.hub.running())
+                self.assertTrue(coordinator.start('oracle'));coordinator.poll()
+                self.assertEqual(coordinator.state,'failed');self.assertEqual(prepared,[True])
+        def test_dependency_cancel_keeps_context_and_work(self):
+            from unittest import mock
+            coordinator=self.window.dependencies;before=clone(self.service.document);process=mock.Mock();process.poll.return_value=None;process.returncode=130
+            with mock.patch(__name__+'.runtime_root',return_value=self.root/'runtime'),mock.patch(__name__+'.subprocess.Popen',return_value=process):
+                coordinator.start('oracle');coordinator.result_path.write_text(json.dumps({'status':'cancelled'}),encoding='utf-8');process.poll.return_value=130;coordinator.poll()
+            self.assertEqual(coordinator.state,'cancelled');self.assertEqual(self.service.document,before)
+        def test_dependency_restart_rejected_cell_does_not_save(self):
+            from unittest import mock
+            self.window.dependencies.state='restart'
+            with mock.patch.object(self.window.sheet_workspace,'commit_active_editor',return_value=False),mock.patch(__name__+'.prepare_restart_handoff') as save:
+                self.assertFalse(self.window.restart_after_preparation());self.assertFalse(save.called)
+        def test_dependency_settings_closure_does_not_own_installer(self):
+            from unittest import mock
+            coordinator=self.window.dependencies;process=mock.Mock();process.poll.return_value=None;process.returncode=130
+            dialog=ui['SettingsDialog'](self.window)
+            with mock.patch(__name__+'.runtime_root',return_value=self.root/'runtime'),mock.patch(__name__+'.subprocess.Popen',return_value=process) as launch:
+                coordinator.start('oracle');dialog.reject();dialog.deleteLater();QC.QCoreApplication.sendPostedEvents(None,QC.QEvent.Type.DeferredDelete)
+                self.assertTrue(coordinator.busy);self.assertFalse(coordinator.start('h2'));self.assertEqual(launch.call_count,1)
+                coordinator.result_path.write_text(json.dumps({'status':'cancelled'}),encoding='utf-8');process.poll.return_value=130;coordinator.poll()
+            self.assertEqual(coordinator.state,'cancelled')
+        def test_dependency_preparation_preserves_unsaved_connection(self):
+            from unittest import mock
+            issue={'state':'missing','profile':'oracle','title':'Oracle','message':'Brak sterownika','details':'oracledb'}
+            with mock.patch(__name__+'.dependency_status',return_value=issue):
+                dialog=ui['SourceDialog'](self.window);dialog.kind.setCurrentIndex(dialog.kind.findData('oracle'))
+                dialog.name.setText('Nowe połączenie');dialog.inputs['oracle']['host'].setText('example.invalid');dialog.inputs['oracle']['service'].setText('demo');dialog.inputs['oracle']['user'].setText('reader')
+                with mock.patch.object(self.window.dependencies,'start',return_value=True) as start:
+                    dialog.driver_card.prepare();self.assertTrue(start.called);source=start.call_args.args[2]
+                    self.assertEqual(self.service.source(source['id'])['options']['host'],'example.invalid');self.assertEqual(dialog.original['id'],source['id'])
+                    self.assertNotIn(digest(source),self.service.trusted);self.assertFalse(self.service.hub.running())
+                dialog.reject();dialog.deleteLater()
+        def test_dependency_source_test_ignores_late_other_driver(self):
+            from unittest import mock
+            issue=lambda profile,*args:{'state':'missing','profile':profile,'title':profile,'message':'Brak sterownika','details':profile}
+            callbacks=[]
+            with mock.patch(__name__+'.dependency_status',side_effect=issue):
+                dialog=ui['SourceDialog'](self.window);dialog.kind.setCurrentIndex(dialog.kind.findData('oracle'))
+                for key,value in (('host','example.invalid'),('service','demo'),('user','reader')):dialog.inputs['oracle'][key].setText(value)
+                with mock.patch.object(self.service.hub,'submit',return_value='test-job'),mock.patch.object(self.window.watcher,'watch',side_effect=lambda response,done,error,**kw:callbacks.append(error)):
+                    dialog.test_connection()
+                dialog.kind.setCurrentIndex(dialog.kind.findData('firebird'));dialog.inputs['firebird']['database'].setText('test-database')
+                callbacks.pop()(ui['QtFailure']('Old Oracle import failed',issue('oracle')))
+                self.assertEqual(dialog.driver_card.issue['profile'],'firebird');self.assertTrue(dialog.test_button.isEnabled());self.assertIn('zmieniły',dialog.test_label.text())
+                with mock.patch.object(self.window.dependencies,'start',return_value=True) as start:
+                    dialog.driver_card.prepare();self.assertEqual(start.call_args.args[0],'firebird');self.assertEqual(start.call_args.args[2]['kind'],'firebird')
+                dialog.reject();dialog.deleteLater()
+        def test_dependency_source_test_ignores_volatile_new_source_id(self):
+            from unittest import mock
+            issue={'state':'missing','profile':'oracle','title':'Oracle','message':'Brak sterownika','details':'oracledb'};callbacks=[]
+            with mock.patch(__name__+'.dependency_status',return_value=issue):
+                dialog=ui['SourceDialog'](self.window);dialog.kind.setCurrentIndex(dialog.kind.findData('oracle'))
+                for key,value in (('host','example.invalid'),('service','demo'),('user','reader')):dialog.inputs['oracle'][key].setText(value)
+                with mock.patch.object(self.service.hub,'submit',return_value='test-job'),mock.patch.object(self.window.watcher,'watch',side_effect=lambda response,done,error,**kw:callbacks.append(error)):
+                    dialog.test_connection()
+                callbacks.pop()(ui['QtFailure']('Current Oracle import failed',dict(issue,state='broken')))
+                self.assertEqual(dialog.driver_card.issue['state'],'broken');self.assertEqual(dialog.driver_card.prepare_button.text(),'Napraw sterownik')
+                dialog.reject();dialog.deleteLater()
+        def test_dependency_busy_installer_blocks_window_close(self):
+            from unittest import mock
+            self.window.dependencies.state='running';event=ui['QtGui'].QCloseEvent()
+            with mock.patch.object(self.window,'prompt_unsaved') as prompt:
+                self.window.closeEvent(event);self.assertFalse(event.isAccepted());self.assertFalse(prompt.called)
+            self.window.dependencies.state='cancelled'
+        def test_dependency_failed_new_process_keeps_old_work(self):
+            from unittest import mock
+            self.window.dependencies.state='restart';ws=self.window.sheet_workspace;ws.session.edit(ws.sheet_id,0,0,'unsaved');before=clone(ws.session.book)
+            handoff={'path':str(self.root/'resume.json'),'ready_path':str(self.root/'ready.json'),'python':sys.executable};process=mock.Mock();process.poll.return_value=1
+            Path(handoff['ready_path']).write_text('ready',encoding='utf-8')
+            with mock.patch(__name__+'.prepare_restart_handoff',return_value=handoff),mock.patch(__name__+'.launch_restart',return_value=process),mock.patch.object(self.window,'blocking_io',side_effect=lambda fn,title:fn()),mock.patch.object(self.window,'close') as close:
+                self.assertTrue(self.window.restart_after_preparation());self.window.poll_restart();self.assertFalse(close.called)
+            self.assertEqual(ws.session.book['sheets'],before['sheets']);self.assertFalse(self.window.project_busy);self.assertTrue(self.window.centralWidget().isEnabled());self.assertTrue(self.errors)
+            self.assertTrue((self.root/'cancelled').is_file())
+            self.errors.clear()
+        def test_dependency_restart_waits_for_ready_before_close(self):
+            from unittest import mock
+            self.window.dependencies.state='restart';handoff={'path':str(self.root/'resume.json'),'ready_path':str(self.root/'ready.json'),'python':sys.executable};process=mock.Mock();process.poll.return_value=None
+            with mock.patch(__name__+'.prepare_restart_handoff',return_value=handoff),mock.patch(__name__+'.launch_restart',return_value=process),mock.patch.object(self.window,'blocking_io',side_effect=lambda fn,title:fn()),mock.patch.object(self.window,'close') as close:
+                self.assertTrue(self.window.restart_after_preparation());self.window.poll_restart();self.assertFalse(close.called)
+                Path(handoff['ready_path']).write_text('{}',encoding='utf-8');self.window.poll_restart();self.assertTrue(close.called);self.assertTrue(self.window._restart_confirmed)
+            self.window._restart_process=None
+        def test_dependency_resume_is_unconnected_until_explicit_action(self):
+            from unittest import mock
+            source=self.dependency_fixture();ready={'state':'ready','profile':'oracle','title':'Oracle','message':'','details':''}
+            with mock.patch(__name__+'.dependency_status',return_value=ready),mock.patch.object(self.window,'authorize') as authorize,mock.patch.object(self.service.hub,'submit') as submit:
+                self.window.resume_prepared_source(source['id']);self.assertFalse(authorize.called);self.assertFalse(submit.called)
+                self.assertEqual(self.window.database_explorer.driver_card.prepare_button.text(),'Połącz')
         def test_graph_enter_opens_live_join_without_creating_analysis(self):
             path,ex=self.open_database_fixture();ex.tabs.setCurrentIndex(1);app.processEvents()
             self.wait(lambda:not ex.graph._initial_view)
@@ -14585,8 +15281,10 @@ def ui_test():
         def file_mime(self,path):
             mime=QC.QMimeData();mime.setUrls([QC.QUrl.fromLocalFile(str(path))]);return mime
         def drag_event(self,mime):
-            return ui['QtGui'].QDragEnterEvent(QC.QPoint(80,110),Qt.DropAction.CopyAction|Qt.DropAction.MoveAction,
+            event=ui['QtGui'].QDragEnterEvent(QC.QPoint(80,110),Qt.DropAction.CopyAction|Qt.DropAction.MoveAction,
                 mime,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier)
+            event._test_mime=mime  # Qt borrows the pointer; synthetic events must retain its Python owner.
+            return event
         def native_drop(self,target,mime):
             enter=self.drag_event(mime);app.sendEvent(target,enter)
             self.assertTrue(enter.isAccepted())
@@ -15160,7 +15858,7 @@ def ui_test():
 
 
 THIRD_PARTY = '''Pivot Studio: original application code, MIT License.
-Author monogram: Łukasz Guziczak, embedded at the author's request from
+Author's Przesmyk mark: Łukasz Guziczak, embedded at the author's request from
   https://guziczak.github.io/zloto/ ; a brand mark, not a bundled third-party library.
 Python: PSF License; https://www.python.org/psf/license/
 SQLite: public domain; https://www.sqlite.org/copyright.html
@@ -15671,11 +16369,14 @@ class SetupChrome:
 
 class SetupWindow:
     """Compact, borderless stdlib setup. Installer/credentials remain separate from painting."""
-    def __init__(self,profile='desktop',wheelhouse=None,*,_test_mode=False,launch_args=None,root=None,prepare=None,system_frame=False,ui_scale=None):
+    def __init__(self,profile='desktop',wheelhouse=None,*,_test_mode=False,launch_args=None,root=None,prepare=None,system_frame=False,ui_scale=None,repair=False):
         import tkinter as tk
         from tkinter import ttk,font as tkfont
         self.tk,self.ttk=tk,ttk;self.profile=profile;self._test_mode=_test_mode;self.launch_args=launch_args
-        self.runtime=Path(root or runtime_root());self.prepare=prepare or install_environment
+        self.runtime=Path(root or runtime_root());self.prepare=prepare or install_environment;self.repair=repair
+        if profile not in INSTALL_PROFILE_LABELS:raise UserError('Nieznany profil instalacji.')
+        self.first_setup=profile=='desktop' and load_runtime_marker(self.runtime) is None
+        self.available_marker=None;self.optional_failures={}
         self.events=queue.Queue();self.cancel=threading.Event();self.thread=None;self.result=None;self.closed=False
         self.phase='form';self.started=0.;self.timer=None;self.visual_timer=None;self.reflow_timer=None;self.fit_timer=None
         self.images=[];self.round_cache={};self.log_lines=[];self.ready_ui=False;self.user_sized=False;self.chrome_warning=''
@@ -15686,13 +16387,17 @@ class SetupWindow:
             saved=package_source();saved.update(mode='internal',index_url='');self.failure=str(exc)
         if wheelhouse:saved=package_source('offline',wheel_dir=str(wheelhouse))
         tk_dpi_awareness();set_desktop_identity();self.root=tk.Tk();self.root.withdraw()
-        self.root.title('Pivot Studio · Przygotowanie')
+        self.root.title('Pivot Studio · '+self.setup_title())
         self.scale=max(.85,min(2.5,float(ui_scale if ui_scale is not None else float(self.root.tk.call('tk','scaling'))/(96/72))))
         families=set(tkfont.families(self.root))
         self.font='Segoe UI' if os.name=='nt' else next((f for f in ('Inter','Lato','DejaVu Sans') if f in families),'TkDefaultFont')
         self.style=ttk.Style(self.root);self.style.theme_use('clam')
         self.mode=tk.StringVar(self.root,value=saved['mode']);self.address=tk.StringVar(self.root,value=saved['index_url'] if saved['mode']=='internal' else '')
         self.username=tk.StringVar(self.root,value=saved['username']);self.password=tk.StringVar(self.root)
+        self.address.trace_add('write',lambda *_:self.password.set(''))
+        self.mode.trace_add('write',lambda *_:self.password.set(''))
+        self.include_drivers=tk.BooleanVar(self.root,value=self.first_setup)
+        self.driver_selection={key:tk.BooleanVar(self.root,value=True) for key in OPTIONAL_INSTALL_PROFILES}
         self.ca=tk.StringVar(self.root,value=saved['ca_file']);self.proxy=tk.StringVar(self.root,value=saved['proxy']);self.wheels=tk.StringVar(self.root,value=saved['wheel_dir'])
         self.chrome=SetupChrome(self,system_frame);self.theme_button=self.chrome.theme_button
         self.body=tk.Frame(self.chrome.host,bd=0);self.body.pack(fill='both',expand=True)
@@ -15712,7 +16417,7 @@ class SetupWindow:
         self.host.grid(row=0,column=1,sticky='nsew');self.host.columnconfigure(0,weight=1);self.host.rowconfigure(1,weight=1)
         self.host.bind('<Configure>',lambda e:self.schedule_reflow())
         self.intro=ttk.Frame(self.host,style='Boot.TFrame');self.intro.grid(row=0,column=0,sticky='ew',pady=(0,self.px(20)));self.intro.columnconfigure(0,weight=1)
-        self.eyebrow=ttk.Label(self.intro,text='PIERWSZE URUCHOMIENIE',style='Boot.Eyebrow.TLabel');self.eyebrow.grid(row=0,column=0,sticky='w',pady=(0,self.px(8)))
+        self.eyebrow=ttk.Label(self.intro,text='PIERWSZE URUCHOMIENIE' if self.first_setup else self.setup_title().upper(),style='Boot.Eyebrow.TLabel');self.eyebrow.grid(row=0,column=0,sticky='w',pady=(0,self.px(8)))
         self.heading=ttk.Label(self.intro,text='Skąd pobieramy biblioteki?',style='Boot.Title.TLabel');self.heading.grid(row=1,column=0,sticky='w')
         self.subheading=ttk.Label(self.intro,text='Wybierz źródło. Resztą zajmie się Pivot.',style='Boot.Muted.TLabel');self.subheading.grid(row=2,column=0,sticky='w',pady=(self.px(8),0))
         self.stack=ttk.Frame(self.host,style='Boot.TFrame');self.stack.grid(row=1,column=0,sticky='nsew');self.stack.columnconfigure(0,weight=1);self.stack.rowconfigure(0,weight=1)
@@ -15740,16 +16445,26 @@ class SetupWindow:
         self.address_entry=self.entry(self.internal,'Adres indeksu · HTTPS, końcówka /simple',self.address,0,0,2)
         self.username_entry=self.entry(self.internal,'Login · opcjonalnie',self.username,1,0)
         self.password_entry=self.entry(self.internal,'Hasło / token',self.password,1,1,masked=True)
-        self.auth_note=ttk.Label(self.internal,text='Hasło tylko na tę instalację. Bez przełączania na PyPI.',style='Boot.Small.TLabel')
+        self.auth_note=ttk.Label(self.internal,text='Przywrócono ustawienia Artifactory. Podaj hasło lub token na czas pobierania.' if saved['mode']=='internal' and saved['username'] else 'Hasło tylko na tę instalację. Bez przełączania na PyPI.',style='Boot.Small.TLabel')
         self.auth_note.grid(row=2,column=0,columnspan=2,sticky='ew',pady=(0,self.px(8)))
         self.offline=ttk.Frame(self.fields,style='Boot.TFrame');self.offline.columnconfigure(0,weight=1)
         self.entry(self.offline,'Folder z pakietami .whl',self.wheels,0,0,browse='dir')
-        self.advanced_button=ttk.Button(self.fields,text='Ustawienia sieci i instalacja offline',style='Boot.Quiet.TButton',command=self.toggle_advanced)
+        self.advanced_button=ttk.Button(self.fields,text=self.advanced_text(),style='Boot.Quiet.TButton',command=self.toggle_advanced)
         self.advanced_button.grid(row=2,column=0,sticky='w',pady=(self.px(12),0))
         self.options=ttk.Frame(self.fields,style='Boot.TFrame');self.options.columnconfigure(0,weight=1)
         self.entry(self.options,'Certyfikaty CA (PEM) · opcjonalnie',self.ca,0,0,browse='file')
         self.entry(self.options,'Proxy · http(s)://serwer:port',self.proxy,1,0)
         ttk.Radiobutton(self.options,text='Użyj folderu z pakietami offline',variable=self.mode,value='offline',command=self.source_changed,style='Boot.TRadiobutton').grid(row=2,column=0,sticky='w',pady=self.px(5))
+        self.drivers_check=ttk.Checkbutton(self.fields,text='Przygotuj także sterowniki baz danych — zalecane',variable=self.include_drivers,style='Boot.TCheckbutton')
+        if self.first_setup:
+            self.drivers_check.grid(row=4,column=0,sticky='w',pady=(self.px(14),0))
+            for row,key in enumerate(OPTIONAL_INSTALL_PROFILES,3):
+                text='Magazyn poświadczeń' if key=='secrets' else INSTALL_PROFILE_LABELS[key]
+                problem=installer_profile_problem(key)
+                if problem:self.driver_selection[key].set(False);text+=' · wymaga Pythona 3.11+'
+                ttk.Checkbutton(self.options,text=text,variable=self.driver_selection[key],style='Boot.TCheckbutton',state='disabled' if problem else 'normal').grid(row=row,column=0,sticky='w',pady=self.px(3))
+            self.drivers_note=ttk.Label(self.options,text='Pakiety Python. Java, Oracle Client i fbclient wymagają osobnej konfiguracji.',style='Boot.Small.TLabel')
+            self.drivers_note.grid(row=7,column=0,sticky='ew',pady=(self.px(5),0));self.entry_labels.append((self.drivers_note,self.options))
         self.build_progress()
         self.footer=ttk.Frame(self.host,style='Boot.TFrame');self.footer.grid(row=2,column=0,sticky='ew',pady=(self.px(14),0));self.footer.columnconfigure(0,weight=1)
         self.error_label=ttk.Label(self.footer,text='',style='Boot.Error.TLabel');self.error_label.grid(row=0,column=0,sticky='ew',pady=(0,self.px(12)));self.error_label.grid_remove()
@@ -15759,6 +16474,7 @@ class SetupWindow:
         self.cancel_button=ttk.Button(self.actions,text='Nie teraz',style='Boot.Quiet.TButton',command=self.close);self.cancel_button.grid(row=0,column=0,sticky='w')
         self.details_button=ttk.Button(self.actions,text='Szczegóły',style='Boot.Quiet.TButton',command=self.toggle_details);self.details_button.grid(row=0,column=1,sticky='w',padx=self.px(10));self.details_button.grid_remove()
         self.confirm_button=ttk.Button(self.actions,text=self.confirm_text(),style='Boot.Primary.TButton',command=self.confirm);self.confirm_button.grid(row=0,column=2,sticky='e')
+        self.continue_button=ttk.Button(self.actions,text='Uruchom z gotowymi bibliotekami',style='Boot.Quiet.TButton',command=self.continue_without_optional)
         self.root.protocol('WM_DELETE_WINDOW',self.close);self.root.bind('<Return>',self.enter_key,add='+')
         self.root.bind('<FocusIn>',self.reveal_focus,add='+');self.root.bind('<Configure>',self.schedule_reflow,add='+')
         self.root.bind('<MouseWheel>',self.wheel,add='+');self.root.bind('<Button-4>',self.wheel,add='+');self.root.bind('<Button-5>',self.wheel,add='+')
@@ -15771,7 +16487,11 @@ class SetupWindow:
         self.confirm_button.focus_set()
     def px(self,value):return max(1,round(float(value)*self.scale))
     def fontspec(self,size,bold=False):return (self.font,-self.px(size),'bold' if bold else 'normal')
-    def confirm_text(self):return 'Przygotuj i uruchom' if self.launch_args is not None else 'Przygotuj środowisko'
+    def setup_title(self):
+        label=INSTALL_PROFILE_LABELS[self.profile]
+        return ('Napraw '+label if self.profile=='desktop' else 'Napraw obsługę '+label) if self.repair else ('Przygotuj '+label if self.profile=='desktop' else 'Przygotuj obsługę '+label)
+    def confirm_text(self):return 'Pobierz i uruchom' if self.launch_args is not None else 'Pobierz i przygotuj'
+    def advanced_text(self):return 'Sieć, pakiety offline i wybór sterowników' if self.first_setup else 'Ustawienia sieci i instalacja offline'
     def build_progress(self):
         tk,ttk=self.tk,self.ttk
         self.progress=ttk.Frame(self.stack,style='Boot.TFrame');self.progress.columnconfigure(0,weight=1);self.progress.rowconfigure(0,weight=1)
@@ -15914,6 +16634,8 @@ class SetupWindow:
         st.layout('Boot.TEntry',[(element,{'sticky':'nsew','children':[('Entry.padding',{'sticky':'nsew','children':[('Entry.textarea',{'sticky':'nsew'})]})]})])
         st.configure('Boot.TRadiobutton',background=c['bg'],foreground=c['text'],font=self.fontspec(12))
         st.map('Boot.TRadiobutton',background=[('active',c['bg'])])
+        st.configure('Boot.TCheckbutton',background=c['bg'],foreground=c['text'],font=self.fontspec(11))
+        st.map('Boot.TCheckbutton',background=[('active',c['bg'])],foreground=[('disabled',c['muted'])])
         st.configure('Boot.Vertical.TScrollbar',background=c['border'],troughcolor=c['bg'],bordercolor=c['bg'],lightcolor=c['border'],darkcolor=c['border'],borderwidth=0,arrowcolor=c['muted'],width=self.px(7))
         st.layout('Boot.Vertical.TScrollbar',[('Vertical.Scrollbar.trough',{'sticky':'ns','children':[('Vertical.Scrollbar.thumb',{'expand':1,'sticky':'nsew'})]})])
         st.map('Boot.Vertical.TScrollbar',background=[('disabled',c['border']),('pressed',c['muted']),('active',c['muted'])],lightcolor=[('disabled',c['border']),('active',c['muted'])],darkcolor=[('disabled',c['border']),('active',c['muted'])])
@@ -15970,7 +16692,7 @@ class SetupWindow:
         self.advanced=not self.advanced
         if self.advanced:self.options.grid(row=3,column=0,sticky='ew',pady=(self.px(12),0))
         else:self.options.grid_remove()
-        self.advanced_button.configure(text='Ukryj ustawienia dodatkowe' if self.advanced else 'Ustawienia sieci i instalacja offline')
+        self.advanced_button.configure(text='Ukryj ustawienia dodatkowe' if self.advanced else self.advanced_text())
         self.fit_window();self.schedule_reflow()
     def wheel(self,event):
         if self.phase=='form':content,canvas=self.fields,self.canvas
@@ -16006,7 +16728,7 @@ class SetupWindow:
         return 'Źródło: '+host
     def show_form(self):
         if self.thread is not None and self.thread.is_alive():return
-        self.phase='form';self.cancel.clear();self.password.set('');self.progress.grid_remove();self.form.grid()
+        self.phase='form';self.cancel.clear();self.password.set('');self.progress.grid_remove();self.form.grid();self.continue_button.grid_remove()
         self.eyebrow.configure(text='ŹRÓDŁO BIBLIOTEK');self.heading.configure(text='Skąd pobieramy biblioteki?')
         self.subheading.configure(text='Popraw ustawienia i spróbuj ponownie.');self.subheading.grid()
         self.confirm_button.grid();self.confirm_button.configure(text=self.confirm_text(),state='normal')
@@ -16014,7 +16736,7 @@ class SetupWindow:
         self.user_sized=False;self.fit_window(force=True);self.schedule_reflow()
     def show_progress(self):
         self.form.grid_remove();self.progress.grid(row=0,column=0,sticky='nsew')
-        self.eyebrow.configure(text='PRZYGOTOWANIE');self.heading.configure(text='Przygotowuję Pivot Studio')
+        self.eyebrow.configure(text='PRZYGOTOWANIE');self.heading.configure(text=self.setup_title());self.continue_button.grid_remove()
         self.subheading.grid_remove();self.confirm_button.grid_remove();self.details_button.grid(row=0,column=0,sticky='w',padx=0)
         self.cancel_button.grid(row=0,column=2,sticky='e');self.progress_canvas.yview_moveto(0)
         self.cancel_button.configure(text='Anuluj',state='normal');self.set_error('');self.source_status.configure(text=self.source_summary())
@@ -16023,7 +16745,7 @@ class SetupWindow:
         self.stage_note.configure(text='Sprawdzam lokalne biblioteki i interpreter.')
         self.elapsed.configure(text='0:00');self.fit_window(force=True);self.schedule_reflow()
     def confirm(self):
-        if self.phase in ('error','cancelled'):self.show_form();return
+        if self.phase in ('error','cancelled','optional-error'):self.show_form();return
         if self.phase=='ready':self.destroy();return
         if self.phase!='form' or self.thread is not None and self.thread.is_alive():return
         try:
@@ -16034,19 +16756,34 @@ class SetupWindow:
         self.password.set('');self.phase='working';self.cancel.clear();self.started=time.monotonic();self.log_lines=[];self._elapsed_second=-1
         self.logbox.configure(state='normal');self.logbox.delete('1.0','end');self.logbox.configure(state='disabled');self.show_progress()
         redactor=installation_redactor(source)
+        include_drivers=self.first_setup and self.include_drivers.get()
+        optional_profiles=[key for key,value in self.driver_selection.items() if value.get()]
         def work():
             try:
-                marker=self.prepare(self.profile,root=self.runtime,source=source,cancel=self.cancel,
+                marker=prepare_bootstrap_environment(self.profile,include_drivers=include_drivers,optional_profiles=optional_profiles,
+                    prepare=self.prepare,root=self.runtime,source=source,cancel=self.cancel,
                     progress=lambda text:self.events.put(('log',redactor(text))),stage=lambda key,text:self.events.put(('stage',(key,redactor(text)))))
                 if self.cancel.is_set():raise Cancelled('Anulowano uruchomienie. Przygotowane biblioteki pozostały na dysku.')
                 if self.launch_args is not None:
                     self.events.put(('stage',('launch','Otwieram główne okno. Czekam na narysowanie interfejsu.')))
                     marker=launch_native_window(marker,self.launch_args,self.events)
                 self.events.put(('done',marker))
+            except OptionalPreparationError as exc:self.events.put(('optional-error',(exc.marker,exc.failures,redactor(str(exc)))))
             except Cancelled as exc:self.events.put(('cancelled',redactor(str(exc))))
             except Exception as exc:self.events.put(('launch-pending' if getattr(exc,'launch_pending',False) else 'error',redactor(str(exc))))
             finally:source['password']=''
         self.thread=threading.Thread(target=work,name='PivotSetup',daemon=False);self.thread.start()
+    def continue_without_optional(self):
+        if self.phase!='optional-error' or not self.available_marker or self.thread is not None and self.thread.is_alive():return
+        marker=dict(self.available_marker);marker['optional_failures']=dict(self.optional_failures)
+        if self.launch_args is None:self.result=marker;self.destroy();return
+        self.cancel.clear();self.phase='launch';self.started=time.monotonic();self.set_error('')
+        self.continue_button.grid_remove();self.confirm_button.grid_remove();self.cancel_button.configure(text='Schowaj')
+        self.stage_note.configure(text='Otwieram Pivot Studio ze sprawdzonymi bibliotekami.')
+        def launch():
+            try:self.events.put(('done',launch_native_window(marker,self.launch_args,self.events)))
+            except Exception as exc:self.events.put(('launch-pending' if getattr(exc,'launch_pending',False) else 'error',safe_error(exc)))
+        self.thread=threading.Thread(target=launch,name='PivotSetupLaunch',daemon=False);self.thread.start()
     def toggle_details(self):
         if self.phase=='form':return
         self.details=not self.details
@@ -16087,11 +16824,24 @@ class SetupWindow:
             elif kind=='done':
                 self.result=value
                 if value.get('launched'):self.destroy();return
-                self.phase='ready';self.completed_steps=4;self.active_step=-1;self.heading.configure(text='Twoje studio jest gotowe')
+                self.phase='ready';self.completed_steps=4;self.active_step=-1;self.heading.configure(text='Twoje studio jest gotowe' if self.profile=='desktop' else 'Obsługa '+INSTALL_PROFILE_LABELS[self.profile]+' jest gotowa')
                 self.stage_caption.configure(text='ZAKOŃCZONO');self.stage_label.configure(text='Biblioteki przygotowane')
                 self.stage_note.configure(text='Uruchom ponownie ten sam plik, aby otworzyć aplikację.')
                 self.confirm_button.grid();self.confirm_button.configure(text='Gotowe',state='normal');self.cancel_button.grid_remove()
                 self.progress_art.render(0,False);self.draw_steps()
+            elif kind=='optional-error':
+                self.available_marker,self.optional_failures,message=value;self.phase=kind;self.append_log(message)
+                self.heading.configure(text='Pivot Studio jest gotowe')
+                names=', '.join(INSTALL_PROFILE_LABELS[key] for key in self.optional_failures)
+                self.set_error('Nie przygotowano: '+names+'. Popraw źródło albo uruchom program z gotowymi bibliotekami.')
+                self.stage_caption.configure(text='DODATKI WYMAGAJĄ UWAGI');self.stage_label.configure(text='Podstawowe funkcje są gotowe')
+                self.stage_note.configure(text='Szczegóły każdego dodatku są w dzienniku. Klienty baz i Java wymagają osobnej konfiguracji.')
+                self.confirm_button.grid();self.confirm_button.configure(text='Popraw źródło i ponów',state='normal')
+                self.continue_button.configure(text='Uruchom z gotowymi bibliotekami' if self.launch_args is not None else 'Użyj gotowego środowiska')
+                self.continue_button.grid(row=1,column=0,columnspan=3,sticky='e',pady=(self.px(10),0))
+                self.cancel_button.grid(row=0,column=0,sticky='w');self.cancel_button.configure(text='Zamknij',state='normal')
+                self.details_button.grid(row=0,column=1,sticky='w',padx=self.px(10))
+                self.progress_art.render(0,False);self.draw_steps();self.fit_window()
             elif kind in ('error','cancelled','launch-pending'):
                 self.phase=kind;self.append_log(value)
                 short=' '.join(str(value).split());short=short if len(short)<=220 else short[:217].rsplit(' ',1)[0]+'…'
@@ -16126,14 +16876,14 @@ class SetupWindow:
         if self.thread is not None:self.thread.join()
         return self.result
 
-def bootstrap_desktop(wheelhouse=None,profile='desktop',*,launch_args=None,system_frame=None):
-    try:window=SetupWindow(profile,wheelhouse,launch_args=launch_args,system_frame=('--system-frame' in sys.argv if system_frame is None else system_frame))
+def bootstrap_desktop(wheelhouse=None,profile='desktop',*,launch_args=None,system_frame=None,repair=False):
+    try:window=SetupWindow(profile,wheelhouse,launch_args=launch_args,repair=repair,system_frame=('--system-frame' in sys.argv if system_frame is None else system_frame))
     except ImportError:raise UserError('Włącz składnik Tcl/Tk w instalatorze Pythona. Nie pobrano bibliotek bez wyboru źródła.') from None
     return window.run()
 
 
 
-def native_run(service,project=None,demo=False,*,screenshot=None,screenshot_size='1450x890'):
+def native_run(service,project=None,demo=False,*,screenshot=None,screenshot_size='1450x890',resume=None):
     """Run Qt with diagnostics installed BEFORE constructing any application views."""
     ui=native_ui_types();QW=ui['QtWidgets'];QC=ui['QtCore'];set_desktop_identity()
     from shiboken6 import isValid as qt_object_alive
@@ -16182,6 +16932,10 @@ def native_run(service,project=None,demo=False,*,screenshot=None,screenshot_size
                     self.queued=True;QC.QTimer.singleShot(0,self.done)
                 return False
             def done(self):
+                if resume and Path(resume['cancel_path']).exists():
+                    window.closing=True;window.hide();app.exit(130);return
+                if resume and not failures and not window._ui_exception_seen:
+                    atomic_bytes(Path(resume['ready_path']),b'ready')
                 raw=os.environ.pop('_PIVOT_PAINT_ACK','')
                 if not raw or failures or window._ui_exception_seen:return
                 path=Path(raw)
@@ -16191,7 +16945,18 @@ def native_run(service,project=None,demo=False,*,screenshot=None,screenshot_size
 
         ack=PaintAck();window._paint_ack=ack;window.show()
         if failures:raise RuntimeError('Błąd podczas wyświetlania interfejsu. Diagnostyka: '+str(log_path)) from failures[0]
-        if project:QC.QTimer.singleShot(0,lambda:window.guard(lambda:window.open_project(project)))
+        if resume:
+            if resume.get('source_id'):window.resume_prepared_source(resume['source_id'])
+            window.statusBar().showMessage('Przywrócono pracę po przygotowaniu bibliotek. Połączenie z bazą wymaga ponownego potwierdzenia.',15000)
+            # A timed-out old session may cancel while this process is between
+            # constructing the window and painting it. Honor that late signal.
+            restart_guard=QC.QTimer(window);restart_guard.setInterval(150);began_restart=time.monotonic()
+            def check_restart_cancel():
+                if Path(resume['cancel_path']).exists():
+                    restart_guard.stop();service.checkpoint();window.closing=True;window.hide();app.exit(130)
+                elif time.monotonic()-began_restart>60:restart_guard.stop()
+            restart_guard.timeout.connect(check_restart_cancel);restart_guard.start()
+        elif project:QC.QTimer.singleShot(0,lambda:window.guard(lambda:window.open_project(project)))
         elif demo:QC.QTimer.singleShot(0,lambda:window.guard(window.open_demo))
         else:
             state=service.call('state',{})
@@ -16337,6 +17102,69 @@ def bootstrap_test():
             with patch.object(subprocess,'Popen',FailedProcess),self.assertRaises(UserError):
                 install_environment('desktop',root=self.root,source=package_source(),progress=lambda _:None)
             self.assertEqual(json.loads((self.root/'current.json').read_text()),previous)
+        def test_profile_preflight_before_any_process(self):
+            with patch.object(subprocess,'Popen') as child:
+                with self.assertRaises(UserError):install_environment('arbitrary-package',root=self.root,source=package_source())
+                with patch.object(sys,'version_info',(3,10,0)),self.assertRaisesRegex(UserError,'3.11'):
+                    install_environment('firebird',root=self.root,source=package_source())
+                child.assert_not_called()
+        @unittest.skipIf(sys.version_info[:2]<(3,11),'Firebird wymaga Pythona 3.11+')
+        def test_driver_verification_is_not_affected_by_qt_import_hooks(self):
+            class DownloadInput(io.BytesIO):
+                def close(self):
+                    if not self.closed:
+                        payload=json.loads(self.getvalue());Path(payload['dest'],'example-1.0-py3-none-any.whl').write_bytes(b'controlled test wheel')
+                    super().close()
+            class ProbeProcess:
+                def __init__(self,command,**kw):
+                    code=command[-1] if '-c' in command else ''
+                    # Simulate the real Shiboken/dateutil-six incompatibility discovered on Windows.
+                    self.code=1 if 'from PySide6' in code and 'import firebird.driver' in code else 0
+                    self.stdout=io.BytesIO(b'Qt import hook rejected six.moves\n' if self.code else b'')
+                    self.stdin=DownloadInput() if kw['stdin']==subprocess.PIPE else None;self.pid=999999
+                def poll(self):return self.code
+                def wait(self,**kw):return self.code
+            with patch.object(subprocess,'Popen',ProbeProcess):
+                marker=install_environment('firebird',root=self.root,source=package_source(),progress=lambda _:None)
+            self.assertEqual(set(marker['profiles']),{'desktop','firebird'})
+            self.assertEqual(json.loads((self.root/'current.json').read_text()),marker)
+        def test_optional_failure_keeps_core_and_retries_only_missing(self):
+            calls=[];fail={'oracle'};source=package_source('internal','https://example.org/simple','reader','private')
+            selected=('oracle','h2','secrets')
+            def prepare(profile,**kw):
+                calls.append(profile);self.assertEqual(kw['source']['password'],'private')
+                if profile in fail:raise UserError('Kontrolowany brak pakietu')
+                previous=load_runtime_marker(self.root) or {'profiles':[]}
+                marker={'python':sys.executable,'profiles':sorted(set(previous['profiles'])|{profile}), 'version':APP_VERSION}
+                atomic_bytes(self.root/'current.json',dumps(marker).encode());return marker
+            with self.assertRaises(OptionalPreparationError) as caught:
+                prepare_bootstrap_environment('desktop',include_drivers=True,optional_profiles=selected,prepare=prepare,root=self.root,source=source)
+            self.assertEqual(calls,['desktop','oracle','h2','secrets'])
+            self.assertEqual(caught.exception.marker,load_runtime_marker(self.root))
+            self.assertEqual(set(caught.exception.failures),{'oracle'})
+            self.assertIn('desktop',caught.exception.marker['profiles']);self.assertNotIn('oracle',caught.exception.marker['profiles'])
+            fail.clear();calls.clear()
+            result=prepare_bootstrap_environment('desktop',include_drivers=True,optional_profiles=selected,prepare=prepare,root=self.root,source=source)
+            self.assertEqual(calls,['oracle']);self.assertEqual(set(result['profiles']),{'desktop',*selected})
+        def test_optional_cancellation_does_not_try_remaining_profiles(self):
+            calls=[]
+            def prepare(profile,**kw):
+                calls.append(profile)
+                if profile=='oracle':raise Cancelled('Anulowano')
+                return {'python':sys.executable,'profiles':['desktop'],'version':APP_VERSION}
+            with self.assertRaises(Cancelled):
+                prepare_bootstrap_environment('desktop',include_drivers=True,prepare=prepare,root=self.root)
+            self.assertEqual(calls,['desktop','oracle'])
+        def test_reused_wheels_checked_against_generation_hash_and_source(self):
+            generation=self.root/'generation';wheels=private_dir(generation/'wheels');destination=private_dir(self.root/'next-wheels')
+            wheel=wheels/'example-1.0-py3-none-any.whl';wheel.write_bytes(b'checked wheel')
+            lock=generation/'requirements.lock';lock.write_text('example==1.0 --hash=sha256:'+file_digest(wheel)+'\n')
+            source=package_source();marker={'python':str(generation/'Scripts'/'python.exe'),'version':APP_VERSION,
+                'lock_sha256':file_digest(lock),'source_identity':package_source_identity(source),'python_version':list(sys.version_info[:2])}
+            self.assertEqual(reuse_verified_wheels(marker,self.root,destination,source),['example==1.0'])
+            wheel.write_bytes(b'changed bytes');self.assertEqual(reuse_verified_wheels(marker,self.root,destination,source),[])
+            internal=package_source('internal','https://example.org/simple')
+            self.assertEqual(reuse_verified_wheels(marker,self.root,destination,internal),[])
         def test_colors_contrast(self):
             def lum(s):
                 v=[int(s[i:i+2],16)/255 for i in (1,3,5)];v=[x/12.92 if x<=.04045 else ((x+.055)/1.055)**2.4 for x in v]
@@ -16408,6 +17236,17 @@ def bootstrap_test():
         def test_switch_public_clears_password(self):
             self.w.mode.set('internal');self.w.source_changed();self.w.password.set('private')
             self.w.mode.set('pypi');self.w.source_changed();self.assertEqual(self.w.password.get(),'')
+        def test_changed_repository_address_clears_password(self):
+            self.w.mode.set('internal');self.w.source_changed();self.w.address.set('https://example.org/simple')
+            self.w.password.set('private');self.w.address.set('https://another.example/simple')
+            self.assertEqual(self.w.password.get(),'')
+        def test_first_setup_offers_drivers_by_default(self):
+            self.assertTrue(self.w.first_setup);self.assertTrue(self.w.include_drivers.get())
+            self.assertTrue(self.w.drivers_check.winfo_ismapped())
+        def test_oracle_repair_has_context_and_no_bootstrap_options(self):
+            self.w.destroy();self.w=SetupWindow('oracle',root=self.root/'runtime',_test_mode=True,repair=True)
+            self.pump();self.assertIn('Napraw obsługę Oracle',self.w.root.title())
+            self.assertFalse(self.w.first_setup);self.assertFalse(self.w.drivers_check.winfo_ismapped())
         def test_isolated_tk_fixture_never_installs(self):
             self.w.confirm();self.pump();self.assertIsNone(self.w.thread);self.assertFalse((self.root/'runtime'/'current.json').exists())
         def test_theme_switch_no_callback_error(self):
@@ -16418,8 +17257,16 @@ def bootstrap_test():
         def test_workflow_ready_without_network(self):
             def prepare(profile,**kw):
                 self.calls.append(kw['source']['mode']);kw['stage']('verify','Kontrolowany test bez sieci.');return {'profiles':['desktop'],'python':sys.executable}
-            self.w._test_mode=False;self.w.prepare=prepare;self.w.confirm();self.pump(lambda:self.w.phase=='ready')
+            self.w.include_drivers.set(False);self.w._test_mode=False;self.w.prepare=prepare;self.w.confirm();self.pump(lambda:self.w.phase=='ready')
             self.assertEqual(self.calls,['pypi']);self.assertIsNotNone(self.w.result)
+        def test_optional_failure_requires_explicit_use_of_ready_runtime(self):
+            def prepare(profile,**kw):
+                if profile=='oracle':raise UserError('Kontrolowany brak pakietu Oracle')
+                return {'profiles':['desktop',profile],'python':sys.executable,'version':APP_VERSION}
+            self.w._test_mode=False;self.w.prepare=prepare;self.w.confirm();self.pump(lambda:self.w.phase=='optional-error')
+            self.assertIsNone(self.w.result);self.assertFalse(self.w.closed)
+            self.assertTrue(self.w.continue_button.winfo_ismapped())
+            self.w.continue_without_optional();self.assertTrue(self.w.closed);self.assertIn('oracle',self.w.result['optional_failures'])
         def test_failure_redacted_and_retry(self):
             token='CONTROLLED_SECRET'
             def prepare(profile,**kw):raise UserError('Błąd serwera '+token)
@@ -16543,7 +17390,7 @@ def bootstrap_test():
             self.w.toggle_theme();capture('PivotStudio_setup_jasny.png')
     suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(SourceTests),unittest.defaultTestLoader.loadTestsFromTestCase(TkTests)])
     result=unittest.TextTestRunner(verbosity=2).run(suite)
-    print('Testy źródła/pip są izolowane. Nie potwierdzają połączenia z firmowym Artifactory ani działania Windows.')
+    print('Testy źródła/pip są izolowane. Nie potwierdzają pobierania z firmowego Artifactory ani połączenia z bazą.')
     return 0 if result.wasSuccessful() else 1
 
 
@@ -16602,6 +17449,9 @@ def main(argv=None):
     parser.add_argument('--data-dir',help='Katalog projektów roboczych, importów i ustawień.')
     parser.add_argument('--setup',action='store_true',help='Okno Tkinter: wybierz publiczne PyPI lub własne Artifactory.')
     parser.add_argument('--setup-only',action='store_true',help='Przygotuj biblioteki bez uruchamiania aplikacji.')
+    parser.add_argument('--setup-result',help=argparse.SUPPRESS)
+    parser.add_argument('--repair',action='store_true',help=argparse.SUPPRESS)
+    parser.add_argument('--resume',help=argparse.SUPPRESS)
     parser.add_argument('--install',choices=['desktop','drivers','all','oracle','firebird','h2','secrets'],help='Wybierz źródło i przygotuj wskazane biblioteki.')
     parser.add_argument('--wheelhouse',help='Folder pakietów .whl dla instalacji offline.')
     parser.add_argument('--self-test',action='store_true',help='Testy rdzenia, bez Qt i bez sieci.')
@@ -16635,7 +17485,14 @@ def main(argv=None):
             if item.startswith('--install=') or item in ('--setup','--setup-only'):continue
             forward.append(item)
         launch=None if args.setup_only or args.install else forward
-        result=bootstrap_desktop(args.wheelhouse,args.install or 'desktop',launch_args=launch,system_frame=args.system_frame)
+        if args.setup_result:launch=None
+        try:
+            result=bootstrap_desktop(args.wheelhouse,args.install or 'desktop',launch_args=launch,system_frame=args.system_frame,repair=args.repair)
+        except Exception:
+            if args.setup_result:atomic_bytes(Path(args.setup_result),dumps({'status':'error'}).encode('utf-8'))
+            raise
+        if args.setup_result:
+            atomic_bytes(Path(args.setup_result),dumps({'status':'ready','marker':result} if result else {'status':'cancelled'}).encode('utf-8'))
         return 0 if result else 130
     marker=load_runtime_marker()
     if not args.no_bootstrap and not args.screenshot:
@@ -16665,7 +17522,12 @@ def main(argv=None):
     if args.light:
         prefs=appearance_preferences(root);prefs['theme']='light';save_appearance(prefs,root)
     service=ApplicationService(root)
-    try:return native_run(service,args.project,args.demo,screenshot=args.screenshot,screenshot_size=args.screenshot_size)
+    try:
+        resume=load_restart_handoff(service,args.resume) if args.resume else None
+        return native_run(service,args.project,args.demo,screenshot=args.screenshot,screenshot_size=args.screenshot_size,resume=resume)
+    except Cancelled:
+        if args.resume:return 130
+        raise
     except KeyboardInterrupt:service.checkpoint();return 130
     finally:
         service.close()

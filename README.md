@@ -31,7 +31,7 @@ Pobierz **[PivotStudio.py](https://github.com/guziczak/pivotstudio/raw/refs/head
 py PivotStudio.py
 ```
 
-**Potrzebujesz Pythona 3.10–3.14, 64-bit, z Tcl/Tk.** Pierwszy start otwiera wybór **publicznego PyPI** albo **własnego Artifactory**, a następnie przygotowuje prywatne środowisko bibliotek. Nie musisz ręcznie wykonywać poleceń `pip`.
+**Potrzebujesz Pythona 3.10–3.14, 64-bit, z Tcl/Tk.** Pierwszy start otwiera wybór **publicznego PyPI** albo **własnego Artifactory**, a następnie przygotowuje prywatne środowisko bibliotek. Domyślnie zaznaczone jest także przygotowanie pakietów sterowników baz danych; wybór można zmienić przed pobraniem. Nie musisz ręcznie wykonywać poleceń `pip`.
 
 Od razu możesz upuścić XLSX lub SQLite na okno. Bez własnych danych: **menu → Pomoc → Otwórz przykład**.
 
@@ -124,6 +124,12 @@ Na pierwszym ekranie wybierasz, skąd pobrać pakiety. **Własny adres Artifacto
 
 Hasło źródła pakietów nie jest zapisywane. Błąd firmowego indeksu **nie przełącza pobierania samowolnie na PyPI**. Przygotowane biblioteki pozostają w prywatnym środowisku — nie trzeba instalować ich globalnie.
 
+Od **0.7.4** brak sterownika przy połączeniu pokazuje trwały komunikat z przyciskiem **Przygotuj sterownik**. Uszkodzony import ma osobną akcję naprawy; brak klienta natywnego prowadzi do ustawień. To samo okno przygotowania przywraca ostatnie źródło, adres, login i ustawienia sieci. Hasło lub token Artifactory podajesz ponownie; zmiana adresu usuwa wpisany sekret.
+
+Pierwsze przygotowanie sprawdza zestaw podstawowy, następnie wybrane dodatki: Oracle, Firebird, H2/JPype i magazyn poświadczeń. Brak dodatku pozwala jawnie wybrać ponowienie lub uruchomienie sprawdzonego zestawu. Java, JAR H2, fbclient i Oracle Client pozostają oddzielnymi składnikami. Pakiet Oracle w trybie Thin nie wymaga Oracle Client.
+
+Po doinstalowaniu wybierasz **Zapisz i uruchom ponownie** albo **Później**. Pivot zapisuje i ponownie odczytuje prywatną kopię pracy; stare okno zamyka dopiero po potwierdzeniu startu nowego. Kopia nie nadpisuje dotychczasowego pliku projektu: zachowuje jego nazwę i stan niezapisanych zmian. Hasła i zgody na dostęp do bazy nie przechodzą do nowej sesji — przywrócone źródło czeka na **Połącz**.
+
 ## Lokalnie, z jasnymi zasadami
 
 **Arkusz edytujesz. Bazę przeglądasz.** Połączenia bazodanowe i ich wyniki pozostają tylko do odczytu. Polecenie **„Kopia strony → arkusz”** tworzy edytowalną kopię bieżącej strony. Eksport XLSX zapisuje nową kopię skoroszytu, nie nadpisuje otwartego oryginału.
@@ -136,14 +142,18 @@ Aplikacja nie ma wbudowanej telemetrii ani WebEngine. Sieć jest potrzebna przy 
 
 ## Status i ograniczenia
 
-**0.7.2 · aktywnie rozwijane wydanie.** Pivot Studio nie jest pełnym zamiennikiem Excela. Obsługa formuł i formatowania ma określony zakres; makra i część obiektów XLSX nie są obsługiwane. Przy ważnych plikach zachowaj oryginał i sprawdź eksportowaną kopię.
+**0.7.4 · aktywnie rozwijane wydanie.** Nowe przygotowanie sterowników, kontrolowany restart oraz aktualny złoty znak Przesmyk w **Pomoc → O autorze**. Poprawiono zapis projektu, eksport i tworzenie pivota z zakresu na Windows. Pivot Studio nie jest pełnym zamiennikiem Excela. Obsługa formuł i formatowania ma określony zakres; makra i część obiektów XLSX nie są obsługiwane. Przy ważnych plikach zachowaj oryginał i sprawdź eksportowaną kopię.
 
 Roboczy skoroszyt ma limit **200 000 zapisanych komórek**, a pojedyncza operacja — **100 000**. Plan JOIN obejmuje **2–8 różnych tabel z jednego źródła**. Płaskie połączenie nie jest wielotabelowym modelem miar Excela. Widoczność katalogu bazy zależy od uprawnień konta.
 
 <details>
 <summary><b>Stan testów i pochodzenie materiałów</b></summary>
 
-Raport wydania 0.7.2: **379 testów rdzenia i regresji** oraz **61 testów przygotowania i Tkintera** zakończonych powodzeniem. **26 nowych testów klawiatury Qt nie wykonano** z powodu braku PySide6 w środowisku przygotowania wydania. Nie oznacza to potwierdzenia wszystkich interakcji na Windows. Adaptery H2, Firebird i Oracle wymagają prób na rzeczywistych instancjach.
+Weryfikacja **0.7.4 na Windows**: zestaw rdzenia obejmuje **414 testów — 412 przeszło, 2 pominięto z powodu braku uprawnienia do dowiązań**. Zestaw przygotowania obejmuje **70 sprawdzonych testów** (pełny przebieg 69 oraz dodatkowa regresja i ponowny przebieg logiki instalatora po poprawce). Rzeczywista instalacja z publicznego PyPI w osobnym katalogu przygotowała wszystkie pięć profili, przeszła `pip check` i importy. Sprawdzono także rzeczywisty restart Qt z kopią niezapisanej pracy i potwierdzeniem startu nowego okna.
+
+Pełny przebieg Qt w trybie `offscreen` liczył 137 testów: pozostało 5 wcześniejszych niepowodzeń dotyczących klawiatury/IME, układu nagłówka i limitu czasu wykazu technologii. Dwa dodatkowe błędy fixture drag/drop poprawiono i sprawdzono osobno. Nowe testy przygotowania, restartu i logo przechodzą. Wynik nie potwierdza wszystkich interakcji w zwykłym oknie Windows. Połączenie z firmowym Artifactory i rzeczywistymi instancjami H2, Firebird oraz Oracle wymaga dostępu do tych systemów.
+
+Instalator sprawdza hashe pobranych plików i ponownie używa wyłącznie zweryfikowanych plików z tego samego źródła. Nie zawiera jeszcze kompletnego, wcześniej zatwierdzonego manifestu hashy wydawców dla wszystkich platform.
 
 Zdjęcia przedstawiają rzeczywiście uruchomioną aplikację, nie makiety. Mapa i wynik JOIN-a pochodzą z Windows, z wersji 0.7.0; arkusz — z udostępnionego zdjęcia sprzed poprawki 0.7.2. Okno przygotowania to Tkinter 0.7.1 na Linux/Xvfb. Baner wykorzystuje fragment autentycznego diagramu. Zrzuty przycięto bez paska zadań; w wyniku JOIN-a zamaskowano techniczne identyfikatory i znaczniki czasu. Nie są to nowe zrzuty GUI 0.7.2.
 
