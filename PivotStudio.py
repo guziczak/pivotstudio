@@ -33,6 +33,7 @@ widocznym aktywnym dialogu. Osadzona geometria, bez sieci i bez nowego intro.
 opcjonalne sterowniki od pierwszego startu i restart z potwierdzoną kopią pracy.
 Aktualny złoty znak Przesmyk z /zloto/; poprawki zapisu i eksportu na Windows.
 Dokładne filtry DECIMAL_TEXT, szczegóły dat SQLite i formatowanie scaleń.
+Oracle: wybór schematu przed pobraniem dużego katalogu, osobny stan błędu metadanych.
 """
 from __future__ import annotations
 
@@ -2305,6 +2306,14 @@ DATABASE_CATALOG_FORMAT = 1
 DATABASE_MAX_OBJECTS = 20000
 DATABASE_MAX_ITEMS = 150000
 DATABASE_MAX_METADATA_BYTES = 24 * 1024 * 1024
+
+
+class DatabaseCatalogLimit(UserError):
+    """A working connection whose metadata needs a narrower explicit scope."""
+    def __init__(self,message,scope):
+        super().__init__(message);self.catalog_scope=clone(scope)
+
+
 DATABASE_PAGE_SIZE = 200
 DATABASE_KINDS = {'table':'Tabele', 'view':'Widoki', 'materialized view':'Widoki materializowane',
                   'index':'Indeksy', 'trigger':'Wyzwalacze', 'sequence':'Sekwencje',
@@ -2349,14 +2358,21 @@ class DatabaseInspector:
     visible. Limits fail rather than silently claiming a truncated catalogue is full.
     Object and relation names come from the database, never heuristic name matching.
     """
-    def __init__(self, adapter, progress=None):
+    def __init__(self, adapter, progress=None, schema=None):
         self.adapter=adapter; self.progress=progress or (lambda text:None)
         self.objects={};self.warnings=[];self.scopes=[];self.relations=[];self.section_state={}
+        self.schema=(adapter.options.get('schema','') if schema is None else schema) if adapter.kind=='oracle' else ''
+        if not isinstance(self.schema,str) or len(self.schema)>512 or any(ord(c)<32 for c in self.schema):
+            raise UserError('Nieprawidłowy schemat odczytu katalogu.')
+        self._oracle_scope=None
     def add(self, kind, schema, name, **extra):
         kind=str(kind).lower();schema=str(schema or '');name=str(name)
         key=database_object_id(schema,kind,name)
         if key not in self.objects:
-            if len(self.objects)>=DATABASE_MAX_OBJECTS:raise UserError('Katalog przekracza 20 000 obiektów. Nie oznaczono go jako kompletny.')
+            if len(self.objects)>=DATABASE_MAX_OBJECTS:
+                message=f'Katalog przekracza {DATABASE_MAX_OBJECTS:,} obiektów. Nie oznaczono go jako kompletny.'
+                if self._oracle_scope is not None:raise DatabaseCatalogLimit(message+' Wybierz węższy zakres odczytu.',self._oracle_scope)
+                raise UserError(message)
             self.objects[key]={'id':key,'kind':kind,'schema':schema,'name':name,'parent':'',
                 'system':False,'columns':[],'keys':[],'indexes':[],'definition':'',
                 'definition_kind':'unavailable','properties':{},'problems':[]}
@@ -2376,7 +2392,7 @@ class DatabaseInspector:
         self.adapter.check_cancel();self.progress('Struktura · '+label)
         try:
             value=function();self.section_state[label]='complete';return value
-        except Cancelled:raise
+        except (Cancelled,DatabaseCatalogLimit):raise
         except Exception as exc:
             self.adapter.check_cancel()
             message=label+': '+safe_error(exc,self.adapter.password)
@@ -2436,9 +2452,12 @@ class DatabaseInspector:
              'scope':self.scopes,'objects':objects,'relations':self.relations,'counts':counts,
              'warnings':self.warnings,'sections':self.section_state,'complete':not self.warnings,
              'metadata_only':True,'integrity_checked':False,'read_at':utcnow(),'elapsed':time.monotonic()-start}
+        if self._oracle_scope is not None:out['oracle_scope']=clone(self._oracle_scope)
         out['fingerprint']=digest({'objects':objects,'relations':self.relations,'scope':self.scopes})
         if len(dumps(out).encode('utf-8'))>DATABASE_MAX_METADATA_BYTES:
-            raise UserError('Metadane przekraczają 24 MB. Katalog nie został uznany za kompletny.')
+            message='Metadane przekraczają 24 MB. Katalog nie został uznany za kompletny.'
+            if self._oracle_scope is not None:raise DatabaseCatalogLimit(message+' Wybierz węższy zakres odczytu.',self._oracle_scope)
+            raise UserError(message)
         return out
     def read_sqlite(self):
         a=self.adapter;a.conn.set_authorizer(sqlite_metadata_authorizer)
@@ -2562,11 +2581,26 @@ class DatabaseInspector:
         for label,fn in [('Definicje widoków',view_defs),('Wyzwalacze',triggers),('Sekwencje',sequences),('Procedury i funkcje',routines),('Domeny',domains),('Synonimy',synonyms)]:self.section(label,fn)
         self.section_state['Obiekty']='complete'
     def read_oracle(self):
-        self.scopes=['Oracle · ALL_*: wszystkie obiekty widoczne dla zalogowanego konta, nie pełny katalog DBA.']
-        for owner,name,typ,status in self.rows('SELECT OWNER,OBJECT_NAME,OBJECT_TYPE,STATUS FROM ALL_OBJECTS WHERE SUBOBJECT_NAME IS NULL'):
+        # Count dictionary objects before transferring their names or any bulk
+        # metadata. A scope failure still proves that the connection succeeded.
+        counts=self.rows('SELECT OWNER,COUNT(*) FROM ALL_OBJECTS WHERE SUBOBJECT_NAME IS NULL GROUP BY OWNER ORDER BY OWNER')
+        self._oracle_scope={'schema':self.schema,'schemas':[{'name':str(owner),'objects':int(count)} for owner,count in counts],
+                            'limit':DATABASE_MAX_OBJECTS}
+        count=sum(item['objects'] for item in self._oracle_scope['schemas'] if not self.schema or item['name']==self.schema)
+        scope='schemat '+self.schema if self.schema else 'wszystkie dostępne schematy'
+        self.scopes=['Oracle · ALL_* · '+scope+' · obiekty widoczne dla zalogowanego konta, nie pełny katalog DBA.']
+        if count>DATABASE_MAX_OBJECTS:
+            message=f'Zakres „{scope}” obejmuje {count:,} obiektów; limit katalogu wynosi {DATABASE_MAX_OBJECTS:,}.'
+            message+=(' Wybierz mniejszy schemat. Odczyt części pojedynczego schematu nie jest jeszcze dostępny.' if self.schema else
+                      ' Wybierz schemat przed odczytem struktury.')
+            raise DatabaseCatalogLimit(message,self._oracle_scope)
+        params=[self.schema] if self.schema else []
+        where=' WHERE OWNER=:p1' if self.schema else ''
+        for owner,name,typ,status in self.rows('SELECT OWNER,OBJECT_NAME,OBJECT_TYPE,STATUS FROM ALL_OBJECTS WHERE SUBOBJECT_NAME IS NULL'+
+                (' AND OWNER=:p1' if self.schema else ''),params):
             self.add(typ.lower(),owner,name,system=owner in ('SYS','SYSTEM'),properties={'Stan':status})
         def columns():
-            for sc,tn,n,typ,pos,nullable,default,precision,scale in self.rows('SELECT OWNER,TABLE_NAME,COLUMN_NAME,DATA_TYPE,COLUMN_ID,NULLABLE,DATA_DEFAULT,DATA_PRECISION,DATA_SCALE FROM ALL_TAB_COLUMNS ORDER BY OWNER,TABLE_NAME,COLUMN_ID'):
+            for sc,tn,n,typ,pos,nullable,default,precision,scale in self.rows('SELECT OWNER,TABLE_NAME,COLUMN_NAME,DATA_TYPE,COLUMN_ID,NULLABLE,DATA_DEFAULT,DATA_PRECISION,DATA_SCALE FROM ALL_TAB_COLUMNS'+where+' ORDER BY OWNER,TABLE_NAME,COLUMN_ID',params):
                 obj=self.relation(sc,tn)
                 if obj:obj['columns'].append({'name':n,'type':typ+('('+str(precision)+(','+str(scale) if scale is not None else '')+')' if precision is not None else ''),
                     'position':int(pos or 0),'nullable':nullable=='Y','default':database_metadata_text(default),
@@ -2574,10 +2608,22 @@ class DatabaseInspector:
         self.section('Kolumny',columns)
         def constraints():
             usage=collections.defaultdict(list)
-            for sc,n,c,pos in self.rows('SELECT OWNER,CONSTRAINT_NAME,COLUMN_NAME,POSITION FROM ALL_CONS_COLUMNS ORDER BY POSITION'):
+            for sc,n,c,pos in self.rows('SELECT OWNER,CONSTRAINT_NAME,COLUMN_NAME,POSITION FROM ALL_CONS_COLUMNS'+where+' ORDER BY POSITION',params):
                 usage[(sc,n)].append(c)
-            rows=self.rows('SELECT OWNER,CONSTRAINT_NAME,CONSTRAINT_TYPE,TABLE_NAME,R_OWNER,R_CONSTRAINT_NAME,DELETE_RULE,STATUS,VALIDATED,SEARCH_CONDITION FROM ALL_CONSTRAINTS')
-            lookup={(r[0],r[1]):r for r in rows}
+            rows=self.rows('SELECT OWNER,CONSTRAINT_NAME,CONSTRAINT_TYPE,TABLE_NAME,R_OWNER,R_CONSTRAINT_NAME,DELETE_RULE,STATUS,VALIDATED,SEARCH_CONDITION FROM ALL_CONSTRAINTS'+where,params)
+            lookup={(r[0],r[1]):r[3] for r in rows}
+            if self.schema and any(r[2]=='R' and r[4]!=self.schema for r in rows):
+                # Read only external keys referenced from this schema. Their
+                # labels remain useful even though their tables are out of scope.
+                # DISTINCT prevents duplicate columns when several FKs share a key.
+                sql=('SELECT DISTINCT p.OWNER,p.CONSTRAINT_NAME,p.TABLE_NAME,c.COLUMN_NAME,c.POSITION '
+                     'FROM ALL_CONSTRAINTS f JOIN ALL_CONSTRAINTS p ON p.OWNER=f.R_OWNER AND p.CONSTRAINT_NAME=f.R_CONSTRAINT_NAME '
+                     'LEFT JOIN ALL_CONS_COLUMNS c ON c.OWNER=p.OWNER AND c.CONSTRAINT_NAME=p.CONSTRAINT_NAME '
+                     "WHERE f.OWNER=:p1 AND f.CONSTRAINT_TYPE='R' AND p.OWNER<>:p2 "
+                     'ORDER BY p.OWNER,p.CONSTRAINT_NAME,c.POSITION')
+                for sc,n,tn,col,pos in self.rows(sql,[self.schema,self.schema]):
+                    lookup[(sc,n)]=tn
+                    if col is not None:usage[(sc,n)].append(col)
             for sc,n,kind,tn,rsc,rn,dr,status,validated,expr in rows:
                 obj=self.relation(sc,tn)
                 if not obj:continue
@@ -2585,23 +2631,24 @@ class DatabaseInspector:
                      'columns':usage[(sc,n)],'enforced':status=='ENABLED','validated':validated}
                 if kind=='C':key['expression']=database_metadata_text(expr)
                 if kind=='R':
-                    target=lookup.get((rsc,rn));key.update(target_schema=rsc or '',target_table=target[3] if target else '',target_columns=usage[(rsc,rn)],on_delete=dr,on_update='NO ACTION')
+                    key.update(target_schema=rsc or '',target_table=lookup.get((rsc,rn),''),target_columns=usage[(rsc,rn)],on_delete=dr,on_update='NO ACTION')
                 obj['keys'].append(key)
         self.section('Klucze i ograniczenia',constraints)
         def indexes():
-            for sc,n,ts,tn,unique,typ in self.rows('SELECT OWNER,INDEX_NAME,TABLE_OWNER,TABLE_NAME,UNIQUENESS,INDEX_TYPE FROM ALL_INDEXES'):
+            for sc,n,ts,tn,unique,typ in self.rows('SELECT OWNER,INDEX_NAME,TABLE_OWNER,TABLE_NAME,UNIQUENESS,INDEX_TYPE FROM ALL_INDEXES'+where,params):
                 obj=self.add('index',sc,n,parent=tn,properties={'Rodzaj':typ,'Unikalny':unique=='UNIQUE'},index_columns=[])
                 table=self.relation(ts,tn)
                 if table:table['indexes'].append(obj['id'])
-            for sc,n,c,pos,desc in self.rows('SELECT INDEX_OWNER,INDEX_NAME,COLUMN_NAME,COLUMN_POSITION,DESCEND FROM ALL_IND_COLUMNS ORDER BY COLUMN_POSITION'):
+            for sc,n,c,pos,desc in self.rows('SELECT INDEX_OWNER,INDEX_NAME,COLUMN_NAME,COLUMN_POSITION,DESCEND FROM ALL_IND_COLUMNS'+
+                    (' WHERE INDEX_OWNER=:p1' if self.schema else '')+' ORDER BY COLUMN_POSITION',params):
                 obj=self.objects.get(database_object_id(sc,'index',n))
                 if obj:obj.setdefault('index_columns',[]).append({'name':c,'position':int(pos),'direction':desc,'key':True})
         self.section('Indeksy',indexes)
         def definitions():
-            for sc,n,text in self.rows('SELECT OWNER,VIEW_NAME,TEXT FROM ALL_VIEWS'):
+            for sc,n,text in self.rows('SELECT OWNER,VIEW_NAME,TEXT FROM ALL_VIEWS'+where,params):
                 obj=self.relation(sc,n)
                 if obj:obj.update(definition=database_metadata_text(text),definition_kind='view query')
-            for sc,n,tn,event,timing,text in self.rows('SELECT OWNER,TRIGGER_NAME,TABLE_NAME,TRIGGERING_EVENT,TRIGGER_TYPE,TRIGGER_BODY FROM ALL_TRIGGERS'):
+            for sc,n,tn,event,timing,text in self.rows('SELECT OWNER,TRIGGER_NAME,TABLE_NAME,TRIGGERING_EVENT,TRIGGER_TYPE,TRIGGER_BODY FROM ALL_TRIGGERS'+where,params):
                 self.add('trigger',sc,n,parent=tn or '',definition=database_metadata_text(text),definition_kind='body',properties={'Zdarzenie':event,'Rodzaj':timing})
         self.section('Definicje widoków i wyzwalaczy',definitions)
         self.section_state['ALL_OBJECTS']='complete'
@@ -3201,7 +3248,7 @@ def worker_main():
                 state.update(id=jid,adapter=None,cancel=event)
                 if jid in cancelled_ids: event.set(); cancelled_ids.discard(jid)
             progress=lambda text:send({'id':jid,'event':'progress','text':text})
-            watchdog=None
+            watchdog=None;connected=False
             try:
                 if event.is_set(): raise Cancelled('Zadanie anulowano przed uruchomieniem.')
                 operation=request['operation']; args=request.get('args',{})
@@ -3223,8 +3270,8 @@ def worker_main():
                         with contextlib.suppress(Exception): adapter.cancel()
                         progress('Przekroczono limit czasu. Wysłano żądanie anulowania; oczekiwanie na sterownik.')
                     watchdog=threading.Timer(request.get('timeout',60),expired); watchdog.daemon=True; watchdog.start()
-                    adapter.connect(); adapter.check_cancel()
-                    if operation=='database_catalog': value=DatabaseInspector(adapter,progress).read()
+                    adapter.connect();connected=True;adapter.check_cancel()
+                    if operation=='database_catalog': value=DatabaseInspector(adapter,progress,schema=args.get('schema')).read()
                     elif operation=='database_page': value=database_page(adapter,args)
                     elif operation=='database_join_page': value=database_join_page(adapter,args)
                     elif operation=='tables': value=adapter.tables()
@@ -3250,8 +3297,9 @@ def worker_main():
             except Exception as exc:
                 is_cancel=event.is_set() or isinstance(exc,Cancelled)
                 message='Anulowano wykonanie lub przekroczono limit czasu. Poprzedni wynik zachowano.' if is_cancel else safe_error(exc,request.get('password',''))
-                failure={'id':jid,'event':'error','message':message,'cancelled':is_cancel}
+                failure={'id':jid,'event':'error','message':message,'cancelled':is_cancel,'connected':connected}
                 if isinstance(exc,DependencyError) and not is_cancel:failure['dependency']=exc.dependency
+                if isinstance(exc,DatabaseCatalogLimit) and not is_cancel:failure['catalog_scope']=exc.catalog_scope
                 send(failure)
             finally:
                 if watchdog: watchdog.cancel()
@@ -3319,6 +3367,8 @@ class WorkerClient:
                         job.update(status='cancelled' if message.get('cancelled') else 'error',
                                    error=message.get('message','Błąd sterownika'),ended=utcnow()); self.busy=None
                         if isinstance(message.get('dependency'),dict):job['dependency']=message['dependency']
+                        if isinstance(message.get('catalog_scope'),dict):job['catalog_scope']=message['catalog_scope']
+                        job['connected']=message.get('connected') is True
         finally:
             with self.hub.lock:
                 if self.busy and self.busy in self.hub.jobs:
@@ -6843,15 +6893,17 @@ def native_ui_types():
                 try:
                     if job['status']=='done':
                         if done: done(job.get('value'))
-                    elif error: error(QtFailure(job.get('error','Zadanie anulowano.'),job.get('dependency')))
+                    elif error: error(QtFailure(job.get('error','Zadanie anulowano.'),job.get('dependency'),
+                                               job.get('catalog_scope'),job.get('connected',False)))
                     else: alert(self.parent(),'Nie wykonano operacji',job.get('error','Zadanie anulowano.'))
                 except Exception as exc: alert(self.parent(),'Błąd obsługi wyniku',safe_error(exc))
                 self.changed.emit()
         def cancel(self,jid): self.service.call('cancel',{'id':jid})
 
     class QtFailure(str):
-        def __new__(cls,message,dependency=None):
-            value=super().__new__(cls,message);value.dependency=clone(dependency) if dependency else None;return value
+        def __new__(cls,message,dependency=None,catalog_scope=None,connected=False):
+            value=super().__new__(cls,message);value.dependency=clone(dependency) if dependency else None
+            value.catalog_scope=clone(catalog_scope) if catalog_scope else None;value.connected=bool(connected);return value
 
     class ResultTableModel(QC.QAbstractTableModel):
         """Full virtual row range, asynchronous pages, precise numeric transport."""
@@ -10313,7 +10365,7 @@ def native_ui_types():
                     title='Odczyt struktury bazy' if q['operation']=='database_catalog' else 'Odczyt strony danych')
             except Exception as exc:
                 self._active=None
-                if self._live(q):q['failed'](QtFailure(safe_error(exc),getattr(exc,'dependency',None)))
+                if self._live(q):q['failed'](QtFailure(safe_error(exc),getattr(exc,'dependency',None),getattr(exc,'catalog_scope',None)))
                 self._timer.start(0)
 
     class DatabaseRecordsModel(QC.QAbstractTableModel):
@@ -10860,16 +10912,22 @@ def native_ui_types():
         """Catalogue first; data views and pivots are separate explicit operations."""
         def __init__(self,window):
             super().__init__(window);self._host_window=window;self.source=None;self.catalog=None;self._cache={};self._objects={};self._wanted=None;self._epoch=0;self._selected='';self._graph_focus='';self._busy_catalog=False;self._data_pages={};self._tree_items={}
+            self._oracle_schema_override=None;self._oracle_scope_info=None
             self.queue=DatabaseTaskQueue(window);self.setObjectName('databaseExplorer')
             outer=QW.QVBoxLayout(self);outer.setContentsMargins(22,14,22,12);outer.setSpacing(10);outer.setAlignment(Qt.AlignmentFlag.AlignTop)
             top=QW.QHBoxLayout();self.title=label('Baza danych');self.title.setObjectName('sectionTitle');self.title.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);top.addWidget(self.title,1)
             back=button('Arkusz',window.return_to_sheet);back.setObjectName('quietButton');top.addWidget(back)
-            top.addWidget(icon_button('refresh','Odśwież całą strukturę',lambda:self.reload(True)));top.addWidget(icon_button('stop','Anuluj odczyt struktury',self.cancel_catalog))
+            top.addWidget(icon_button('refresh','Odśwież wybrany zakres struktury',lambda:self.reload(True)));top.addWidget(icon_button('stop','Anuluj odczyt struktury',self.cancel_catalog))
             self.more=QW.QToolButton();self.more.setText('Baza');self.more.setPopupMode(QW.QToolButton.ToolButtonPopupMode.InstantPopup)
             menu=QW.QMenu(self.more);menu.addAction('Eksportuj katalog struktury JSON…',lambda:window.guard(self.export_catalog));menu.addAction('Nowe zapytanie SQL…',lambda:window.guard(lambda:window.new_analysis(sql=True)))
             self.saved_joins_menu=menu.addMenu('Zapisane połączenia tabel');self.saved_joins_menu.aboutToShow.connect(self.refresh_saved_joins)
             menu.addAction('Edytuj połączenie…',lambda:window.guard(lambda:window.add_source(self.source)));self.more.setMenu(menu);top.addWidget(self.more);outer.addLayout(top)
-            self.status=label('Otwórz bazę, aby zobaczyć wszystkie jej obiekty.',True);self.status.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);outer.addWidget(self.status)
+            self.status=label('Otwórz bazę, aby zobaczyć wszystkie jej obiekty.',True,True);self.status.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);outer.addWidget(self.status)
+            self.oracle_scope_bar=QW.QWidget();scope_row=QW.QHBoxLayout(self.oracle_scope_bar);scope_row.setContentsMargins(0,0,0,0);scope_row.setSpacing(8)
+            scope_row.addWidget(label('Zakres Oracle',True));self.oracle_schema=QW.QComboBox();self.oracle_schema.setEditable(True);self.oracle_schema.setInsertPolicy(QW.QComboBox.InsertPolicy.NoInsert)
+            self.oracle_schema.setMinimumContentsLength(16);self.oracle_schema.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);self.oracle_schema.setSizePolicy(QW.QSizePolicy.Policy.Expanding,QW.QSizePolicy.Policy.Fixed)
+            self.oracle_schema.setAccessibleName('Schemat Oracle do odczytu');scope_row.addWidget(self.oracle_schema,1)
+            self.oracle_read_button=button('Odczytaj schemat',lambda:window.guard(self.read_oracle_schema));scope_row.addWidget(self.oracle_read_button);outer.addWidget(self.oracle_scope_bar);self.oracle_scope_bar.hide()
             self.driver_card=DependencyCard(window,self);outer.addWidget(self.driver_card)
             self.tabs=QW.QTabWidget();self.tabs.setDocumentMode(True);self.tabs.setObjectName('resultTabs');outer.addWidget(self.tabs,1)
             # One shared search/filter row lives inside Structure, not in the global toolbar.
@@ -10928,27 +10986,76 @@ def native_ui_types():
             self.tabs.currentChanged.connect(self.tab_changed)
             self._filter_timer=QC.QTimer(self);self._filter_timer.setSingleShot(True);self._filter_timer.setInterval(120);self._filter_timer.timeout.connect(self._apply_filter)
             self.select_object('')
+        def oracle_schema_scope(self):
+            if self._oracle_schema_override is not None:return self._oracle_schema_override
+            return str((self.source or {}).get('options',{}).get('schema',''))
+        def catalog_scope_label(self,catalog=None):
+            catalog=self.catalog if catalog is None else catalog
+            if self.source and self.source['kind']=='oracle':
+                schema=(catalog or {}).get('oracle_scope',{}).get('schema',self.source['options'].get('schema',''))
+                return 'Schemat '+schema if schema else 'Wszystkie dostępne schematy Oracle'
+            return 'Cała struktura bazy'
+        def update_oracle_scope(self,scope=None):
+            oracle=bool(self.source and self.source['kind']=='oracle');self.oracle_scope_bar.setVisible(oracle)
+            if not oracle:return
+            if scope is not None:self._oracle_scope_info=clone(scope)
+            info=self._oracle_scope_info or {};selected=self.oracle_schema_scope()
+            blocker=QC.QSignalBlocker(self.oracle_schema);self.oracle_schema.clear();self.oracle_schema.addItem('Wszystkie dostępne schematy','')
+            for item in info.get('schemas',[]):
+                name=str(item['name']);self.oracle_schema.addItem(name+' · '+str(item['objects'])+' obiektów',name)
+            index=self.oracle_schema.findData(selected)
+            if index<0:self.oracle_schema.addItem(selected,selected);index=self.oracle_schema.count()-1
+            self.oracle_schema.setCurrentIndex(index);del blocker
+            self.oracle_schema.setToolTip('Wybierz właściciela obiektów albo wpisz nazwę schematu. Zmiana dotyczy tego widoku.'+
+                (' Limit zakresu: '+str(info['limit'])+' obiektów.' if info.get('limit') else ''))
+            self.oracle_schema.setEnabled(not self._busy_catalog);self.oracle_read_button.setEnabled(not self._busy_catalog)
+        def read_oracle_schema(self):
+            if not self.source or self.source['kind']!='oracle' or self._busy_catalog:return
+            index=self.oracle_schema.currentIndex();text=self.oracle_schema.currentText()
+            schema=self.oracle_schema.itemData(index) if index>=0 and text==self.oracle_schema.itemText(index) else text.strip()
+            self._oracle_schema_override=str(schema or '');self._wanted=None;self.reload(False)
+        def invalidate_source_catalog(self,source):
+            self._cache={key:value for key,value in self._cache.items() if value.get('source_id')!=source['id']}
         def show_unconnected(self,source,issue):
             self.reset();self.source=clone(source);self.title.setText(source['name']);self.title.setToolTip(source['name'])
-            self.status.setText('Nie połączono z bazą.');self.driver_card.set_issue(issue,source);self.tabs.hide();self._unconnected_space.show()
+            self.status.setText('Nie połączono z bazą.');self.driver_card.set_issue(issue,source);self.tabs.hide();self._unconnected_space.show();self.update_oracle_scope()
         def open_source(self,source,obj=None,data=False):
+            same_source=bool(self.source and digest(source)==digest(self.source))
+            if not same_source:
+                self.reset();self.source=clone(source);self.title.setText(source['name']);self.title.setToolTip(source['name']);self.tabs.setCurrentIndex(0);self.update_oracle_scope()
             self._wanted=(obj,data) if obj else None
-            if self.source and digest(source)==digest(self.source):
+            if self.open_oracle_object_scope(obj):return
+            if same_source:
                 if self.catalog:
                     self._open_wanted()
                     if obj is None:self.tabs.setCurrentIndex(0);self.select_object('')
                 elif not self._busy_catalog:self.reload(False)
                 return
-            self.reset();self.source=clone(source);self._wanted=(obj,data) if obj else None
-            self.title.setText(source['name']);self.title.setToolTip(source['name']);self.tabs.setCurrentIndex(0);self.reload(False)
+            self.reload(False)
+        def open_oracle_object_scope(self,obj):
+            if not obj or not self.source or self.source['kind']!='oracle' or not obj.get('schema'):return False
+            target=obj['schema'];loaded_scope=(self.catalog or {}).get('oracle_scope',{}).get('schema',self.source['options'].get('schema',''))
+            found=bool(self.catalog and any(o['name']==obj['name'] and o['schema']==target and o['kind'] in DATABASE_RELATIONS for o in self.catalog['objects']))
+            if found:
+                if self.oracle_schema_scope()!=loaded_scope:
+                    if self._busy_catalog:self._epoch+=1;self.queue.cancel_owner(self);self._busy_catalog=False
+                    self.more.setEnabled(True);self.warning.hide();self._oracle_schema_override=loaded_scope;self.accept_catalog(self.catalog);return True
+                return False
+            self._oracle_schema_override=target;self.queue.cancel_owner(self)
+            self.reload(bool(self.catalog and loaded_scope==target));return True
         def reload(self,force=False):
             if not self.source:return
             issue=dependency_status(self.source['kind'],self._host_window.service.settings)
-            if issue['state']!='ready':self.show_unconnected(self.source,issue);return
+            if issue['state']!='ready':
+                self.driver_card.set_issue(issue,self.source);self.tabs.setVisible(bool(self.catalog));self._unconnected_space.setVisible(not self.catalog);self.status.setText('Nie połączono z bazą.');self.update_oracle_scope();return
             if digest(self.source) not in self._host_window.service.trusted:
                 if not self._host_window.authorize(self.source):return
             self.driver_card.set_issue(None);self.tabs.show();self._unconnected_space.hide()
-            self._epoch+=1;epoch=self._epoch;key=digest(self.source);self._busy_catalog=True;self.warning.hide();self.status.setText('Odczytuję strukturę. Zawartość tabel nie jest pobierana.')
+            args={};key=digest(self.source)
+            if self.source['kind']=='oracle':
+                key=digest({'source':self.source,'schema':self.oracle_schema_scope()})
+                if self._oracle_schema_override is not None:args['schema']=self._oracle_schema_override
+            self._epoch+=1;epoch=self._epoch;self._busy_catalog=True;self.update_oracle_scope();self.warning.hide();self.status.setText('Odczytuję strukturę. Zawartość tabel nie jest pobierana.'+(' Widoczny katalog: '+self.catalog_scope_label()+'.' if self.catalog else ''))
             if not force and key in self._cache:self._busy_catalog=False;self.more.setEnabled(True);self.accept_catalog(self._cache[key]);return
             self.more.setEnabled(False)
             def loaded(value):
@@ -10959,16 +11066,20 @@ def native_ui_types():
             def failed(text):
                 if epoch!=self._epoch:return
                 self._busy_catalog=False;self.more.setEnabled(True)
+                self.update_oracle_scope(getattr(text,'catalog_scope',None))
                 issue=getattr(text,'dependency',None)
                 if issue:
                     self.driver_card.set_issue(issue,self.source);self.tabs.setVisible(bool(self.catalog));self._unconnected_space.setVisible(not self.catalog);self.warning.hide();self.status.setText('Nie połączono z bazą.');return
-                self.warning.setText(str(text));self.warning.show();self.tabs.setVisible(bool(self.catalog));self._unconnected_space.setVisible(not self.catalog);self.status.setText('Nie ukończono odczytu struktury. Widoczny jest poprzedni katalog.' if self.catalog else 'Nie połączono z bazą. Sprawdź szczegóły błędu i spróbuj ponownie.')
+                self.warning.setText(str(text));self.warning.show();self.tabs.setVisible(bool(self.catalog));self._unconnected_space.setVisible(not self.catalog)
+                status='Połączenie działa; nie ukończono odczytu struktury.' if getattr(text,'connected',False) else 'Nie ukończono odczytu struktury.' if self.catalog else 'Nie połączono z bazą. Sprawdź szczegóły błędu i spróbuj ponownie.'
+                if self.catalog:status+=' Widoczny jest poprzedni katalog: '+self.catalog_scope_label()+'.'
+                self.status.setText(status);self.status.setToolTip(status)
             def progress(job):
                 if epoch==self._epoch:self.status.setText(job.get('stage','Odczyt struktury…'))
-            self.queue.submit(self,'database_catalog',self.source,{},loaded,failed,progress)
+            self.queue.submit(self,'database_catalog',self.source,args,loaded,failed,progress)
         def cancel_catalog(self):
             self._epoch+=1;self._busy_catalog=False;self.queue.cancel_owner(self);self.more.setEnabled(True)
-            self.status.setText('Anulowano odczyt struktury.'+(' Zachowano wcześniejszy katalog.' if self.catalog else ''))
+            self.update_oracle_scope();self.status.setText('Anulowano odczyt struktury.'+(' Zachowano wcześniejszy katalog: '+self.catalog_scope_label()+'.' if self.catalog else ''))
         def accept_catalog(self,catalog):
             self.driver_card.set_issue(None);self.tabs.show();self._unconnected_space.hide()
             fresh_objects={o['id']:o for o in catalog['objects']}
@@ -10986,10 +11097,12 @@ def native_ui_types():
                     page.cancel();page.note.setText('Struktura obiektu zmieniła się. Odśwież dane; widoczna strona pochodzi z wcześniejszego odczytu.')
                 if fresh:page.obj=clone(fresh)
             self.catalog=catalog;self._objects={o['id']:o for o in catalog['objects']};self._selected=''
+            self.update_oracle_scope(catalog.get('oracle_scope'))
             schema=self.schemas.currentData();self.schemas.blockSignals(True);self.schemas.clear();self.schemas.addItem('Wszystkie schematy','')
             for name in sorted({o['schema'] for o in catalog['objects'] if o['schema']}):self.schemas.addItem(name,name)
             self.schemas.setCurrentIndex(max(0,self.schemas.findData(schema)));self.schemas.blockSignals(False)
             counts=catalog['counts'];self.status.setText(f'{len(catalog["objects"])} obiektów · {counts.get("table",0)} tabel · {counts.get("view",0)} widoków · {len(catalog["relations"])} kluczy obcych · tylko odczyt')
+            if self.source and self.source['kind']=='oracle':self.status.setText(self.catalog_scope_label()+' · '+self.status.text())
             self.status.setToolTip('\n'.join(catalog['scope'])+'\nOdczyt: '+catalog['read_at'])
             if catalog['warnings']:
                 self.warning.setText('Katalog częściowy · '+str(len(catalog['warnings']))+' problemów odczytu. Szczegóły w Informacjach.');self.warning.setToolTip('\n'.join(catalog['warnings']));self.warning.show()
@@ -11056,7 +11169,7 @@ def native_ui_types():
         def select_object(self,oid):
             self._selected=oid;obj=self._objects.get(oid);can=bool(obj and obj['kind'] in DATABASE_RELATIONS)
             self.data_button.setEnabled(can);self.pivot_button.setEnabled(can);self.related_button.setEnabled(can)
-            self.object_title.setText(database_label(obj) if obj else 'Cała struktura bazy')
+            self.object_title.setText(database_label(obj) if obj else self.catalog_scope_label())
             columns=obj['columns'] if obj else []
             self.columns_model.set_records(['Kolumna','Typ','NULL','Klucz','Domyślnie'],[(c['name'],c['type'],'tak' if c['nullable'] else 'nie',('PK '+str(c['pk_position']) if c.get('pk_position') else '')+(' · generowana' if c.get('generated') else '')+(' · ukryta' if c.get('hidden') else ''),c.get('default','')) for c in columns])
             keys=obj['keys'] if obj else []
@@ -11078,7 +11191,7 @@ def native_ui_types():
                 self.details.setCurrentIndex(0 if columns else 3 if obj['definition'] else 4)
             else:
                 self.definition.setPlainText('Wybierz dowolny obiekt, aby zobaczyć jego definicję. Nic nie zostanie wykonane.')
-                cat=self.catalog or {};summary=('Otwarta jest baza, nie pojedyncza analiza.' if self.catalog else 'Nie połączono z bazą; katalog nie został jeszcze odczytany.')+'\n\n'+ '\n'.join(cat.get('scope',[]))
+                cat=self.catalog or {};summary=('Odczytany zakres: '+self.catalog_scope_label()+'.' if self.catalog else 'Katalog nie został jeszcze odczytany.')+'\n\n'+ '\n'.join(cat.get('scope',[]))
                 summary+='\n\n'+ '\n'.join(DATABASE_KINDS.get(k,k)+': '+str(v) for k,v in cat.get('counts',{}).items())
                 summary+='\n\nStruktura nie jest kopią wszystkich rekordów. Tabele otwierasz dwuklikiem; zapytania są tylko do odczytu.'
                 if cat.get('warnings'):summary+='\n\nProblemy odczytu:\n'+'\n'.join(cat['warnings'])
@@ -11146,7 +11259,9 @@ def native_ui_types():
         def _render_graph(self):
             if not self.catalog:return
             plan=database_graph_subset(self.catalog,self.search.text(),self.schemas.currentData() or '',self.system.isChecked(),self._graph_focus)
-            source_key=digest(self.source);view_key=digest([self.search.text(),self.schemas.currentData(),self.system.isChecked(),self._graph_focus])[:24]
+            source_key=digest(self.source);view=[self.search.text(),self.schemas.currentData(),self.system.isChecked(),self._graph_focus]
+            if self.source['kind']=='oracle':view.append(self.catalog.get('oracle_scope',{}).get('schema',self.source['options'].get('schema','')))
+            view_key=digest(view)[:24]
             self.graph.show_plan(plan,source_key,view_key)
             total=sum(o['kind'] in DATABASE_RELATIONS for o in self.catalog['objects'])
             hidden_system=sum(o['kind'] in DATABASE_RELATIONS and o['system'] for o in self.catalog['objects']) if not self.system.isChecked() else 0
@@ -11196,6 +11311,7 @@ def native_ui_types():
             self._epoch+=1;self.queue.clear()
             while self.data_tabs.count():self.close_data(0)
             self._busy_catalog=False;self.catalog=None;self.source=None;self._objects={};self._selected='';self._wanted=None;self._graph_focus=''
+            self._oracle_schema_override=None;self._oracle_scope_info=None;self.oracle_schema.clear();self.oracle_scope_bar.hide()
             self.tree_model.clear();self._tree_items={};self.warning.hide();self.more.setEnabled(True);self.select_object('');self.driver_card.set_issue(None);self.tabs.show();self._unconnected_space.hide()
         def dispose(self):self.reset();self._cache.clear();self._filter_timer.stop()
 
@@ -11659,7 +11775,7 @@ def native_ui_types():
             result=self.service.call('source_save',dialog.value); saved=result['source']
             self.service.call('trust',{'source_id':saved['id'],'confirmed':True})
             self.tables_cache.pop(saved['id'],None); self.field_cache.clear(); self.refresh_navigation(); self.refresh_validity()
-            self.database_explorer._cache.pop(digest(saved),None);self.database_explorer.source=None
+            self.database_explorer.invalidate_source_catalog(saved);self.database_explorer.source=None
             self.open_database(saved)
         def delete_source(self,source):
             if confirm(self,'Usuń źródło','Usunąć definicję połączenia „'+source['name']+'”? Plik bazy nie zostanie usunięty.'):
@@ -13355,6 +13471,169 @@ def sheet_test_suite():
     return unittest.defaultTestLoader.loadTestsFromTestCase(SheetTests)
 
 
+def oracle_catalog_test_suite():
+    """Execute Oracle dictionary SELECTs with real binds on a local SQL fixture.
+
+    This verifies scope and relational semantics, not Oracle driver integration.
+    """
+    import unittest
+    from unittest.mock import patch
+    class DictionaryOracle(Adapter):
+        kind='oracle'
+        def __init__(self):
+            super().__init__({'id':'oracle-fixture','kind':'oracle','name':'Oracle fixture','options':{}})
+            self.conn=sqlite3.connect(':memory:');self.requests=[];self.returned=[];self.fail_on=''
+        def execute(self,sql,params=()):
+            self.check_cancel();bindings={'p'+str(i):value for i,value in enumerate(params,1)}
+            if set(re.findall(r':(p\d+)\b',sql))!=set(bindings):raise AssertionError('Niepełne lub zbędne parametry Oracle.')
+            cur=self.conn.cursor();self.active_cursor=cur;cur.execute(sql,bindings);return cur
+        def fetch(self,sql,params=(),limit=None):
+            self.requests.append((sql,list(params)))
+            if self.fail_on and self.fail_on in sql:raise UserError('Brak dostępu do sekcji testowej.')
+            rows=super().fetch(sql,params,limit);self.returned.append((sql,rows));return rows
+    class OracleCatalogTests(unittest.TestCase):
+        def setUp(self):
+            self.adapter=DictionaryOracle();self.addCleanup(self.adapter.close);self.db=self.adapter.conn
+            self.db.executescript('''
+                CREATE TABLE ALL_OBJECTS(OWNER TEXT,OBJECT_NAME TEXT,OBJECT_TYPE TEXT,STATUS TEXT,SUBOBJECT_NAME TEXT);
+                CREATE TABLE ALL_TAB_COLUMNS(OWNER TEXT,TABLE_NAME TEXT,COLUMN_NAME TEXT,DATA_TYPE TEXT,COLUMN_ID INTEGER,NULLABLE TEXT,DATA_DEFAULT TEXT,DATA_PRECISION INTEGER,DATA_SCALE INTEGER);
+                CREATE TABLE ALL_CONSTRAINTS(OWNER TEXT,CONSTRAINT_NAME TEXT,CONSTRAINT_TYPE TEXT,TABLE_NAME TEXT,R_OWNER TEXT,R_CONSTRAINT_NAME TEXT,DELETE_RULE TEXT,STATUS TEXT,VALIDATED TEXT,SEARCH_CONDITION TEXT);
+                CREATE TABLE ALL_CONS_COLUMNS(OWNER TEXT,CONSTRAINT_NAME TEXT,COLUMN_NAME TEXT,POSITION INTEGER);
+                CREATE TABLE ALL_INDEXES(OWNER TEXT,INDEX_NAME TEXT,TABLE_OWNER TEXT,TABLE_NAME TEXT,UNIQUENESS TEXT,INDEX_TYPE TEXT);
+                CREATE TABLE ALL_IND_COLUMNS(INDEX_OWNER TEXT,INDEX_NAME TEXT,COLUMN_NAME TEXT,COLUMN_POSITION INTEGER,DESCEND TEXT);
+                CREATE TABLE ALL_VIEWS(OWNER TEXT,VIEW_NAME TEXT,TEXT TEXT);
+                CREATE TABLE ALL_TRIGGERS(OWNER TEXT,TRIGGER_NAME TEXT,TABLE_NAME TEXT,TRIGGERING_EVENT TEXT,TRIGGER_TYPE TEXT,TRIGGER_BODY TEXT);
+            ''')
+            for owner,tables in [('App',('PARENT','CHILD')),('Other',('EXTERNAL_PARENT','UNRELATED'))]:
+                self.db.executemany('INSERT INTO ALL_OBJECTS VALUES(?,?,?,\'VALID\',NULL)',
+                    [(owner,n,'TABLE') for n in tables]+[(owner,'IX_CHILD','INDEX'),(owner,'V_CHILD','VIEW'),(owner,'TR_CHILD','TRIGGER')])
+                self.db.execute('INSERT INTO ALL_INDEXES VALUES(?,?,?,?,?,?)',(owner,'IX_CHILD',owner,tables[1],'NONUNIQUE','NORMAL'))
+                self.db.execute('INSERT INTO ALL_IND_COLUMNS VALUES(?,?,?,?,?)',(owner,'IX_CHILD','ID',1,'ASC'))
+                self.db.execute('INSERT INTO ALL_VIEWS VALUES(?,?,?)',(owner,'V_CHILD','SELECT ID FROM '+tables[1]))
+                self.db.execute('INSERT INTO ALL_TRIGGERS VALUES(?,?,?,?,?,?)',(owner,'TR_CHILD',tables[1],'INSERT','BEFORE EACH ROW','BEGIN NULL; END;'))
+            for owner,table,names in [('App','PARENT',['ID']),('App','CHILD',['ID','A','B','C','D','LID']),
+                                      ('Other','EXTERNAL_PARENT',['X','Y']),('Other','UNRELATED',['Z'])]:
+                self.db.executemany('INSERT INTO ALL_TAB_COLUMNS VALUES(?,?,?,?,?,?,NULL,38,0)',
+                    [(owner,table,n,'NUMBER',i,'N') for i,n in enumerate(names,1)])
+            for owner,name,kind,table,target_owner,target in [
+                    ('App','PK_PARENT','P','PARENT',None,None),('App','PK_CHILD','P','CHILD',None,None),
+                    ('App','FK_LOCAL','R','CHILD','App','PK_PARENT'),
+                    ('App','FK_EXTERNAL','R','CHILD','Other','PK_EXTERNAL'),
+                    ('App','FK_EXTERNAL_AGAIN','R','CHILD','Other','PK_EXTERNAL'),
+                    ('Other','PK_EXTERNAL','P','EXTERNAL_PARENT',None,None),
+                    ('Other','PK_UNRELATED','P','UNRELATED',None,None)]:
+                self.db.execute('INSERT INTO ALL_CONSTRAINTS VALUES(?,?,?,?,?,?,\'NO ACTION\',\'ENABLED\',\'VALIDATED\',NULL)',
+                                (owner,name,kind,table,target_owner,target))
+            for owner,name,columns in [('App','PK_PARENT',['ID']),('App','PK_CHILD',['ID']),('App','FK_LOCAL',['LID']),
+                                      ('App','FK_EXTERNAL',['A','B']),('App','FK_EXTERNAL_AGAIN',['C','D']),
+                                      ('Other','PK_EXTERNAL',['X','Y']),('Other','PK_UNRELATED',['Z'])]:
+                # Reverse physical insertion order: positions must order the FK.
+                self.db.executemany('INSERT INTO ALL_CONS_COLUMNS VALUES(?,?,?,?)',
+                    [(owner,name,col,pos) for pos,col in reversed(list(enumerate(columns,1)))])
+        def read(self,schema=None):return DatabaseInspector(self.adapter,schema=schema).read()
+        def large_schema(self,owner='Huge',count=20001):
+            self.db.executemany('INSERT INTO ALL_OBJECTS VALUES(?,?,\'TABLE\',\'VALID\',NULL)',
+                               [(owner,'T'+str(i)) for i in range(count)])
+        def test_small_all_catalog_keeps_all_schemas_and_resolved_fk(self):
+            catalog=self.read()
+            self.assertTrue(catalog['complete']);self.assertEqual({o['schema'] for o in catalog['objects']},{'App','Other'})
+            self.assertEqual(catalog['oracle_scope'],{'schema':'','schemas':[{'name':'App','objects':5},{'name':'Other','objects':5}],'limit':20000})
+            self.assertTrue(all(edge['resolved'] for edge in catalog['relations']))
+            self.assertTrue(all(not params for sql,params in self.adapter.requests))
+        def test_source_schema_default_is_honored_and_all_override_is_explicit(self):
+            self.adapter.options['schema']='App'
+            catalog=self.read();self.assertEqual({o['schema'] for o in catalog['objects']},{'App'})
+            self.assertEqual(catalog['oracle_scope']['schema'],'App')
+            self.assertEqual({o['schema'] for o in self.read('')['objects']},{'App','Other'})
+        def test_oversize_all_stops_before_names_or_bulk_metadata(self):
+            self.large_schema()
+            with self.assertRaises(DatabaseCatalogLimit) as caught:self.read()
+            scope=caught.exception.catalog_scope
+            self.assertEqual(scope['schema'],'');self.assertEqual(scope['limit'],20000)
+            self.assertIn({'name':'Huge','objects':20001},scope['schemas'])
+            self.assertEqual(len(self.adapter.requests),1);self.assertIn('GROUP BY OWNER',self.adapter.requests[0][0])
+        def test_small_selected_schema_works_beside_oversize_catalog(self):
+            self.large_schema();catalog=self.read('App')
+            self.assertTrue(catalog['complete']);self.assertEqual(len(catalog['objects']),5)
+            self.assertEqual({o['schema'] for o in catalog['objects']},{'App'})
+            for sql,params in self.adapter.requests[1:]:
+                with self.subTest(sql=sql):
+                    self.assertTrue(params);self.assertTrue(all(p=='App' for p in params));self.assertIn('WHERE ',sql)
+            for sql,rows in self.adapter.returned[1:]:
+                with self.subTest(sql=sql):
+                    if 'SELECT DISTINCT p.OWNER' in sql:
+                        self.assertEqual(rows,[('Other','PK_EXTERNAL','EXTERNAL_PARENT','X',1),('Other','PK_EXTERNAL','EXTERNAL_PARENT','Y',2)])
+                    else:self.assertTrue(all(row[0]=='App' for row in rows))
+        def test_oversize_single_schema_is_honest_scope_error(self):
+            self.large_schema()
+            with self.assertRaises(DatabaseCatalogLimit) as caught:self.read('Huge')
+            self.assertEqual(caught.exception.catalog_scope['schema'],'Huge')
+            self.assertIn('pojedynczego schematu',str(caught.exception));self.assertEqual(len(self.adapter.requests),1)
+        def test_cross_schema_keys_keep_target_details_without_loading_target_objects(self):
+            catalog=self.read('App');edges={e['name']:e for e in catalog['relations']}
+            self.assertTrue(edges['FK_LOCAL']['resolved'])
+            for name,columns in [('FK_EXTERNAL',['A','B']),('FK_EXTERNAL_AGAIN',['C','D'])]:
+                edge=edges[name]
+                self.assertFalse(edge['resolved']);self.assertEqual(edge['target'],'')
+                self.assertEqual(edge['source_columns'],columns);self.assertEqual(edge['target_schema'],'Other')
+                self.assertEqual(edge['target_table'],'EXTERNAL_PARENT');self.assertEqual(edge['target_columns'],['X','Y'])
+            self.assertTrue(all(o['schema']=='App' for o in catalog['objects']))
+        def test_cross_schema_parent_without_column_privilege_keeps_table_name(self):
+            self.db.execute("DELETE FROM ALL_CONS_COLUMNS WHERE OWNER='Other' AND CONSTRAINT_NAME='PK_EXTERNAL'")
+            edge=next(e for e in self.read('App')['relations'] if e['name']=='FK_EXTERNAL')
+            self.assertEqual(edge['target_table'],'EXTERNAL_PARENT');self.assertEqual(edge['target_columns'],[]);self.assertFalse(edge['resolved'])
+        def test_subobjects_do_not_count_or_appear_as_extra_objects(self):
+            self.db.executemany('INSERT INTO ALL_OBJECTS VALUES(\'App\',\'CHILD\',\'TABLE PARTITION\',\'VALID\',?)',[(str(i),) for i in range(20)])
+            catalog=self.read('App');self.assertEqual(len(catalog['objects']),5)
+            self.assertEqual(next(s['objects'] for s in catalog['oracle_scope']['schemas'] if s['name']=='App'),5)
+        def test_unknown_or_different_case_schema_stays_empty_without_fallback(self):
+            for schema in ('app','ABSENT'):
+                with self.subTest(schema=schema):
+                    catalog=self.read(schema);self.assertEqual(catalog['objects'],[])
+                    self.assertEqual(catalog['oracle_scope']['schema'],schema)
+                    self.assertNotIn(schema,[s['name'] for s in catalog['oracle_scope']['schemas']])
+        def test_schema_is_bound_without_case_folding_or_sql_interpolation(self):
+            owner="MiXeD' OR 1=1 --"
+            for table,columns in [('ALL_OBJECTS',['OWNER']),('ALL_TAB_COLUMNS',['OWNER']),
+                    ('ALL_CONSTRAINTS',['OWNER','R_OWNER']),('ALL_CONS_COLUMNS',['OWNER']),
+                    ('ALL_INDEXES',['OWNER','TABLE_OWNER']),('ALL_IND_COLUMNS',['INDEX_OWNER']),
+                    ('ALL_VIEWS',['OWNER']),('ALL_TRIGGERS',['OWNER'])]:
+                for col in columns:self.db.execute('UPDATE '+table+' SET '+col+'=? WHERE '+col+'=?',(owner,'App'))
+            catalog=self.read(owner);self.assertEqual({o['schema'] for o in catalog['objects']},{owner})
+            for sql,params in self.adapter.requests:
+                self.assertNotIn(owner,sql)
+                if params:self.assertTrue(all(value==owner for value in params))
+            child=next(o for o in catalog['objects'] if o['name']=='CHILD')
+            self.assertEqual([c['name'] for c in child['columns']],['ID','A','B','C','D','LID'])
+            self.assertEqual(child['columns'][0]['pk_position'],1);self.assertEqual(len(child['indexes']),1)
+            index=next(o for o in catalog['objects'] if o['kind']=='index');self.assertEqual(index['index_columns'][0]['name'],'ID')
+            self.assertTrue(next(o for o in catalog['objects'] if o['kind']=='view')['definition'])
+            self.assertTrue(next(o for o in catalog['objects'] if o['kind']=='trigger')['definition'])
+        def test_invalid_schema_fails_before_query(self):
+            for schema in (False,[],{},'x\0y','x\ny','x'*513):
+                with self.subTest(schema=schema),self.assertRaises(UserError):self.read(schema)
+            self.assertEqual(self.adapter.requests,[])
+        def test_section_permission_error_stays_explicitly_partial(self):
+            self.adapter.fail_on='FROM ALL_VIEWS';catalog=self.read('App')
+            self.assertFalse(catalog['complete']);self.assertTrue(catalog['warnings']);self.assertEqual(len(catalog['objects']),5)
+            self.assertEqual(catalog['oracle_scope']['schema'],'App')
+        def test_metadata_byte_limit_returns_scope_instead_of_truncated_catalog(self):
+            with patch.dict(globals(),DATABASE_MAX_METADATA_BYTES=1),self.assertRaises(DatabaseCatalogLimit) as caught:self.read('App')
+            self.assertEqual(caught.exception.catalog_scope['schema'],'App');self.assertEqual(len(caught.exception.catalog_scope['schemas']),2)
+        def test_object_growth_inside_section_propagates_scope_limit(self):
+            self.db.execute("INSERT INTO ALL_INDEXES VALUES('App','IX_LATE','App','CHILD','NONUNIQUE','NORMAL')")
+            with patch.dict(globals(),DATABASE_MAX_OBJECTS=5),self.assertRaises(DatabaseCatalogLimit) as caught:self.read('App')
+            self.assertEqual(caught.exception.catalog_scope['schema'],'App');self.assertEqual(caught.exception.catalog_scope['limit'],5)
+        def test_cancellation_is_not_converted_to_scope_selection(self):
+            self.adapter.cancelled.set()
+            with self.assertRaises(Cancelled):self.read('App')
+        def test_scope_exception_owns_its_metadata(self):
+            scope={'schema':'App','schemas':[{'name':'App','objects':5}],'limit':5}
+            error=DatabaseCatalogLimit('limit',scope);scope['schemas'][0]['objects']=6
+            self.assertEqual(error.catalog_scope['schemas'][0]['objects'],5)
+    return unittest.defaultTestLoader.loadTestsFromTestCase(OracleCatalogTests)
+
+
 def database_explorer_test_suite():
     """Real SQLite and worker IPC. UI source checks are not Qt/Windows execution."""
     import unittest
@@ -14435,6 +14714,50 @@ def dependency_restart_test_suite():
     return unittest.defaultTestLoader.loadTestsFromTestCase(DependencyRestartTests)
 
 
+def database_worker_error_test_suite():
+    import unittest
+    from unittest.mock import patch
+    class DatabaseWorkerErrorTests(unittest.TestCase):
+        def test_catalog_scope_and_connection_state_survive_worker_protocol(self):
+            scope={'schema':'','schemas':[{'name':'APP','objects':7},{'name':'SYS','objects':30000}],'limit':20000}
+            ready=threading.Event();output=io.StringIO();requested=[];closed=[]
+            source=validate_source({'kind':'oracle','name':'Oracle','options':{'host':'example.invalid','user':'reader'}})
+            requests=[{'id':'scope','operation':'database_catalog','source':source,'args':{'schema':'APP'}},
+                      {'id':'connect','operation':'database_catalog','source':source,'args':{}}]
+            class AdapterFixture:
+                def __init__(self,*args):self.number=len(requested);requested.append(self)
+                def connect(self):
+                    if self.number:raise UserError('Connection refused')
+                def check_cancel(self):pass
+                def cancel(self):pass
+                def close(self):closed.append(self.number)
+            class Input:
+                def __iter__(self):
+                    for request in requests:
+                        ready.clear();yield dumps(request)+'\n'
+                        if not ready.wait(5):raise AssertionError('Worker did not report an error')
+                    yield dumps({'operation':'shutdown'})+'\n'
+            class Output:
+                def write(self,line):
+                    output.write(line)
+                    if json.loads(line).get('event')=='error':ready.set()
+                def flush(self):pass
+            with patch.dict(ADAPTERS,oracle=AdapterFixture),patch(__name__+'.DatabaseInspector') as inspector:
+                inspector.return_value.read.side_effect=DatabaseCatalogLimit('Wybierz schemat.',scope)
+                with patch.object(sys,'stdin',Input()),patch.object(sys,'stdout',Output()):worker_main()
+                self.assertEqual(inspector.call_args.kwargs['schema'],'APP')
+            self.assertEqual(closed,[0,1])
+            # Feed the actual serialized worker messages to the UI-side reader.
+            hub=WorkerHub();hub.jobs={r['id']:{'status':'running'} for r in requests}
+            client=WorkerClient.__new__(WorkerClient);client.hub=hub;client.busy='scope'
+            class Process:stdout=io.StringIO(output.getvalue())
+            client.process=Process();client._read()
+            first=hub.poll('scope');second=hub.poll('connect')
+            self.assertEqual(first['status'],'error');self.assertTrue(first['connected']);self.assertEqual(first['catalog_scope'],scope)
+            self.assertEqual(second['status'],'error');self.assertFalse(second['connected']);self.assertNotIn('catalog_scope',second)
+    return unittest.defaultTestLoader.loadTestsFromTestCase(DatabaseWorkerErrorTests)
+
+
 def self_test():
     """No optional packages and no external DB access. Run on the delivered file."""
     import unittest
@@ -14751,6 +15074,8 @@ def self_test():
     print(f'{APP_NAME} {APP_VERSION} — testy lokalne; Python {platform.python_version()}, SQLite {sqlite3.sqlite_version}',flush=True)
     suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(CoreTests),gui_contract_test_suite(),file_intake_test_suite(),workbook_test_suite(),sheet_test_suite(),sheet_selection_test_suite(),sheet_contrast_test_suite(),database_explorer_test_suite(),database_join_test_suite(),technology_license_test_suite(),sheet_interaction_test_suite(),author_test_suite()])
     suite.addTests(dependency_restart_test_suite())
+    suite.addTests(oracle_catalog_test_suite())
+    suite.addTests(database_worker_error_test_suite())
     result=unittest.TextTestRunner(verbosity=2).run(suite)
     print('Testy rdzenia nie zastępują integracji z H2 / Firebird / Oracle. Testy Qt: --ui-test.',flush=True)
     return 0 if result.wasSuccessful() else 1
@@ -15233,6 +15558,106 @@ def ui_test():
             return path,self.window.database_explorer
         def dependency_fixture(self):
             return self.service.call('source_save',{'source':{'id':uid(),'name':'Oracle test','kind':'oracle','options':{'host':'example.invalid','port':1521,'service':'demo','user':'reader','mode':'thin'}},'password':''})['source']
+        def oracle_scope_fixture(self,schema=''):
+            from unittest import mock
+            source=self.dependency_fixture();source['options']['schema']=schema;source=self.service.call('source_save',{'source':source,'password':''})['source']
+            self.service.trusted.add(digest(source));ex=self.window.database_explorer;requests=[]
+            ready=mock.patch(__name__+'.dependency_status',return_value={'state':'ready','profile':'oracle','title':'Oracle','message':'','details':''});ready.start();self.addCleanup(ready.stop)
+            def submit(owner,operation,src,args,done,failed,progress):requests.append({'source':clone(src),'args':clone(args),'done':done,'failed':failed})
+            queued=mock.patch.object(ex.queue,'submit',side_effect=submit);queued.start();self.addCleanup(queued.stop)
+            self.window.open_database(source);return source,ex,requests
+        def oracle_scope_info(self,schema=''):
+            return {'schema':schema,'schemas':[{'name':'SMALL','objects':12},{'name':'BIG','objects':25001},{'name':'OTHER','objects':17}],'limit':20000}
+        def oracle_scope_catalog(self,source,schema,objects=()):
+            return {'version':DATABASE_CATALOG_FORMAT,'source_id':source['id'],'backend':'oracle','scope':['Widoczne obiekty wskazanego zakresu.'],'objects':clone(list(objects)),'relations':[],'counts':dict(collections.Counter(o['kind'] for o in objects)),'warnings':[],'read_at':utcnow(),'oracle_scope':self.oracle_scope_info(schema)}
+        def oracle_scope_table(self,schema,name='T'):
+            return {'id':database_object_id(schema,'table',name),'schema':schema,'name':name,'kind':'table','system':False,'parent':'',
+                'columns':[{'name':'ID','type':'NUMBER','position':0,'nullable':False,'pk_position':1,'default':'','generated':False,'hidden':False}],
+                'keys':[],'indexes':[],'properties':{},'definition':'','definition_kind':'unavailable','problems':[]}
+        def test_oracle_scope_graph_keeps_separate_camera_and_selection(self):
+            source,ex,requests=self.oracle_scope_fixture('SMALL');small=self.oracle_scope_table('SMALL');other=self.oracle_scope_table('OTHER')
+            small_catalog=self.oracle_scope_catalog(source,'SMALL',[small]);other_catalog=self.oracle_scope_catalog(source,'OTHER',[other])
+            requests[-1]['done'](small_catalog);ex.tabs.setCurrentIndex(1);self.wait(lambda:not ex.graph._initial_view)
+            graph=ex.graph;graph._nodes[small['id']].setSelected(True);graph.zoom_by(1.5);graph.save_state()
+            small_key=graph._view_key;source_key=graph._source_key;saved=clone(graph._state()['views'][small_key])
+            ex._oracle_schema_override='OTHER';ex._render_graph();self.assertEqual(graph._view_key,small_key)
+            ex.reload(False);requests[-1]['done'](other_catalog);self.wait(lambda:not graph._initial_view)
+            self.assertNotEqual(graph._view_key,small_key);self.assertEqual(graph._source_key,source_key);self.assertAlmostEqual(graph.transform().m11(),1.0);self.assertEqual(graph.selected_ids(),[])
+            graph.zoom_by(2.0);graph._nodes[other['id']].setSelected(True);graph.save_state();self.assertEqual(graph._state()['views'][small_key],saved)
+            ex._oracle_schema_override='SMALL';ex.reload(False);self.wait(lambda:not graph._initial_view)
+            self.assertEqual(graph._view_key,small_key);self.assertAlmostEqual(graph.transform().m11(),1.5);self.assertEqual(graph.selected_ids(),[small['id']])
+        def test_oracle_scope_explicit_object_selects_schema_and_preserves_wanted(self):
+            from unittest import mock
+            source,ex,requests=self.oracle_scope_fixture();ex.reset();requests.clear();before=clone(self.service.document);trusted=set(self.service.trusted)
+            small=self.oracle_scope_table('SMALL');other=self.oracle_scope_table('OTHER')
+            with mock.patch.object(ex,'open_data') as open_data:
+                self.window.open_database(source,{'schema':'SMALL','name':'T'},data=True)
+                self.assertEqual(requests[-1]['args'],{'schema':'SMALL'});self.assertEqual(ex._wanted,({'schema':'SMALL','name':'T'},True))
+                requests[-1]['done'](self.oracle_scope_catalog(source,'SMALL',[small]));open_data.assert_called_with(small['id'])
+                self.window.open_database(source,{'schema':'OTHER','name':'T'},data=True)
+                self.assertEqual(requests[-1]['args'],{'schema':'OTHER'});self.assertIsNotNone(ex._wanted)
+                requests[-1]['done'](self.oracle_scope_catalog(source,'OTHER',[other]));open_data.assert_called_with(other['id']);self.assertIsNone(ex._wanted)
+            count=len(requests);self.window.open_database(source,{'schema':'OTHER','name':'gone'})
+            self.assertEqual(len(requests),count+1);requests[-1]['done'](self.oracle_scope_catalog(source,'OTHER',[other]))
+            self.assertIn('nie występuje',ex.warning.text());self.assertIsNone(ex._wanted);self.assertEqual(len(requests),count+1)
+            ex._oracle_schema_override='BIG';ex.reload(False);requests[-1]['failed'](ui['QtFailure']('Limit BIG.',catalog_scope=self.oracle_scope_info('BIG'),connected=True))
+            self.assertFalse(ex._busy_catalog);count=len(requests);self.window.open_database(source,{'schema':'OTHER','name':'T'})
+            self.assertEqual(len(requests),count);self.assertEqual(ex.oracle_schema_scope(),'OTHER');self.assertEqual(ex.oracle_schema.currentData(),'OTHER');self.assertTrue(ex.warning.isHidden())
+            ex.reload(True);self.assertEqual(requests[-1]['args'],{'schema':'OTHER'})
+            self.assertEqual(self.service.document,before);self.assertEqual(self.service.trusted,trusted)
+        def test_oracle_scope_all_catalog_kept_for_existing_explicit_object(self):
+            source,ex,requests=self.oracle_scope_fixture();small=self.oracle_scope_table('SMALL');requests[-1]['done'](self.oracle_scope_catalog(source,'',[small]))
+            self.window.open_database(source,{'schema':'SMALL','name':'T'});self.assertEqual(len(requests),1);self.assertIsNone(ex._oracle_schema_override);self.assertEqual(ex._selected,small['id'])
+            self.window.open_database(source,{'schema':'OTHER','name':'T'});self.assertEqual(requests[-1]['args'],{'schema':'OTHER'});self.assertEqual(ex._wanted,({'schema':'OTHER','name':'T'},False))
+        def test_oracle_scope_explicit_object_cancels_different_pending_scope(self):
+            source,ex,requests=self.oracle_scope_fixture();small=self.oracle_scope_table('SMALL');other=self.oracle_scope_table('OTHER')
+            requests[-1]['done'](self.oracle_scope_catalog(source,'',[small]));ex._oracle_schema_override='OTHER';ex.reload(False);pending=requests[-1];epoch=ex._epoch
+            self.window.open_database(source,{'schema':'SMALL','name':'T'})
+            self.assertGreater(ex._epoch,epoch);self.assertFalse(ex._busy_catalog);self.assertEqual(ex.oracle_schema_scope(),'');self.assertEqual(ex._selected,small['id'])
+            pending['done'](self.oracle_scope_catalog(source,'OTHER',[other]));self.assertEqual(ex.catalog['oracle_scope']['schema'],'');self.assertEqual(ex._selected,small['id'])
+        def test_oracle_scope_limit_keeps_selector_and_can_retry(self):
+            source,ex,requests=self.oracle_scope_fixture();before=clone(self.service.document);trusted=set(self.service.trusted)
+            self.assertEqual(requests[0]['args'],{})
+            requests[0]['failed'](ui['QtFailure']('Przekroczono limit 20000 obiektów.',catalog_scope=self.oracle_scope_info(),connected=True));app.processEvents()
+            self.assertIn('Połączenie działa',ex.status.text());self.assertNotIn('Nie połączono',ex.status.text());self.assertTrue(ex.driver_card.isHidden())
+            self.assertFalse(ex.oracle_scope_bar.isHidden());self.assertTrue(ex.tabs.isHidden());self.assertGreaterEqual(ex.oracle_schema.findData('BIG'),0)
+            self.window.resize(800,520);app.processEvents();point=ex.oracle_read_button.mapTo(self.window,QC.QPoint(0,0))
+            self.assertTrue(self.window.rect().contains(QC.QRect(point,ex.oracle_read_button.size())))
+            ex.oracle_schema.setCurrentIndex(ex.oracle_schema.findData('SMALL'));QTest.mouseClick(ex.oracle_read_button,Qt.MouseButton.LeftButton)
+            self.assertEqual(requests[-1]['args'],{'schema':'SMALL'});requests[-1]['done'](self.oracle_scope_catalog(source,'SMALL'))
+            self.assertIn('Schemat SMALL',ex.status.text());self.assertEqual(ex.object_title.text(),'Schemat SMALL');self.assertFalse(ex.tabs.isHidden());self.assertFalse(ex.oracle_scope_bar.isHidden())
+            self.assertEqual(self.service.document,before);self.assertEqual(self.service.trusted,trusted);self.assertFalse(self.service.hub.running())
+        def test_oracle_scope_failed_switch_retains_previous_catalog_label(self):
+            source,ex,requests=self.oracle_scope_fixture('SMALL');requests[-1]['done'](self.oracle_scope_catalog(source,'SMALL'))
+            ex.oracle_schema.setCurrentIndex(ex.oracle_schema.findData('BIG'));ex.read_oracle_schema()
+            requests[-1]['failed'](ui['QtFailure']('Schemat BIG przekracza limit.',catalog_scope=self.oracle_scope_info('BIG'),connected=True))
+            self.assertEqual(ex.catalog['oracle_scope']['schema'],'SMALL');self.assertEqual(ex.object_title.text(),'Schemat SMALL');self.assertFalse(ex.tabs.isHidden())
+            self.assertIn('poprzedni katalog: Schemat SMALL',ex.status.text());self.assertEqual(ex.oracle_schema.currentData(),'BIG');self.assertFalse(ex.warning.isHidden())
+            ex.reload(True);self.assertEqual(requests[-1]['args'],{'schema':'BIG'})
+        def test_oracle_scope_cache_and_refresh_use_effective_scope(self):
+            source,ex,requests=self.oracle_scope_fixture('SMALL');requests[-1]['done'](self.oracle_scope_catalog(source,'SMALL'))
+            ex.oracle_schema.setCurrentIndex(ex.oracle_schema.findData('OTHER'));ex.read_oracle_schema();requests[-1]['done'](self.oracle_scope_catalog(source,'OTHER'))
+            self.assertEqual(len(requests),2)
+            ex.oracle_schema.setCurrentIndex(ex.oracle_schema.findData('SMALL'));ex.read_oracle_schema()
+            self.assertEqual(len(requests),2);self.assertEqual(ex.catalog['oracle_scope']['schema'],'SMALL')
+            ex.reload(True);self.assertEqual(requests[-1]['args'],{'schema':'SMALL'});requests[-1]['done'](self.oracle_scope_catalog(source,'SMALL'))
+            ex.oracle_schema.setCurrentIndex(ex.oracle_schema.findData(''));ex.read_oracle_schema()
+            self.assertEqual(requests[-1]['args'],{'schema':''});requests[-1]['done'](self.oracle_scope_catalog(source,''))
+            self.assertEqual(ex.catalog_scope_label(),'Wszystkie dostępne schematy Oracle');self.assertEqual(self.service.source(source['id'])['options']['schema'],'SMALL')
+            ex.invalidate_source_catalog(source);self.assertFalse(ex._cache)
+        def test_oracle_scope_new_source_and_project_reset_override(self):
+            source,ex,requests=self.oracle_scope_fixture('SMALL');requests[-1]['done'](self.oracle_scope_catalog(source,'SMALL'))
+            ex.oracle_schema.setCurrentIndex(ex.oracle_schema.findData('BIG'));ex.read_oracle_schema();late=requests[-1]['failed']
+            other=clone(source);other['id']=uid();other['options']['schema']='NEW';other=self.service.call('source_save',{'source':other,'password':''})['source'];self.service.trusted.add(digest(other))
+            self.window.open_database(other);self.assertIsNone(ex._oracle_schema_override);self.assertEqual(requests[-1]['args'],{});self.assertEqual(ex.oracle_schema.currentData(),'NEW')
+            late(ui['QtFailure']('Stary limit.',catalog_scope=self.oracle_scope_info('BIG'),connected=True))
+            self.assertIsNone(ex._oracle_scope_info);self.assertEqual(ex.oracle_schema.currentData(),'NEW');self.assertEqual(ex.oracle_schema.findData('BIG'),-1)
+            self.service.call('project_new',{'discard':True});self.window.reset_project_views()
+            self.assertIsNone(ex._oracle_schema_override);self.assertIsNone(ex.source);self.assertTrue(ex.oracle_scope_bar.isHidden())
+        def test_oracle_scope_connected_error_without_owner_list_is_not_disconnect(self):
+            source,ex,requests=self.oracle_scope_fixture('SMALL');requests[-1]['failed'](ui['QtFailure']('Brak uprawnień do części metadanych.',connected=True))
+            self.assertIn('Połączenie działa',ex.status.text());self.assertFalse(ex.oracle_scope_bar.isHidden());self.assertTrue(ex.driver_card.isHidden());self.assertTrue(ex.tabs.isHidden())
+            ex.oracle_schema.setEditText('MixedOwner');ex.read_oracle_schema();self.assertEqual(requests[-1]['args'],{'schema':'MixedOwner'})
         def test_dependency_missing_card_precedes_authorization(self):
             from unittest import mock
             source=self.dependency_fixture();issue={'state':'missing','profile':'oracle','title':'Oracle','message':'Brak sterownika','details':'oracledb'}

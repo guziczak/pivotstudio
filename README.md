@@ -61,6 +61,8 @@ Przeciągnij plik SQLite na okno. Dostajesz **katalog tabel, widoków, kolumn, k
 
 Powiązane tabele są blisko siebie. Linie prowadzą między polami kluczy. Mapę możesz przesuwać i powiększać; ręczny układ pozostaje po powrocie z danych.
 
+W Oracle pole **Schemat** w połączeniu ogranicza odczyt struktury już po stronie bazy. Jeśli dostępny katalog przekracza 20 000 obiektów, wybierz właściciela obiektów w **Zakres Oracle** i kliknij **Odczytaj schemat**. Lista pokazuje liczbę obiektów w każdym schemacie. Ten wybór dotyczy bieżącego widoku; domyślny schemat możesz zapisać w połączeniu. Relacje do tabel poza zakresem zachowują opis celu, ale nie rozszerzają automatycznie katalogu. Limit dotyczy obiektów struktury, nie liczby rekordów tabel. Odczyt części pojedynczego schematu przekraczającego limit nie jest jeszcze dostępny.
+
 ![Mapa struktury bazy: zaznaczone events i operations, wyróżnione pola klucza i polecenie otwarcia połączonych danych.][relations]
 
 ### 02 · Zaznacz. Enter. Wspólne dane.
@@ -149,9 +151,11 @@ Roboczy skoroszyt ma limit **200 000 zapisanych komórek**, a pojedyncza operacj
 <details>
 <summary><b>Stan testów i pochodzenie materiałów</b></summary>
 
-Weryfikacja **0.7.4 na Windows, Python 3.12 i 3.14**: na każdej wersji uruchomiono **427 testów rdzenia — 425 przeszło, 2 pominięto z powodu braku uprawnienia do dowiązań**. Regresje obejmują zapis projektu, eksport CSV/XLSX, pivot z zakresu, dokładne porównania i stronicowanie `DECIMAL_TEXT`, szczegóły dat oraz formatowanie scaleń z cofaniem i eksportem. Zestaw przygotowania obejmuje **70 sprawdzonych testów** (pełny przebieg 69 oraz dodatkowa regresja i ponowny przebieg logiki instalatora po poprawce). Rzeczywista instalacja z publicznego PyPI w osobnym katalogu przygotowała wszystkie pięć profili, przeszła `pip check` i importy. Sprawdzono także rzeczywisty restart Qt z kopią niezapisanej pracy i potwierdzeniem startu nowego okna.
+Weryfikacja **0.7.4 na Windows, Python 3.12 i 3.14**: na każdej wersji uruchomiono **444 testy rdzenia — 442 przeszły, 2 pominięto z powodu braku uprawnienia do dowiązań**. Regresje obejmują zapis projektu, eksport CSV/XLSX, pivot z zakresu, dokładne porównania i stronicowanie `DECIMAL_TEXT`, szczegóły dat oraz formatowanie scaleń z cofaniem i eksportem. Dodano testy zakresu katalogu Oracle, relacji między schematami i przesyłania błędów odczytu do interfejsu; zapytania wykonano na lokalnym słowniku testowym, bez serwera Oracle. Zestaw przygotowania obejmuje **70 sprawdzonych testów** (pełny przebieg 69 oraz dodatkowa regresja i ponowny przebieg logiki instalatora po poprawce). Rzeczywista instalacja z publicznego PyPI w osobnym katalogu przygotowała wszystkie pięć profili, przeszła `pip check` i importy. Sprawdzono także rzeczywisty restart Qt z kopią niezapisanej pracy i potwierdzeniem startu nowego okna.
 
 Pełny przebieg Qt w trybie `offscreen` liczył 137 testów: pozostało 5 wcześniejszych niepowodzeń dotyczących klawiatury/IME, układu nagłówka i limitu czasu wykazu technologii. Dwa dodatkowe błędy fixture drag/drop poprawiono i sprawdzono osobno. Nowe testy przygotowania, restartu i logo przechodzą. Wynik nie potwierdza wszystkich interakcji w zwykłym oknie Windows. Połączenie z firmowym Artifactory i rzeczywistymi instancjami H2, Firebird oraz Oracle wymaga dostępu do tych systemów.
+
+Zmianę zakresu Oracle sprawdzono dodatkowo w 29 testach Qt: 25 testów wyboru schematu i dotychczasowej obsługi baz oraz 4 nowe regresje mapy i otwierania obiektów między schematami. Wszystkie przeszły. Zrzuty 800×600 i 900×650 potwierdziły dostępność wyboru schematu po błędzie limitu.
 
 Instalator sprawdza hashe pobranych plików i ponownie używa wyłącznie zweryfikowanych plików z tego samego źródła. Nie zawiera jeszcze kompletnego, wcześniej zatwierdzonego manifestu hashy wydawców dla wszystkich platform.
 
