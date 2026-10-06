@@ -33,7 +33,7 @@ py PivotStudio.py
 
 **Potrzebujesz Pythona 3.10–3.14, 64-bit, z Tcl/Tk.** Pierwszy start otwiera wybór **publicznego PyPI** albo **własnego Artifactory**, a następnie przygotowuje prywatne środowisko bibliotek. Domyślnie zaznaczone jest także przygotowanie pakietów sterowników baz danych; wybór można zmienić przed pobraniem. Nie musisz ręcznie wykonywać poleceń `pip`.
 
-Od razu możesz upuścić XLSX lub SQLite na okno. Bez własnych danych: **menu → Pomoc → Otwórz przykład**.
+Od razu możesz upuścić XLSX, XLSM lub SQLite na okno. XLSM otwiera dane bez uruchamiania makr. Bez własnych danych: **menu → Pomoc → Otwórz przykład**.
 
 <details>
 <summary><b>Wymagania, inne systemy i opcjonalne sterowniki</b></summary>
@@ -59,7 +59,7 @@ Biblioteki i interpreter są osobnymi składnikami. Jeden plik `.py` oznacza pro
 
 Przeciągnij plik SQLite na okno. Dostajesz **katalog tabel, widoków, kolumn, kluczy i indeksów** — bez obowiązkowego tworzenia analizy. Przełącz się na **Relacje**, żeby zobaczyć, co z czym się łączy.
 
-Powiązane tabele są blisko siebie. Linie prowadzą między polami kluczy. Węższe kafelki i mniejsze napisy pozwalają zmieścić około czterech tabel w rzędzie przy typowej szerokości okna. Mapę możesz przesuwać i powiększać; ręczny układ pozostaje po powrocie z danych oraz podczas doczytywania kolumn.
+Powiązane tabele są blisko siebie. Linie prowadzą między polami kluczy. **Widok → Uporządkuj według relacji** wykorzystuje aktualną szerokość kanwy: liczba kart w rzędzie zależy od miejsca, bez stałego ograniczenia do czterech. Polecenie przelicza układ, wraca do jego początku i przywraca czytelne powiększenie 100%. Mapę możesz przesuwać i powiększać; ręczny układ pozostaje po powrocie z danych oraz podczas doczytywania kolumn, do następnego jawnego uporządkowania.
 
 Duży katalog Oracle jest wyświetlany **stronami po 1000 obiektów**. Możesz przeglądać wszystkie dostępne schematy albo jeden duży schemat; liczba ponad 20 000 obiektów nie blokuje otwarcia listy. Pivot zapisuje listę obiektów i odczytane szczegóły w lokalnym **cache SQLite**, zachowanym po zamknięciu aplikacji. Po ukończeniu synchronizacji wyszukiwanie nazw i przechodzenie między stronami korzystają z zapisanej listy. Przy braku kompletnego cache dostępny pozostaje odczyt stron z Oracle.
 
@@ -70,6 +70,8 @@ Kolumny i połączenia pojawiają się na mapie w trakcie pobierania, bez reseto
 Pole **Schemat** w połączeniu ustala domyślny zakres. Możesz go tymczasowo zmienić w **Zakres Oracle → Odczytaj schemat**, bez zmiany poświadczeń; nazwę schematu można także wpisać ręcznie. Obiekty systemowe można włączyć polem **Systemowe**. Odświeżenie przygotowuje nową listę w tle; anulowanie lub błąd zachowuje poprzednią kompletną wersję. Cache jest oddzielony według połączenia, konta i zakresu, znajduje się poza projektem i można go wyczyścić z menu **Baza**. Na Windows jest to plik `%LOCALAPPDATA%\PivotStudio\cache\metadata-v1.sqlite` (przy własnym `--data-dir` — podkatalog `cache` wybranego katalogu). Zapis zawiera nazwy i odczytane definicje, bez haseł. Mapa pokazuje rozpoznane dotąd relacje, a eksport JSON obejmuje bieżącą stronę i doczytane szczegóły. Ograniczenia pamięci i rozmiaru pojedynczej odpowiedzi pozostają aktywne.
 
 ![Mapa struktury bazy: zaznaczone events i operations, wyróżnione pola klucza i polecenie otwarcia połączonych danych.][relations]
+
+W zakładce **Dane** dwuklik komórki doczytuje jej odroczoną zawartość LOB/BLOB lub długi tekst. Okno pokazuje tekst, JSON albo podgląd szesnastkowy danych binarnych. Rozmiar i ewentualne skrócenie są jawne; **Zapisz całość…** pobiera pełną wartość do pliku strumieniowo. Odczyt wskazuje konkretny rekord przez klucz lub obsługiwany identyfikator wiersza, także w wyniku JOIN. Widok bez jednoznacznego identyfikatora otrzymuje komunikat zamiast próby ponownego odczytu według numeru pozycji. Wartość jest odczytywana na bieżąco, więc może różnić się od wcześniejszego podglądu strony.
 
 ### 02 · Zaznacz. Enter. Wspólne dane.
 
@@ -102,7 +104,15 @@ Zaznaczenie w arkuszu może stać się źródłem pivota lub wykresu. Połączen
 
 **A, B, C… u góry. 1, 2, 3… z lewej.** Aktywna komórka, pasek formuły, zakresy, zakładki i zoom. Do tego edycja, kopiowanie i wklejanie, cofanie, podstawowe formatowanie i lokalny silnik formuł.
 
-XLSX otwierasz jako skoroszyt z nazwanymi arkuszami. Przełączasz zakładki bez ponownego importowania pliku. Narzędzia **Format**, **Dane** i **Pivot** są pod ręką, ale nie zajmują czterech rzędów ekranu.
+XLSX i XLSM otwierasz jako skoroszyt z nazwanymi arkuszami. Przełączasz zakładki bez ponownego importowania pliku. Narzędzia **Format**, **Dane** i **Pivot** są pod ręką, ale nie zajmują czterech rzędów ekranu.
+
+**Otwarcie XLSM w arkuszu Pivot odczytuje dane bez wykonywania VBA.** Import korzysta z zapisanych wyników formuł. Oryginał pozostaje bez zmian; eksport edytowanego skoroszytu do XLSX wymaga akceptacji utraty nieobsługiwanych elementów, w tym makr. Lokalny silnik arkusza nie zapisuje zmodyfikowanych skoroszytów jako działających aplikacji XLSM.
+
+**Narzędzia → Excel: makra i PDF** to osobna, jawnie uruchamiana sesja wymagająca Microsoft Excel na Windows. Otwiera kopię XLSX/XLSM w widocznym Excelu. Możesz używać istniejących przycisków skoroszytu albo podać nazwę makra. Opcja uruchomienia makr otwarcia pozwala wykonać inicjalizację skoroszytu. Pivot nie potrzebuje kodu VBA i nie zmienia ustawień Centrum zaufania; zachowuje też oznaczenie pochodzenia kopiowanego pliku.
+
+Standardowe okna komunikatów należące do tej sesji pojawiają się w ramce Pivot wraz z rzeczywistymi odpowiedziami. **„Pomiń → Nie”** przy pytaniu „Czy przerwać sprawdzanie?” wysyła właśnie odpowiedź „Nie”. To nie zmienia warunków w kodzie VBA i nie gwarantuje, że skrypt mimo błędu wygeneruje raport. Niestandardowe formularze obsługujesz w widocznym Excelu. Odpowiedź jest przekazywana wyłącznie po kliknięciu, po ponownym sprawdzeniu aktualnego okna i procesu.
+
+**PDF bieżącego arkusza** korzysta z drukowania Excela, niezależnie od przycisku generatora w skoroszycie. Zapisuje aktualną zawartość i obszar wydruku — nie potwierdza wykonania obliczeń generatora. **Zapisz kopię skoroszytu** zachowuje plik w jego dotychczasowym formacie, w tym VBA w XLSM. Te operacje potwierdzają sukces dopiero po sprawdzeniu pliku wynikowego. Przed zamknięciem sesji zapisz potrzebne zmiany; robocza kopia sesji jest tymczasowa.
 
 ![Lokalny arkusz Pivot Studio: kompaktowy nagłówek, pasek formuły, oznaczenia komórek i zakładki na dole.][sheet]
 
@@ -142,7 +152,7 @@ Po doinstalowaniu wybierasz **Zapisz i uruchom ponownie** albo **Później**. Pi
 
 **Arkusz edytujesz. Bazę przeglądasz.** Połączenia bazodanowe i ich wyniki pozostają tylko do odczytu. Polecenie **„Kopia strony → arkusz”** tworzy edytowalną kopię bieżącej strony. Eksport XLSX zapisuje nową kopię skoroszytu, nie nadpisuje otwartego oryginału.
 
-**Zapisujesz pracę, nie tylko obraz tabeli.** Projekt `.pivot` zachowuje arkusze, analizy i nazwane plany połączeń. Przygotowane dane można dołączyć do projektu; oryginalny XLSX jest osobną decyzją. Nie jest to automatyczna kopia całego serwera bazodanowego.
+**Zapisujesz pracę, nie tylko obraz tabeli.** Projekt `.pivot` zachowuje arkusze, analizy i nazwane plany połączeń. Przygotowane dane można dołączyć do projektu; oryginalny XLSX/XLSM jest osobną decyzją. Nie jest to automatyczna kopia całego serwera bazodanowego.
 
 **Wiesz, czego używasz.** W **Pomoc → Technologie i licencje** sprawdzisz lokalne wersje składników, deklaracje i warunki, źródła oraz dostępne teksty licencji. Zestawienie można skopiować lub wyeksportować; nieznane wersje wymagają weryfikacji, nie dostają automatycznie zielonego „tak”.
 
@@ -150,20 +160,26 @@ Aplikacja nie ma wbudowanej telemetrii ani WebEngine. Sieć jest potrzebna przy 
 
 ## Status i ograniczenia
 
-**0.7.4 · aktywnie rozwijane wydanie.** Nowe przygotowanie sterowników, kontrolowany restart oraz aktualny złoty znak Przesmyk w **Pomoc → O autorze**. Poprawiono zapis projektu, eksport i tworzenie pivota z zakresu na Windows, a także filtrowanie i sortowanie `DECIMAL_TEXT`, szczegóły pivota dla dat SQLite oraz formatowanie zakresów ze scaleniami. Pivot Studio nie jest pełnym zamiennikiem Excela. Obsługa formuł i formatowania ma określony zakres; makra i część obiektów XLSX nie są obsługiwane. Przy ważnych plikach zachowaj oryginał i sprawdź eksportowaną kopię.
+**0.7.4 · aktywnie rozwijane wydanie.** Nowe przygotowanie sterowników, kontrolowany restart oraz aktualny złoty znak Przesmyk w **Pomoc → O autorze**. Poprawiono zapis projektu, eksport i tworzenie pivota z zakresu na Windows, a także filtrowanie i sortowanie `DECIMAL_TEXT`, szczegóły pivota dla dat SQLite oraz formatowanie zakresów ze scaleniami. Pivot Studio nie jest pełnym zamiennikiem Excela. Obsługa formuł i formatowania ma określony zakres; lokalny arkusz odczytuje dane XLSM, a wykonanie VBA wymaga osobnej sesji z zainstalowanym Excelem. Część obiektów skoroszytów nie jest obsługiwana przez lokalny edytor. Przy ważnych plikach zachowaj oryginał i sprawdź eksportowaną kopię.
 
 Roboczy skoroszyt ma limit **200 000 zapisanych komórek**, a pojedyncza operacja — **100 000**. Plan JOIN obejmuje **2–8 różnych tabel z jednego źródła**. Płaskie połączenie nie jest wielotabelowym modelem miar Excela. Widoczność katalogu bazy zależy od uprawnień konta.
 
 <details>
 <summary><b>Stan testów i pochodzenie materiałów</b></summary>
 
-Weryfikacja **0.7.4 na Windows, Python 3.12 i 3.14**: na każdej wersji ostatni pełny przebieg obejmował **524 testy rdzenia — 522 przeszły, 2 pominięto z powodu braku uprawnienia do dowiązań**. Regresje obejmują zapis i eksport, pivot z zakresu, liczby, daty, scalenia oraz katalog **49 295 obiektów**. Sprawdzono strumieniowy zapis katalogu przez protokół workera, ponowne otwarcie SQLite, ostatnią stronę, lokalne wyszukiwanie, szczegóły oraz JOIN. Zestawy cache obejmują 21 testów magazynu, 20 testów serwisu, 12 testów pobierania struktury i 11 testów mapy: anulowanie, wznowienie po restarcie, pierwszeństwo zadań użytkownika, ponowne użycie połączenia z nową transakcją dla każdej partii, zmiany bazy i generacji, limity pamięci i dysku, błędy częściowe, relacje spoza strony oraz odbudowę uszkodzonego cache. Zapytania Oracle wykonano na lokalnym słowniku testowym, bez serwera Oracle.
+Weryfikacja **0.7.4 na Windows, Python 3.12 i 3.14**: na każdej wersji ostatni pełny przebieg obejmował **584 testy rdzenia — 582 przeszły, 2 pominięto z powodu braku uprawnienia do dowiązań**. Regresje obejmują zapis i eksport, pivot z zakresu, liczby, daty, scalenia oraz katalog **49 295 obiektów**. Sprawdzono strumieniowy zapis katalogu przez protokół workera, ponowne otwarcie SQLite, ostatnią stronę, lokalne wyszukiwanie, szczegóły oraz JOIN. Zestawy cache obejmują 21 testów magazynu, 20 testów serwisu, 12 testów pobierania struktury i 11 testów mapy: anulowanie, wznowienie po restarcie, pierwszeństwo zadań użytkownika, ponowne użycie połączenia z nową transakcją dla każdej partii, zmiany bazy i generacji, limity pamięci i dysku, błędy częściowe, relacje spoza strony oraz odbudowę uszkodzonego cache. Zapytania Oracle wykonano na lokalnym słowniku testowym, bez serwera Oracle.
+
+Nowe sprawdzenia obejmują 23 testy odczytu i eksportu pojedynczej komórki, 3 testy ich obsługi przez serwis, 6 testów danych XLSM oraz 2 testy układu mapy. Zweryfikowano tożsamość wiersza i kolumny, klucze złożone oraz binarne, anulowanie eksportu bez utraty poprzedniego pliku, ograniczenie podglądu, dokładne liczby JSON i dekodowanie Unicode na granicach porcji. Testy SQLite używają rzeczywistej bazy; zachowanie LOB-ów Oracle, Firebird i H2 sprawdzono na kontrolowanych odpowiednikach sterowników. Kontener XLSM zachowuje oryginalne bajty, a samo otwarcie danych nie wykonuje VBA.
+
+Obsługę zewnętrznego Excela obejmuje **15 testów kontrolera sesji i 11 testów komunikatów Win32**: osobny proces, odrzucenie nieaktualnej odpowiedzi, zachowanie oznaczenia pochodzenia pliku, kopiowanie pliku tylko do odczytu, odrzucenie uszkodzonego wyniku, anulowanie podczas zapisu i sprzątanie sesji. Standardowe okna Windows sprawdzono w rzeczywistym osobnym procesie, a skrypt pomocniczy — parserem Windows PowerShell. Przebieg operacji Excela testowano przez kontrolowany proces zastępczy. Na stanowisku testowym **nie ma zarejestrowanego Excel COM**; wykonania VBA ani eksportu przez prawdziwego Excela nie potwierdzono. Sprawdzono rzeczywisty start pomocnika i kontrolowane zakończenie przy braku COM.
 
 Zestaw przygotowania obejmuje **70 wcześniej sprawdzonych testów** (pełny przebieg 69 oraz dodatkowa regresja i ponowny przebieg logiki instalatora po poprawce). Rzeczywista instalacja z publicznego PyPI w osobnym katalogu przygotowała wszystkie pięć profili, przeszła `pip check` i importy. Sprawdzono także rzeczywisty restart Qt z kopią niezapisanej pracy i potwierdzeniem startu nowego okna.
 
 Pełny przebieg Qt w trybie `offscreen` liczył 137 testów: pozostało 5 wcześniejszych niepowodzeń dotyczących klawiatury/IME, układu nagłówka i limitu czasu wykazu technologii. Dwa dodatkowe błędy fixture drag/drop poprawiono i sprawdzono osobno. Nowe testy przygotowania, restartu i logo przechodzą. Wynik nie potwierdza wszystkich interakcji w zwykłym oknie Windows. Połączenie z firmowym Artifactory i rzeczywistymi instancjami H2, Firebird oraz Oracle wymaga dostępu do tych systemów.
 
-Katalog Oracle, trwały cache i powiązane funkcje sprawdzono w **70 testach Qt — wszystkie przeszły**. Zestaw obejmuje 13 testów stopniowego odczytu i gęstszej mapy, 13 wcześniejszych testów cache, 22 testy stronicowania i zakresu oraz 22 testy przygotowania sterowników, przeglądarki baz i relacji. Sprawdzono autoryzację odczytu w tle, pauzę, nieaktualne odpowiedzi, zachowanie kolumn sąsiada po odczycie szczegółów, błędy częściowe i zmianę generacji. Cztery długie kafelki mieszczą się przy szerokości okna 1100 px; wzrost kart po pobraniu kolumn nie powoduje kolizji z automatycznie rozmieszczonymi sąsiadami i zachowuje ręczne pozycje, zaznaczenie oraz powiększenie. Rzeczywisty widok Qt odczytał 49 295 nazw z pliku SQLite bez połączenia z Oracle. Interfejs nie modyfikuje odpowiedzi równolegle zapisywanej do cache. Scenariusze interfejsu Oracle korzystają z danych testowych.
+Katalog Oracle, trwały cache i powiązane funkcje sprawdzono w **84 testach Qt — wszystkie przeszły**. Oprócz wcześniejszych 70 scenariuszy zestaw obejmuje 11 testów okna pełnej komórki, 2 testy otwierania XLSM i test rozmieszczania tabel po zmianie szerokości okna. Dwa testy przechodzą cały przepływ SQLite → worker → okno komórki → eksport pełnej wartości. Sprawdzono autoryzację odczytu w tle, pauzę, nieaktualne odpowiedzi, zachowanie kolumn sąsiada po odczycie szczegółów, błędy częściowe i zmianę generacji. „Uporządkuj” zmienia liczbę kart w rzędzie wraz z dostępną szerokością; wzrost kart po pobraniu kolumn nie powoduje kolizji z automatycznie rozmieszczonymi sąsiadami i zachowuje ręczne pozycje, zaznaczenie oraz powiększenie. Rzeczywisty widok Qt odczytał 49 295 nazw z pliku SQLite bez połączenia z Oracle. Interfejs nie modyfikuje odpowiedzi równolegle zapisywanej do cache. Scenariusze interfejsu Oracle korzystają z danych testowych.
+
+Dodatkowe **11 testów Qt sesji Excel przeszło**: jawne otwarcie i inicjalizacja, makro/PDF/kopia w tle, brak Excela, dokładne przekazanie „Nie”, odrzucenie zmienionego okna, ręczne ponowienie odpowiedzi, responsywność oraz zapis przed zamknięciem. Końcowa regresja sprawdziła łącznie **95 unikalnych scenariuszy Qt** w dwóch zestawach. Kontroler Excel jest w tych testach zastępowany kontrolowanym odpowiednikiem.
 
 Instalator sprawdza hashe pobranych plików i ponownie używa wyłącznie zweryfikowanych plików z tego samego źródła. Nie zawiera jeszcze kompletnego, wcześniej zatwierdzonego manifestu hashy wydawców dla wszystkich platform.
 

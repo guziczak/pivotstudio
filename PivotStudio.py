@@ -7,7 +7,7 @@ Tkinter: wybór PyPI / własnego Artifactory przed pobraniem bibliotek.
 Główne okno: wyłącznie PySide6. Jeden kompaktowy nagłówek, pasek formuły,
 siatka A–XFD / 1–1048576 (wirtualna), zakładki i zoom na dole.
 Arkusze robocze są edytowalne. Bazy i migawki analiz pozostają tylko do odczytu.
-Odczyt XLSX zachowuje fizyczne pozycje komórek, arkusze, zwykłe formuły i
+Odczyt XLSX/XLSM zachowuje fizyczne pozycje komórek, arkusze, zwykłe formuły i
 podstawowe formatowanie. Nie jest pełnym silnikiem Excela: makra, wykresy
 źródłowe i inne nieobsługiwane elementy są zgłaszane przed nowym eksportem.
 Formuły są interpretowane bez eval; zakres funkcji jest jawny w instrukcji.
@@ -35,6 +35,8 @@ Aktualny złoty znak Przesmyk z /zloto/; poprawki zapisu i eksportu na Windows.
 Dokładne filtry DECIMAL_TEXT, szczegóły dat SQLite i formatowanie scaleń.
 Oracle: stronicowany katalog, wyszukiwanie nazw w bazie i szczegóły obiektów na żądanie.
 Trwały cache metadanych Oracle w SQLite, odświeżanie generacji i przeglądanie offline.
+Dwuklik pobiera pełną komórkę/LOB; układ mapy dopasowuje się do szerokości widoku.
+Osobna sesja Microsoft Excel: makra, rzeczywiste komunikaty, kopia skoroszytu i PDF.
 """
 from __future__ import annotations
 
@@ -293,12 +295,19 @@ def display_cell(cell, fmt='auto') -> str:
 
 # ======================== 1. MODEL I WALIDACJA ===============================
 SOURCE_KEYS = {
-    'xlsx': {'path', 'origin', 'owned'},
+    'xlsx': {'path', 'origin', 'owned', 'file_format'},
     'sqlite': {'path', 'owned'},
     'h2': {'mode', 'path', 'host', 'port', 'database', 'user'},
     'firebird': {'host', 'port', 'database', 'user', 'charset', 'role'},
     'oracle': {'host', 'port', 'service', 'sid', 'user', 'mode', 'schema'},
 }
+WORKBOOK_SUFFIXES = frozenset(('.xlsx', '.xlsm'))
+XLSM_DATA_NOTICE = 'XLSM: makra VBA i przyciski makr nie są uruchamiane. Odczytujemy zapisane dane; kopia XLSX nie zachowa makr.'
+
+
+def workbook_file_format(source):
+    options=source['options']
+    return options.get('file_format') or ('xlsm' if any(Path(options.get(k,'')).suffix.lower()=='.xlsm' for k in ('path','origin')) else 'xlsx')
 
 
 def validate_source(value: dict) -> dict:
@@ -324,6 +333,8 @@ def validate_source(value: dict) -> dict:
         raise UserError('Nieprawidłowy tryb H2.')
     if kind == 'oracle' and options.get('mode', 'thin') not in ('thin', 'thick'):
         raise UserError('Nieprawidłowy tryb Oracle.')
+    if kind == 'xlsx' and 'file_format' in options and options['file_format'] not in ('xlsx','xlsm'):
+        raise UserError('Nieprawidłowy format oryginału skoroszytu.')
     result = {'id': clean_text(value.get('id') or uid(), 64), 'kind': kind,
               'name': clean_text(value.get('name') or KIND_NAMES[kind], 100), 'options': options}
     if kind == 'xlsx': result['workbook'] = validate_workbook(value.get('workbook'))
@@ -645,6 +656,7 @@ class SQLiteAdapter(Adapter):
         self.conn = sqlite3.connect(path.as_uri()+'?mode=ro', uri=True, timeout=5)
         self.conn.execute('PRAGMA query_only=ON'); self.conn.execute('PRAGMA trusted_schema=OFF')
         self.conn.execute('PRAGMA busy_timeout=5000')
+        self.text_encoding=self.conn.execute('PRAGMA encoding').fetchone()[0]
         install_decimal_functions(self.conn)
         self.conn.set_progress_handler(lambda:1 if self.cancelled.is_set() else 0,2000)
         self.conn.execute('BEGIN')
@@ -1001,7 +1013,19 @@ class JDBCCursor:
                     value=self.result.getDouble(i); value=None if self.result.wasNull() else float(value)
                 elif t in (-7,16):
                     value=self.result.getBoolean(i); value=None if self.result.wasNull() else bool(value)
-                elif t in (-2,-3,-4,2004): value='[dane binarne — niepobierane]'
+                elif t in (-2,-3,-4,2004):
+                    if i-1 in getattr(self,'identity_binary_columns',set()):
+                        raw=self.result.getBytes(i);value=None if raw is None else bytes(raw)
+                    else:
+                        stream=self.result.getBinaryStream(i);value=None if stream is None else '[dane binarne — niepobierane]'
+                        if stream is not None:stream.close()
+                elif t in (1,12,-1,-9,-15,2005,2011,1111) and getattr(self,'cell_preview',False):
+                    lob=self.result.getClob(i)
+                    try:
+                        try:value=None if lob is None else str(lob.getSubString(1,MAX_CELL_TEXT+1))
+                        except UnicodeDecodeError:value=str(lob.getSubString(1,MAX_CELL_TEXT+2))
+                    finally:
+                        if lob is not None:lob.free()
                 else:
                     value=self.result.getString(i); value=None if value is None else str(value)
                 row.append(value)
@@ -1051,6 +1075,7 @@ class H2Adapter(Adapter):
                 elif isinstance(v,dt.datetime): stmt.setTimestamp(i,jp.JClass('java.sql.Timestamp').valueOf(v.isoformat(' ')))
                 elif isinstance(v,dt.date): stmt.setDate(i,jp.JClass('java.sql.Date').valueOf(v.isoformat()))
                 elif isinstance(v,float): stmt.setDouble(i,v)
+                elif isinstance(v,(bytes,bytearray,memoryview)):stmt.setBytes(i,jp.JArray(jp.JByte)(bytes(v)))
                 else: stmt.setString(i,str(v))
             cur=JDBCCursor(stmt,stmt.executeQuery()); self.active_cursor=cur; return cur
         except Exception:
@@ -1483,7 +1508,7 @@ def project_resource_slots(project, include_originals=True):
         if source['kind']=='sqlite' and source['options'].get('owned'):
             yield source['options'],'path',source['id'],'.sqlite'
         elif source['kind']=='xlsx':
-            if include_originals:yield source['options'],'path','book-'+source['id'],'.xlsx'
+            if include_originals:yield source['options'],'path','book-'+source['id'],'.'+workbook_file_format(source)
             for dataset in source['workbook']['datasets']:
                 for version in dataset['versions']:
                     yield version,'path','data-'+version['id'],'.sqlite'
@@ -1551,7 +1576,7 @@ class ProjectStore:
                 for record,key,rid,suffix in project_resource_slots(project,include_originals):
                     value=record.get(key,'')
                     if not value or value.startswith('@not-included'):
-                        if suffix=='.xlsx' and include_originals:
+                        if suffix in WORKBOOK_SUFFIXES and include_originals:
                             raise UserError('Brak kopii XLSX. Połącz oryginał albo zapisz wyłącznie gotowe dane.')
                         continue
                     sp=Path(value).resolve()
@@ -1560,12 +1585,12 @@ class ProjectStore:
                     if not sp.is_file():raise UserError('Brak danych do dołączenia: '+sp.name)
                     if record.get('sha256') and file_digest(sp)!=record['sha256']:
                         raise UserError('Migawka została zmieniona poza programem. Nie dołączono jej do projektu.')
-                    if suffix=='.xlsx':
+                    if suffix in WORKBOOK_SUFFIXES:
                         owner=next(x for x in project['sources'] if x['kind']=='xlsx' and x['options'] is record)
                         if file_digest(sp)!=owner['workbook']['revision']:raise UserError('Kopia XLSX została zmieniona. Nie zapisano innej wersji jako oryginału.')
                     size+=sp.stat().st_size
                     if size>MAX_PROJECT-4*1024*1024:raise UserError('Dołączone dane przekraczają limit projektu 128 MB.')
-                    if suffix=='.xlsx':
+                    if suffix in WORKBOOK_SUFFIXES:
                         blob=sp.read_bytes()
                         if hashlib.sha256(blob).hexdigest()!=owner['workbook']['revision']:raise UserError('Kopia XLSX zmieniła się podczas zapisu projektu.')
                     else:
@@ -1604,11 +1629,11 @@ class ProjectStore:
 
 # One policy for the file picker and operating-system drag & drop. No disk I/O
 # in the hover path: inaccessible drives are checked later by a worker.
-TABULAR_SUFFIXES = frozenset(('.csv', '.tsv', '.txt', '.xlsx'))
+TABULAR_SUFFIXES = frozenset(('.csv', '.tsv', '.txt')) | WORKBOOK_SUFFIXES
 SQLITE_SUFFIXES = frozenset(('.sqlite', '.sqlite3', '.db', '.db3', '.s3db'))
 MAX_INCOMING_FILES = 16
-FILE_PICKER_FILTER = ('Dane i projekty (*.csv *.tsv *.txt *.xlsx *.sqlite *.sqlite3 *.db *.db3 *.s3db *.pivot);;'
-                      'Excel (*.xlsx);;Tekst / CSV (*.csv *.tsv *.txt);;'
+FILE_PICKER_FILTER = ('Dane i projekty (*.csv *.tsv *.txt *.xlsx *.xlsm *.sqlite *.sqlite3 *.db *.db3 *.s3db *.pivot);;'
+                      'Excel (*.xlsx *.xlsm);;Tekst / CSV (*.csv *.tsv *.txt);;'
                       'SQLite (*.sqlite *.sqlite3 *.db *.db3 *.s3db);;Projekt Pivot Studio (*.pivot);;Wszystkie pliki (*)')
 
 
@@ -1621,7 +1646,7 @@ def incoming_file_plan(paths):
     if isinstance(paths, (str, os.PathLike)):
         paths = [os.fspath(paths)]
     if not isinstance(paths, (list, tuple)) or not paths:
-        raise UserError('Wybierz plik XLSX, CSV, SQLite lub projekt .pivot.')
+        raise UserError('Wybierz plik XLSX, XLSM, CSV, SQLite lub projekt .pivot.')
     if len(paths) > MAX_INCOMING_FILES:
         raise UserError(f'Wybierz najwyżej {MAX_INCOMING_FILES} plików naraz.')
     result, seen = [], set()
@@ -1646,10 +1671,10 @@ def incoming_file_plan(paths):
             kind = 'sqlite'
         elif suffix == '.pivot':
             kind = 'project'
-        elif suffix in ('.xls', '.xlsb', '.xlsm', '.ods'):
+        elif suffix in ('.xls', '.xlsb', '.ods'):
             raise UserError('Ten format arkusza nie jest obsługiwany. Zapisz dane jako XLSX lub CSV; makr nie uruchamiamy.')
         else:
-            raise UserError('Nieobsługiwany format: '+path.name+'. Obsługiwane: XLSX, CSV/TSV/TXT, SQLite i .pivot.')
+            raise UserError('Nieobsługiwany format: '+path.name+'. Obsługiwane: XLSX, XLSM, CSV/TSV/TXT, SQLite i .pivot.')
         result.append({'path':str(path), 'kind':kind, 'name':path.name})
     if any(x['kind']=='project' for x in result) and len(result)!=1:
         raise UserError('Otwórz jeden projekt .pivot oddzielnie. Potem dodaj do niego pliki danych.')
@@ -1738,11 +1763,13 @@ def inspect_local_file(path, cancelled=None):
         result.update(source=source,tables=tables)
     elif plan['kind']=='project':
         if head!=b'SQLite format 3\x00':raise UserError('To nie jest poprawny projekt .pivot.')
-    elif Path(path).suffix.lower()=='.xlsx':
+    elif Path(path).suffix.lower() in WORKBOOK_SUFFIXES:
         if head.startswith(bytes.fromhex('D0CF11E0A1B11AE1')):
             raise UserError('Plik ma format starszego lub zaszyfrowanego Excela. Zapisz niezabezpieczoną kopię XLSX albo CSV.')
         with checked_xlsx(state['path']) as archive:
             _,result['sheets']=xlsx_sheet_catalog(archive)
+        result['file_format']=Path(path).suffix.lower()[1:]
+        if result['file_format']=='xlsm':result['notice']=XLSM_DATA_NOTICE
         if local_file_state(state['path'])!=state:
             raise UserError('Plik zmienił się podczas odczytu listy arkuszy. Ponów odczyt.')
     check();return result
@@ -1841,9 +1868,9 @@ def xlsx_rows(path,sheet_name='',options=None,cancelled=None):
 def import_rows(path,options,cancelled=None):
     path=Path(path)
     if not path.is_file(): raise UserError('Nie znaleziono pliku importu.')
-    if path.suffix.lower()=='.xlsx':
+    if path.suffix.lower() in WORKBOOK_SUFFIXES:
         yield from xlsx_rows(path,options.get('sheet',''),options,cancelled); return
-    if path.suffix.lower() not in TABULAR_SUFFIXES:raise UserError('Nieobsługiwany format importu. Wybierz XLSX lub CSV.')
+    if path.suffix.lower() not in TABULAR_SUFFIXES:raise UserError('Nieobsługiwany format importu. Wybierz XLSX, XLSM lub CSV.')
     encoding=options.get('encoding','utf-8-sig')
     if encoding not in ('utf-8-sig','cp1250','utf-16'): raise UserError('Nieobsługiwane kodowanie.')
     delimiter=options.get('delimiter','auto')
@@ -1880,7 +1907,7 @@ def suggest_type(values,decimal_separator='.'):
 
 
 def import_preview(path,options):
-    if incoming_file_plan([path])[0]['kind']!='tabular':raise UserError('Podgląd importu wymaga XLSX lub CSV.')
+    if incoming_file_plan([path])[0]['kind']!='tabular':raise UserError('Podgląd importu wymaga XLSX, XLSM lub CSV.')
     state=local_file_state(path)
     iterator=import_rows(path,options)
     try:
@@ -1905,11 +1932,11 @@ def import_preview(path,options):
     if local_file_state(path)!=state:raise UserError('Plik zmienił się podczas podglądu. Odczytaj go ponownie.')
     return {'file_state':state,'columns':columns,'sample':[[pack(v) for v in row] for row in sample[:20]],
             'note':'Typy zaproponowano na próbce do 500 rekordów; cały import zostanie ściśle sprawdzony. '
-                   'Zera wiodące pozostają tekstem. Puste komórki → NULL. XLSX: tylko zapisane wyniki formuł, bez przeliczania.'}
+                   'Zera wiodące pozostają tekstem. Puste komórki → NULL. XLSX/XLSM: tylko zapisane wyniki formuł, bez przeliczania.'}
 
 
 def import_file(path,options,columns,target,cancelled=None,progress=lambda _:None,expected_state=None):
-    if incoming_file_plan([path])[0]['kind']!='tabular':raise UserError('Import wymaga XLSX lub CSV.')
+    if incoming_file_plan([path])[0]['kind']!='tabular':raise UserError('Import wymaga XLSX, XLSM lub CSV.')
     initial_state=local_file_state(path)
     if expected_state is not None and initial_state!=expected_state:
         raise UserError('Plik zmienił się od podglądu. Otwórz import ponownie; nie dodano częściowych danych.')
@@ -1981,11 +2008,12 @@ def workbook_check_cancel(cancelled):
 
 def workbook_stage(path, directory, cancelled=None, previous=None):
     """Worker-only stable copy; no publication until the user confirms the navigator."""
-    if Path(path).suffix.lower() != '.xlsx': raise UserError('Wybierz skoroszyt XLSX.')
+    suffix=Path(path).suffix.lower()
+    if suffix not in WORKBOOK_SUFFIXES: raise UserError('Wybierz skoroszyt XLSX lub XLSM (same dane, bez uruchamiania makr).')
     initial = local_file_state(path)
     if initial['size'] > 256*1024*1024: raise UserError('Skoroszyt przekracza limit 256 MB.')
     root = Path(directory); root.mkdir(parents=True, exist_ok=False)
-    target = root/'workbook.xlsx'; checksum=hashlib.sha256()
+    target = root/('workbook'+suffix); checksum=hashlib.sha256()
     try:
         with Path(path).open('rb') as src, target.open('xb') as dst:
             while chunk := src.read(1024*1024):
@@ -2012,7 +2040,8 @@ def workbook_stage(path, directory, cancelled=None, previous=None):
                     sheets.append(dict(sheet,missing=True))
                     datasets.append(clone(workbook_dataset(old,sheet_id=sheet['id'])))
         source=validate_source({'id':old['id'] if old else uid(),'name':old['name'] if old else Path(path).name,
-            'kind':'xlsx','options':{'path':str(target),'origin':str(Path(path).resolve()),'owned':True},
+            'kind':'xlsx','options':{'path':str(target),'origin':str(Path(path).resolve()),'owned':True,
+                                   **({'file_format':'xlsm'} if suffix=='.xlsm' else {})},
             'workbook':{'format':WORKBOOK_FORMAT,'revision':checksum.hexdigest(),'captured':utcnow(),
                         'sheets':sheets,'datasets':datasets}})
         workbook_check_cancel(cancelled)
@@ -3510,6 +3539,276 @@ def database_order_expression(adapter, column, expression):
     return expression+(' COLLATE PS_DECIMAL' if database_exact_decimal(adapter,column) else '')
 
 
+DATABASE_CELL_MAX_BYTES = 1024*1024
+DATABASE_CELL_CHUNK = 65536
+
+
+def database_row_identity(adapter,obj,cols,alias):
+    """Read real key metadata; UI-supplied sorting keys are not row identities."""
+    obj={'schema':obj.get('schema',''),'name':obj['name'],'kind':obj.get('kind','table')}
+    obj['id']=database_object_id(obj['schema'],obj['kind'],obj['name'])
+    names={c['name'] for c in cols};primary=[c['name'] for c in sorted(cols,key=lambda c:c['pk_position']) if c['pk_position']]
+    if adapter.kind=='oracle':
+        rows=adapter.fetch("SELECT k.COLUMN_NAME FROM ALL_CONSTRAINTS c JOIN ALL_CONS_COLUMNS k ON k.OWNER=c.OWNER AND k.CONSTRAINT_NAME=c.CONSTRAINT_NAME WHERE c.OWNER=:p1 AND c.TABLE_NAME=:p2 AND c.CONSTRAINT_TYPE='P' AND c.STATUS='ENABLED' ORDER BY k.POSITION",[obj['schema'],obj['name']],64)
+        primary=[str(r[0]) for r in rows]
+    elif adapter.kind=='h2':
+        rows=adapter.fetch("SELECT k.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS c JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k ON k.CONSTRAINT_SCHEMA=c.CONSTRAINT_SCHEMA AND k.CONSTRAINT_NAME=c.CONSTRAINT_NAME WHERE c.TABLE_SCHEMA=? AND c.TABLE_NAME=? AND c.CONSTRAINT_TYPE='PRIMARY KEY' ORDER BY k.ORDINAL_POSITION",[obj['schema'] or 'PUBLIC',obj['name']],64)
+        primary=[str(r[0]) for r in rows]
+    elif adapter.kind=='firebird':
+        rows=adapter.fetch("SELECT TRIM(s.RDB$FIELD_NAME) FROM RDB$RELATION_CONSTRAINTS c JOIN RDB$INDEX_SEGMENTS s ON s.RDB$INDEX_NAME=c.RDB$INDEX_NAME WHERE c.RDB$RELATION_NAME=? AND c.RDB$CONSTRAINT_TYPE='PRIMARY KEY' ORDER BY s.RDB$FIELD_POSITION",[obj['name']],64)
+        primary=[str(r[0]) for r in rows]
+    if primary and len(primary)<=64 and all(n in names for n in primary):
+        return {'object':obj,'kind':'pk','columns':primary,'expressions':[alias+'.'+qident(n) for n in primary]}
+    if adapter.kind=='oracle' and obj['kind']=='table':
+        return {'object':obj,'kind':'rowid','columns':[],'expressions':[alias+'.ROWID']}
+    # SQLite rowids without INTEGER PRIMARY KEY can change during VACUUM.
+    # Never promise a stable locator for such a table or a keyless view.
+    return None
+
+
+def database_identity_value(value):
+    if isinstance(value,(bytes,bytearray,memoryview)):
+        if len(value)>4096:raise UserError('Klucz rekordu jest zbyt duży.')
+        return {'type':'bytes','value':bytes(value).hex()}
+    if value is None:raise UserError('Pusty klucz nie identyfikuje rekordu.')
+    if isinstance(value,(dt.datetime,dt.date,dt.time)):return {'type':type(value).__name__,'value':value.isoformat()}
+    if not isinstance(value,(str,int,float,Decimal,bool)) or len(str(value))>4096:raise UserError('Nieobsługiwany klucz rekordu.')
+    return {'type':type(value).__name__,'value':str(value)}
+
+
+def database_identity_unpack(value,adapter):
+    if not isinstance(value,dict) or not isinstance(value.get('value'),str) or len(value['value'])>8192:raise UserError('Nieprawidłowy klucz rekordu.')
+    typ=value.get('type');raw=value['value']
+    try:
+        if typ=='bytes':return bytes.fromhex(raw)
+        if typ=='str':return raw
+        if typ=='int':return int(raw)
+        if typ in ('Decimal','float'):
+            result=Decimal(raw) if typ=='Decimal' else float(raw)
+            if not math.isfinite(result):raise ValueError()
+            return str(result) if adapter.kind=='sqlite' and typ=='Decimal' else result
+        if typ=='bool' and raw in ('True','False'):return raw=='True'
+        if typ in ('datetime','date','time'):
+            result=getattr(dt,typ).fromisoformat(raw)
+            return raw if adapter.kind=='sqlite' else result
+    except (ValueError,decimal.InvalidOperation):pass
+    raise UserError('Nieprawidłowy typ klucza rekordu.')
+
+
+def database_row_token(adapter,specs,values):
+    objects={};position=0
+    for spec in specs:
+        count=len(spec['expressions']);parts=values[position:position+count];position+=count
+        if len(parts)!=count or any(v is None for v in parts):continue  # Unmatched LEFT JOIN.
+        try:
+            locator={'kind':spec['kind'],'columns':spec['columns'],'values':[database_identity_value(v) for v in parts]}
+        except UserError:continue
+        objects[spec['object']['id']]={'object':spec['object'],'locator':locator}
+        if len(dumps(objects).encode('utf-8'))>16384:objects.pop(spec['object']['id'])
+    return {'version':1,'source_key':digest(adapter.source),'objects':objects}
+
+
+def database_identity_expressions(adapter,specs):
+    expressions=[expr for spec in specs for expr in spec['expressions']]
+    if adapter.kind=='sqlite':
+        expressions=[f'CASE WHEN length(CAST({expr} AS BLOB))<=4096 THEN {expr} ELSE NULL END' for expr in expressions]
+    elif adapter.kind=='h2':
+        expressions=[f'CASE WHEN OCTET_LENGTH(CAST({expr} AS CHARACTER VARYING))<=4096 THEN {expr} ELSE NULL END' for expr in expressions]
+    return expressions
+
+
+def database_preview_value(value,deferred=False):
+    if isinstance(value,(bytes,bytearray,memoryview)):cell=pack('[BLOB: '+str(len(value))+' bajtów]');deferred=True
+    elif hasattr(value,'read'):cell=pack('[LOB — treść dostępna po dwukliku]');deferred=True
+    elif isinstance(value,str) and len(value)>MAX_CELL_TEXT:cell=pack(value[:MAX_CELL_TEXT-40]+' … [tekst skrócony w podglądzie]');deferred=True
+    else:cell=pack(value)
+    if cell is not None and deferred:cell['deferred']=True
+    return cell
+
+
+def database_cell_query(adapter,args):
+    token=args.get('row_token');oid=args.get('object_id');column=args.get('column')
+    if not isinstance(token,dict) or token.get('version')!=1 or token.get('source_key')!=digest(adapter.source):raise UserError('Komórka należy do innego lub zmienionego źródła. Odśwież stronę.')
+    if not isinstance(token.get('objects'),dict) or len(token['objects'])>DATABASE_JOIN_MAX_TABLES:raise UserError('Nieprawidłowa tożsamość rekordu.')
+    entry=token['objects'].get(oid)
+    if not isinstance(entry,dict):raise UserError('Rekord nie ma potwierdzonego klucza. Nie można bezpiecznie odczytać tej komórki osobno.')
+    raw=entry.get('object');locator=entry.get('locator')
+    if not isinstance(raw,dict) or not isinstance(locator,dict):raise UserError('Nieprawidłowa tożsamość rekordu.')
+    obj={k:raw.get(k) for k in ('schema','name','kind')}
+    if obj['kind'] not in DATABASE_RELATIONS or any(not isinstance(v,str) or len(v)>512 or any(ord(c)<32 for c in v) for v in obj.values()) or not obj['name']:raise UserError('Nieprawidłowy obiekt komórki.')
+    obj['id']=database_object_id(obj['schema'],obj['kind'],obj['name'])
+    if oid!=obj['id'] or raw.get('id')!=oid:raise UserError('Nieprawidłowy identyfikator obiektu komórki.')
+    cols=database_relation_meta(adapter,obj);names={c['name']:c for c in cols}
+    if column not in names:raise UserError('Kolumna nie istnieje. Odśwież strukturę i stronę danych.')
+    spec=database_row_identity(adapter,obj,cols,'ps_cell')
+    if spec is None or locator.get('kind')!=spec['kind'] or locator.get('columns')!=spec['columns']:raise UserError('Klucz rekordu zmienił się. Odśwież stronę danych.')
+    values=locator.get('values')
+    if not isinstance(values,list) or len(values)!=len(spec['expressions']):raise UserError('Niepełny klucz rekordu.')
+    params=[database_identity_unpack(v,adapter) for v in values]
+    if any(v is None for v in params):raise UserError('Pusty klucz rekordu.')
+    where=' AND '.join(expr+' = '+adapter.bind(i+1) for i,expr in enumerate(spec['expressions']))
+    relation=adapter.relation({'schema':obj['schema'],'table':obj['name']})+' ps_cell'
+    return obj,names[column],'ps_cell.'+qident(column),' FROM '+relation+' WHERE '+where,params
+
+
+def database_jdbc_cell_chunks(adapter,lob,meta):
+    """One JDBC stream, including a decoder across UTF-16 surrogate boundaries."""
+    import codecs
+    jp=__import__('jpype');binary=meta['encoding']=='binary';width=1 if binary else 2
+    buffer=jp.JArray(jp.JByte if binary else jp.JChar)(DATABASE_CELL_CHUNK)
+    reader=lob.getBinaryStream() if binary else lob.getCharacterStream();consumed=0
+    decoder=None if binary else codecs.getincrementaldecoder('utf-16-le' if sys.byteorder=='little' else 'utf-16-be')('strict')
+    try:
+        while True:
+            adapter.check_cancel();count=int(reader.read(buffer,0,len(buffer)));adapter.check_cancel()
+            if count<0:break
+            if count==0:raise UserError('Odczyt LOB nie postępuje.')
+            consumed+=count;raw=memoryview(buffer).tobytes()[:count*width]
+            yield raw if binary else decoder.decode(raw,final=False).encode('utf-8')
+        if consumed<meta['size']:raise UserError('Nie ukończono odczytu LOB: strumień zakończył się przed końcem wartości.')
+        if decoder is not None:
+            tail=decoder.decode(b'',final=True)
+            if tail:yield tail.encode('utf-8')
+    finally:reader.close()
+
+
+@contextlib.contextmanager
+def database_cell_stream(adapter,args):
+    """A single verified row, streamed within one read transaction; never OFFSET."""
+    obj,column,expression,clause,params=database_cell_query(adapter,args)
+    meta={'object':obj,'column':column['name'],'encoding':'utf-8','size':None,'unit':'bytes','is_null':False}
+    if adapter.kind=='sqlite':
+        rows=adapter.fetch('SELECT typeof('+expression+'), length(CAST('+expression+' AS BLOB))'+clause+' LIMIT 2',params,2)
+        if len(rows)!=1:raise UserError('Rekord usunięto lub klucz nie jest jednoznaczny. Odśwież stronę.')
+        typ,size=rows[0];meta.update(size=int(size or 0),is_null=typ=='null',encoding='binary' if typ=='blob' else 'utf-8')
+        if typ not in ('text','blob','null'):
+            # SQLite CAST(REAL AS TEXT/BLOB) rounds to about 15 digits.
+            raw=adapter.fetch('SELECT '+expression+clause+' LIMIT 2',params,2)
+            if len(raw)!=1:raise UserError('Rekord nie jest jednoznaczny.')
+            data=str(raw[0][0]).encode('utf-8');meta['size']=len(data);yield meta,iter([data]);return
+        def chunks():
+            import codecs
+            decoder=codecs.getincrementaldecoder(getattr(adapter,'text_encoding','utf-8'))('strict') if typ!='blob' else None
+            position=1
+            while position<=meta['size']:
+                adapter.check_cancel()
+                part=adapter.fetch('SELECT substr(CAST('+expression+' AS BLOB),'+str(position)+','+str(DATABASE_CELL_CHUNK)+')'+clause+' LIMIT 2',params,2)
+                if len(part)!=1 or not isinstance(part[0][0],bytes) or not part[0][0]:raise UserError('Nie ukończono odczytu komórki.')
+                data=part[0][0];position+=len(data)
+                yield decoder.decode(data,final=False).encode('utf-8') if decoder is not None else data
+            if decoder is not None:
+                tail=decoder.decode(b'',final=True)
+                if tail:yield tail.encode('utf-8')
+        with contextlib.closing(chunks()) as stream:yield meta,stream
+        return
+    cur=adapter.execute(adapter.limited('SELECT '+expression+clause,2),params);lob=None;firebird_subtype=None
+    try:
+        if adapter.kind=='firebird':cur.stream_blob_threshold=0
+        if adapter.kind=='h2':
+            if not cur.result.next():raise UserError('Rekord już nie istnieje. Odśwież stronę.')
+            binary=cur.types[0] in (-2,-3,-4,2004)
+            lob=cur.result.getBlob(1) if binary else cur.result.getClob(1)
+            if cur.result.next():raise UserError('Klucz nie jest jednoznaczny. Odśwież stronę.')
+            value=lob;meta.update(encoding='binary' if binary else 'utf-8',unit='bytes' if binary else 'utf-16 units',size=int(lob.length()) if lob is not None else 0,is_null=lob is None)
+        else:
+            rows=cur.fetchmany(2)
+            if len(rows)!=1:raise UserError('Rekord usunięto lub klucz nie jest jednoznaczny. Odśwież stronę.')
+            value=rows[0][0];meta['is_null']=value is None
+            if hasattr(value,'read'):
+                lob=value;binary=(any(t in str(column['type']).upper() for t in ('BLOB','BFILE')) or str(column['type'])=='261')
+                if adapter.kind=='firebird':binary=not lob.is_text()
+                meta.update(encoding='binary' if binary else 'utf-8',unit='bytes' if binary or adapter.kind=='firebird' else 'utf-16 units',size=int(lob.size() if adapter.kind=='oracle' else lob.length))
+                if adapter.kind=='firebird' and not binary:
+                    # firebird-driver 2.0.3 decodes every read(size) separately.
+                    # Read raw bytes and retain decoder state across chunks.
+                    firebird_subtype=lob.sub_type;lob.sub_type=0
+        def chunks():
+            adapter.check_cancel()
+            if value is None:return
+            if adapter.kind=='h2':
+                yield from database_jdbc_cell_chunks(adapter,lob,meta);return
+            if lob is None:
+                if isinstance(value,(bytes,bytearray,memoryview)):data=bytes(value);meta['encoding']='binary'
+                elif isinstance(value,(dict,list)):data=json.dumps(value,ensure_ascii=False,default=str).encode('utf-8')
+                else:data=str(value).encode('utf-8')
+                meta.update(size=len(data),unit='bytes')
+                for offset in range(0,len(data),DATABASE_CELL_CHUNK):adapter.check_cancel();yield data[offset:offset+DATABASE_CELL_CHUNK]
+                return
+            position=1;decoder=None
+            if firebird_subtype is not None:
+                import codecs
+                decoder=codecs.getincrementaldecoder(lob._charset)('strict')
+            while True:
+                adapter.check_cancel()
+                if adapter.kind=='firebird':part=lob.read(DATABASE_CELL_CHUNK)
+                else:
+                    amount=min(DATABASE_CELL_CHUNK,max(0,meta['size']-position+1))
+                    if not amount:break
+                    def read(n):return lob.read(offset=position,amount=n)
+                    try:part=read(amount)
+                    except UnicodeDecodeError:part=read(amount+1)  # Do not split a UTF-16 surrogate pair.
+                    if isinstance(part,str) and part and 0xD800<=ord(part[-1])<=0xDBFF:part=read(amount+1)
+                adapter.check_cancel()
+                if not part:
+                    if position<=meta['size']:raise UserError('Nie ukończono odczytu LOB: strumień zakończył się przed końcem wartości.')
+                    break
+                if decoder is not None:
+                    position+=len(part);yield decoder.decode(part,final=False).encode('utf-8');continue
+                if isinstance(part,str):position+=len(part.encode('utf-16-le'))//2;data=part.encode('utf-8')
+                else:position+=len(part);data=bytes(part)
+                yield data
+            if decoder is not None:
+                tail=decoder.decode(b'',final=True)
+                if tail:yield tail.encode('utf-8')
+        with contextlib.closing(chunks()) as stream:yield meta,stream
+    finally:
+        if lob is not None and adapter.kind in ('h2','firebird'):
+            if firebird_subtype is not None:lob.sub_type=firebird_subtype
+            with contextlib.suppress(Exception):(lob.free if adapter.kind=='h2' else lob.close)()
+        cur.close();adapter.active_cursor=None
+
+
+def database_cell(adapter,args):
+    with database_cell_stream(adapter,args) as (meta,chunks):
+        data=bytearray();truncated=False
+        for chunk in chunks:
+            remaining=DATABASE_CELL_MAX_BYTES-len(data)
+            data.extend(chunk[:remaining])
+            if len(chunk)>remaining:truncated=True;break
+        adapter.check_cancel();raw=bytes(data)
+        encoding=meta['encoding'];format_='text';text='NULL' if meta['is_null'] else ''
+        if not meta['is_null']:
+            candidate='utf-16' if raw.startswith((b'\xff\xfe',b'\xfe\xff')) else 'utf-8-sig' if raw.startswith(b'\xef\xbb\xbf') else 'utf-8'
+            try:
+                import codecs
+                text=codecs.getincrementaldecoder(candidate)('strict').decode(raw,final=not truncated)
+                if encoding=='binary' and any(ord(c)<32 and c not in '\r\n\t' for c in text):raise UnicodeError()
+                encoding=candidate
+            except UnicodeError:text=raw.hex(' ');format_='hex';encoding='binary'
+            if format_=='text' and not truncated:
+                try:
+                    # Classify only. A float round-trip would silently change
+                    # financial JSON numbers and lexical forms such as 1e-400.
+                    parsed=json.loads(text,parse_float=Decimal,parse_int=Decimal)
+                    if isinstance(parsed,(dict,list)):format_='json'
+                except (ValueError,RecursionError):pass
+        return dict(meta,text=text,format=format_,encoding=encoding,truncated=truncated,preview_bytes=len(raw),limit_bytes=DATABASE_CELL_MAX_BYTES,read_at=utcnow(),
+                    scope='Bieżąca wartość rekordu wskazanego kluczem; od czasu odczytu strony dane mogły się zmienić.')
+
+
+def database_cell_export(adapter,args):
+    destination=Path(args['destination']).expanduser().resolve()
+    fd,temp=tempfile.mkstemp(prefix='.'+destination.name+'.',suffix='.tmp',dir=destination.parent);written=0
+    try:
+        with os.fdopen(fd,'wb') as output,database_cell_stream(adapter,args) as (meta,chunks):
+            for chunk in chunks:adapter.check_cancel();output.write(chunk);written+=len(chunk)
+            output.flush();os.fsync(output.fileno());adapter.check_cancel()
+        adapter.check_cancel();os.replace(temp,destination)
+        return {'destination':str(destination),'bytes':written,'encoding':meta['encoding'],'read_at':utcnow(),'scope':'BLOB zapisany bez zmian; tekst zapisany jako UTF-8. Wartość z bieżącego odczytu rekordu.'}
+    finally:
+        with contextlib.suppress(FileNotFoundError):Path(temp).unlink()
+
+
 def database_page(adapter, args):
     """One bounded live page. Filters/sort run at source, not on an arbitrary sample.
 
@@ -3548,14 +3847,18 @@ def database_page(adapter, args):
             param=bind(raw)
             clauses.append(f'ps_cmp({expr}, {param})'+operator+'0' if exact else expr+operator+param)
         else:raise UserError('Nieobsługiwany filtr przeglądu.')
-    exprs=[]
+    exprs=[];deferred_exprs=[]
     for col in cols:
         alias=qident(col['name']);name='ps_db.'+alias
         if adapter.kind=='sqlite':
+            deferred_exprs.append(f"CASE WHEN typeof({name})='blob' OR (typeof({name})='text' AND (length({name})>{MAX_CELL_TEXT} OR length(CAST({name} AS BLOB))>{MAX_CELL_TEXT*4})) THEN 1 ELSE 0 END")
             # Avoid transferring large binary values in a general-purpose preview.
             name=(f"CASE WHEN typeof({name})='blob' THEN '[BLOB: '||length({name})||' bajtów]' "
-                  f"WHEN typeof({name})='text' AND length({name})>{MAX_CELL_TEXT} THEN substr({name},1,{MAX_CELL_TEXT-40})||' … [tekst skrócony w podglądzie]' ELSE {name} END AS {alias}")
+                  f"WHEN typeof({name})='text' AND (length({name})>{MAX_CELL_TEXT} OR length(CAST({name} AS BLOB))>{MAX_CELL_TEXT*4}) THEN substr({name},1,{MAX_CELL_TEXT-40})||' … [tekst skrócony w podglądzie]' ELSE {name} END AS {alias}")
         exprs.append(name)
+    identity=database_row_identity(adapter,obj,cols,'ps_db');identities=[identity] if identity else []
+    exprs.extend(database_identity_expressions(adapter,identities))
+    exprs.extend(deferred_exprs)
     dataset={'schema':obj.get('schema',''),'table':obj['name']}
     sql='SELECT '+', '.join(exprs)+' FROM '+adapter.relation(dataset)+' ps_db'
     if clauses:sql+=' WHERE '+' AND '.join(clauses)
@@ -3577,15 +3880,15 @@ def database_page(adapter, args):
     else:sql+=f' LIMIT {limit+1} OFFSET {offset}'
     cur=adapter.execute(sql,params)
     try:
+        if adapter.kind=='firebird':cur.stream_blob_threshold=0
+        if adapter.kind=='h2':cur.cell_preview=True;cur.identity_binary_columns=set(range(len(cols),len(cols)+sum(len(s['expressions']) for s in identities)))
         adapter.check_cancel();raw=cur.fetchmany(limit+1);adapter.check_cancel()
-        def preview_value(value):
-            if isinstance(value,(bytes,bytearray,memoryview)):return pack('[BLOB: '+str(len(value))+' bajtów]')
-            if hasattr(value,'read'):return pack('[LOB — niepobrany w podglądzie]')
-            if isinstance(value,str) and len(value)>MAX_CELL_TEXT:return pack(value[:MAX_CELL_TEXT-40]+' … [tekst skrócony w podglądzie]')
-            return pack(value)
-        values=[[preview_value(v) for v in row] for row in raw[:limit]]
-    finally:cur.close()
-    result={'object':obj,'columns':cols,'rows':values,'offset':offset,'limit':limit,'has_more':len(raw)>limit,
+        identity_count=sum(len(s['expressions']) for s in identities);flag_start=len(cols)+identity_count
+        values=[[database_preview_value(v,bool(row[flag_start+i]) if deferred_exprs else adapter.kind=='h2' and any(t in str(cols[i]['type']).upper() for t in ('BINARY','BLOB','CLOB','LARGE OBJECT'))) for i,v in enumerate(row[:len(cols)])] for row in raw[:limit]]
+        tokens=[database_row_token(adapter,identities,row[len(cols):flag_start]) for row in raw[:limit]]
+    finally:cur.close();adapter.active_cursor=None
+    oid=database_object_id(obj.get('schema',''),obj.get('kind','table'),obj['name'])
+    result={'object':obj,'columns':[dict(c,origin={'object_id':oid,'column':c['name']}) for c in cols],'rows':values,'row_tokens':tokens,'offset':offset,'limit':limit,'has_more':len(raw)>limit,
             'read_at':utcnow(),'sort':sort,'direction':args.get('direction','asc'),'filters':args.get('filters',[]),
             'stable_order':bool(primary),'scope':'Strona z żywej bazy. Numery to pozycje w widoku, nie identyfikatory rekordów.',
             'sql':sql,'parameters':[{ 'index':i+1,'value':str(v)} for i,v in enumerate(params)]}
@@ -3771,7 +4074,7 @@ def database_join_alias(label,used):
     used.add(alias);return alias
 
 
-def database_join_compile(plan,adapter,preview=False):
+def database_join_compile(plan,adapter,preview=False,extra_expressions=()):
     plan=database_join_validate(plan)
     if adapter.kind!=plan['backend'] or adapter.source['id']!=plan['source_id']:raise UserError('Plan należy do innego połączenia lub silnika.')
     objects={o['id']:o for o in plan['objects']};aliases={o['id']:'ps_j'+str(i) for i,o in enumerate(plan['objects'])}
@@ -3782,7 +4085,7 @@ def database_join_compile(plan,adapter,preview=False):
             label=prefix+' · '+c['name'];alias=database_join_alias(label,used);expr=aliases[obj['id']]+'.'+qident(c['name']);value=expr
             if preview and adapter.kind=='sqlite':
                 value=(f"CASE WHEN typeof({expr})='blob' THEN '[BLOB: '||length({expr})||' bajtów]' "
-                    f"WHEN typeof({expr})='text' AND length({expr})>{MAX_CELL_TEXT} THEN substr({expr},1,{MAX_CELL_TEXT-40})||' … [tekst skrócony w podglądzie]' ELSE {expr} END")
+                    f"WHEN typeof({expr})='text' AND (length({expr})>{MAX_CELL_TEXT} OR length(CAST({expr} AS BLOB))>{MAX_CELL_TEXT*4}) THEN substr({expr},1,{MAX_CELL_TEXT-40})||' … [tekst skrócony w podglądzie]' ELSE {expr} END")
             expressions.append(value+' AS '+qident(alias))
             columns.append({'name':alias,'label':label,'type':c['type'],'pk_position':0,'origin':{'object_id':obj['id'],'column':c['name']},'expression':expr})
     root=objects[plan['base']]
@@ -3795,7 +4098,7 @@ def database_join_compile(plan,adapter,preview=False):
         pairs=[aliases[edge['target']]+'.'+qident(t)+' = '+('+' if adapter.kind=='sqlite' else '')+aliases[edge['source']]+'.'+qident(s)
                for s,t in zip(edge['source_columns'],edge['target_columns'])]
         clause+=(' LEFT JOIN ' if plan['join_type']=='left' else ' INNER JOIN ')+adapter.relation({'schema':added['schema'],'table':added['name']})+' '+aliases[added['id']]+' ON '+' AND '.join(pairs)
-    return {'sql':'SELECT '+', '.join(expressions)+clause,'columns':columns,'aliases':aliases,'plan':plan}
+    return {'sql':'SELECT '+', '.join([*expressions,*extra_expressions])+clause,'columns':columns,'aliases':aliases,'plan':plan}
 
 
 def database_live_foreign_keys(adapter,obj):
@@ -3900,7 +4203,16 @@ def database_join_page(adapter,args):
     plan=database_join_validate(args.get('plan'))
     if adapter.kind!=plan['backend'] or adapter.source['id']!=plan['source_id']:raise UserError('Plan należy do innego źródła lub silnika.')
     live=database_join_verify(adapter,plan)
-    compiled=database_join_compile(plan,adapter,preview=True);columns=compiled['columns'];sql=compiled['sql']
+    identities=[]
+    for i,obj in enumerate(plan['objects']):
+        spec=database_row_identity(adapter,obj,live[obj['id']],'ps_j'+str(i))
+        if spec:identities.append(spec)
+    hidden=database_identity_expressions(adapter,identities)
+    compiled=database_join_compile(plan,adapter,preview=True);columns=compiled['columns'];flags=[]
+    if adapter.kind=='sqlite':
+        for c in columns:
+            expr=c['expression'];flags.append(f"CASE WHEN typeof({expr})='blob' OR (typeof({expr})='text' AND (length({expr})>{MAX_CELL_TEXT} OR length(CAST({expr} AS BLOB))>{MAX_CELL_TEXT*4})) THEN 1 ELSE 0 END")
+    compiled=database_join_compile(plan,adapter,preview=True,extra_expressions=[*hidden,*flags]);sql=compiled['sql']
     where,params=database_join_filters(adapter,columns,args.get('filters',[]));sql+=where
     offset=max(0,int(args.get('offset',0)))
     if offset>100000000:raise UserError('Zbyt odległa strona; zawęź wynik filtrem.')
@@ -3921,16 +4233,15 @@ def database_join_page(adapter,args):
     else:sql+=f' LIMIT {limit+1} OFFSET {offset}'
     adapter.check_cancel();cur=adapter.execute(sql,params)
     try:
+        if adapter.kind=='firebird':cur.stream_blob_threshold=0
+        if adapter.kind=='h2':cur.cell_preview=True;cur.identity_binary_columns=set(range(len(columns),len(columns)+len(hidden)))
         raw=cur.fetchmany(limit+1);adapter.check_cancel()
-        def value(v):
-            if isinstance(v,(bytes,bytearray,memoryview)):return pack('[BLOB: '+str(len(v))+' bajtów]')
-            if hasattr(v,'read'):return pack('[LOB — niepobrany w podglądzie]')
-            if isinstance(v,str) and len(v)>MAX_CELL_TEXT:v=v[:MAX_CELL_TEXT-40]+' … [tekst skrócony w podglądzie]'
-            return pack(v)
-        rows=[[value(v) for v in row] for row in raw[:limit]]
+        flag_start=len(columns)+len(hidden)
+        rows=[[database_preview_value(v,bool(row[flag_start+i]) if flags else adapter.kind=='h2' and any(t in str(columns[i]['type']).upper() for t in ('BINARY','BLOB','CLOB','LARGE OBJECT'))) for i,v in enumerate(row[:len(columns)])] for row in raw[:limit]]
+        tokens=[database_row_token(adapter,identities,row[len(columns):flag_start]) for row in raw[:limit]]
     finally:cur.close();adapter.active_cursor=None
     result={'object':{'id':'join-'+digest(plan)[:24],'name':database_join_caption(plan),'kind':'join','schema':''},
-        'columns':[{k:v for k,v in c.items() if k!='expression'} for c in columns],'rows':rows,
+        'columns':[{k:v for k,v in c.items() if k!='expression'} for c in columns],'rows':rows,'row_tokens':tokens,
         'offset':offset,'limit':limit,'has_more':len(raw)>limit,'stable_order':stable,'read_at':utcnow(),
         'scope':'Połączone rekordy z żywej bazy; kolejne strony mogą się zmieniać przy równoległym zapisie. Filtry działają po JOIN (WHERE).',
         'plan':plan,'plan_fingerprint':digest(plan),'sql':sql,'parameters':[{'index':i+1,'value':str(v)} for i,v in enumerate(params)],
@@ -3973,11 +4284,17 @@ def database_graph_layout(objects,relations,sizes,available_width=1200,compact=F
             while q:
                 oid=q.popleft();ordered.append(oid)
                 for other in sorted(neighbors[oid]&remaining,key=key):remaining.remove(other);q.append(other)
-        cell_width=max((sizes[k][0] for k in ordered),default=230);columns=max(1,int((max(240,float(available_width))-24+18)//(cell_width+18)))
+        width=max(240,float(available_width));cell_width=max((sizes[k][0] for k in ordered),default=230);columns=max(1,int((width-24+18)//(cell_width+18)))
+        # Use the current canvas width, keeping neighbouring BFS nodes close
+        # at row boundaries. A partial final row does not stretch two relatives
+        # to opposite ends of a wide monitor.
+        step=(width-24-cell_width)/(columns-1) if columns>1 else cell_width+18
         result={};y=12
         for offset in range(0,len(ordered),columns):
             row=ordered[offset:offset+columns]
-            for column,oid in enumerate(row):result[oid]=(12+column*(cell_width+18),y)
+            for column,oid in enumerate(row):
+                slot=columns-1-column if (offset//columns)%2 else column
+                result[oid]=(12+slot*step,y)
             y+=max(sizes[oid][1] for oid in row)+24
         return result
     blocks=[]
@@ -4007,6 +4324,411 @@ def database_graph_layout(objects,relations,sizes,available_width=1200,compact=F
 
 
 # ======================== 5. IZOLACJA PROCESÓW I ANULOWANIE ===================
+def excel_availability():
+    """Discovery only: never start Office, read VBA, or change macro policy."""
+    if os.name!='nt':return {'available':False,'reason':'Sesja Excel wymaga Windows i zainstalowanego Microsoft Excel.'}
+    import winreg
+    powershell=Path(os.environ.get('SystemRoot',r'C:\Windows'))/'System32/WindowsPowerShell/v1.0/powershell.exe'
+    if not powershell.is_file():return {'available':False,'reason':'Nie znaleziono Windows PowerShell do uruchomienia osobnej sesji Excel.'}
+    for view in (winreg.KEY_WOW64_64KEY,winreg.KEY_WOW64_32KEY):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,r'Excel.Application\CLSID',0,winreg.KEY_READ|view) as key:clsid=winreg.QueryValue(key,None)
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,'CLSID\\'+clsid+r'\LocalServer32',0,winreg.KEY_READ|view) as key:server=winreg.QueryValue(key,None)
+            if server:return {'available':True,'reason':'Microsoft Excel jest zarejestrowany. Sesja użyje oddzielnej kopii pliku.','powershell':str(powershell)}
+        except OSError:continue
+    return {'available':False,'reason':'Nie znaleziono Microsoft Excel. Podgląd XLSX/XLSM nadal działa; wykonanie makr i wydruk przez Excel wymagają jego instalacji.'}
+
+
+def excel_process_ids():
+    if os.name!='nt':return set()
+    import ctypes
+    from ctypes import wintypes as w
+    class Entry(ctypes.Structure):
+        _fields_=[('dwSize',w.DWORD),('cntUsage',w.DWORD),('th32ProcessID',w.DWORD),('th32DefaultHeapID',ctypes.c_size_t),('th32ModuleID',w.DWORD),('cntThreads',w.DWORD),('th32ParentProcessID',w.DWORD),('pcPriClassBase',w.LONG),('dwFlags',w.DWORD),('szExeFile',w.WCHAR*260)]
+    kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes=[w.DWORD,w.DWORD];kernel.CreateToolhelp32Snapshot.restype=w.HANDLE
+    kernel.Process32FirstW.argtypes=[w.HANDLE,ctypes.POINTER(Entry)];kernel.Process32FirstW.restype=w.BOOL
+    kernel.Process32NextW.argtypes=[w.HANDLE,ctypes.POINTER(Entry)];kernel.Process32NextW.restype=w.BOOL
+    kernel.CloseHandle.argtypes=[w.HANDLE];kernel.CloseHandle.restype=w.BOOL
+    handle=kernel.CreateToolhelp32Snapshot(2,0)
+    if handle==ctypes.c_void_p(-1).value:raise UserError('Nie udało się sprawdzić istniejących procesów Excel.')
+    found=set();entry=Entry();entry.dwSize=ctypes.sizeof(entry)
+    try:
+        ok=kernel.Process32FirstW(handle,ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.casefold()=='excel.exe':found.add(int(entry.th32ProcessID))
+            ok=kernel.Process32NextW(handle,ctypes.byref(entry))
+        return found
+    finally:kernel.CloseHandle(handle)
+
+
+class ExcelOwnedProcess:
+    """Keep an OS handle, so a recycled PID can never become a kill target."""
+    def __init__(self,pid,hwnd,previous):
+        if os.name!='nt' or type(pid) is not int or type(hwnd) is not int or pid<=0 or hwnd<=0 or pid in previous:raise UserError('Nie potwierdzono oddzielnego procesu Excel. Istniejące okna pozostają nietknięte.')
+        import ctypes
+        from ctypes import wintypes as w
+        self.ctypes=ctypes;self.kernel=ctypes.WinDLL('kernel32',use_last_error=True);self.handle=None;self.pid=pid;self.hwnd=hwnd;self.handle_lock=threading.RLock()
+        user=ctypes.WinDLL('user32',use_last_error=True);user.GetWindowThreadProcessId.argtypes=[w.HWND,ctypes.POINTER(w.DWORD)];user.GetWindowThreadProcessId.restype=w.DWORD
+        actual=w.DWORD();user.GetWindowThreadProcessId(hwnd,ctypes.byref(actual))
+        if actual.value!=pid:raise UserError('Okno nie należy do nowego procesu Excel.')
+        k=self.kernel;k.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD];k.OpenProcess.restype=w.HANDLE
+        k.CloseHandle.argtypes=[w.HANDLE];k.CloseHandle.restype=w.BOOL
+        k.QueryFullProcessImageNameW.argtypes=[w.HANDLE,w.DWORD,w.LPWSTR,ctypes.POINTER(w.DWORD)];k.QueryFullProcessImageNameW.restype=w.BOOL
+        k.WaitForSingleObject.argtypes=[w.HANDLE,w.DWORD];k.WaitForSingleObject.restype=w.DWORD
+        k.TerminateProcess.argtypes=[w.HANDLE,w.UINT];k.TerminateProcess.restype=w.BOOL
+        self.handle=k.OpenProcess(0x1000|0x100000|1,False,pid)
+        if not self.handle:raise UserError('Nie uzyskano uchwytu własnej sesji Excel.')
+        name=ctypes.create_unicode_buffer(32768);length=w.DWORD(len(name))
+        if not k.QueryFullProcessImageNameW(self.handle,0,name,ctypes.byref(length)) or Path(name.value).name.casefold()!='excel.exe':
+            self.close();raise UserError('Nowy proces nie jest Microsoft Excel.')
+    def alive(self):
+        with self.handle_lock:return bool(self.handle and self.kernel.WaitForSingleObject(self.handle,0)==258)
+    def terminate(self):
+        with self.handle_lock:
+            if self.alive():self.kernel.TerminateProcess(self.handle,130)
+    def close(self):
+        with self.handle_lock:
+            if self.handle:self.kernel.CloseHandle(self.handle);self.handle=None
+
+
+def excel_copy_workbook(source,destination,cancelled,cancel_flag=None):
+    """Windows copy preserves Zone.Identifier and other NTFS streams."""
+    if cancelled.is_set():raise Cancelled('Anulowano otwieranie skoroszytu.')
+    if os.name=='nt':
+        import ctypes
+        from ctypes import wintypes as w
+        flag=cancel_flag if cancel_flag is not None else w.BOOL(False);kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+        kernel.CopyFileExW.argtypes=[w.LPCWSTR,w.LPCWSTR,ctypes.c_void_p,ctypes.c_void_p,ctypes.POINTER(w.BOOL),w.DWORD];kernel.CopyFileExW.restype=w.BOOL
+        if not kernel.CopyFileExW(str(source),str(destination),None,None,ctypes.byref(flag),1):
+            if cancelled.is_set() or flag.value:raise Cancelled('Anulowano kopiowanie skoroszytu.')
+            raise ctypes.WinError(ctypes.get_last_error())
+    else:shutil.copy2(source,destination)  # Test transport on other platforms only.
+    os.chmod(destination,0o600)  # The private working copy must remain editable/removable.
+    if cancelled.is_set():raise Cancelled('Anulowano otwieranie skoroszytu.')
+
+
+EXCEL_SESSION_POWERSHELL = r'''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$sessionId = ''; $excel = $null; $book = $null; $ownedExcel = $false
+function Send-Session($event) {
+    $event['session_id'] = $sessionId
+    [Console]::Out.WriteLine(($event | ConvertTo-Json -Compress -Depth 8))
+    [Console]::Out.Flush()
+}
+function Session-Info {
+    $sheet = ''; $workbook = ''
+    try { $sheet = [string]$excel.ActiveSheet.Name; $workbook = [string]$excel.ActiveWorkbook.Name } catch {}
+    return @{ active_sheet=$sheet; workbook_name=$workbook }
+}
+try {
+    $request = [Console]::In.ReadLine() | ConvertFrom-Json
+    $sessionId = [string]$request.session_id
+    if ($request.action -ne 'open') { throw 'First request must open a working copy.' }
+    Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PivotExcelProcess { [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid); }'
+    $previous = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    Send-Session @{ event='busy'; id=$request.id; operation='open' }
+    $excel = New-Object -ComObject Excel.Application
+    $excelHwnd = [Int64]$excel.Hwnd; [uint32]$excelPid = 0
+    [void][PivotExcelProcess]::GetWindowThreadProcessId([IntPtr]$excelHwnd,[ref]$excelPid)
+    if ($excelPid -eq 0 -or $previous -contains [int]$excelPid) { throw 'Excel did not create a separate process. Existing Excel windows were not changed.' }
+    $ownedExcel = $true
+    Send-Session @{ event='created'; id=$request.id; pid=[int]$excelPid; hwnd=$excelHwnd }
+    $attach = [Console]::In.ReadLine() | ConvertFrom-Json
+    if ($attach.action -ne 'attach' -or $attach.session_id -ne $sessionId) { throw 'Session cancelled before opening the workbook.' }
+    $excel.AutomationSecurity = 2 # msoAutomationSecurityByUI; never lower the user's policy.
+    $excel.EnableEvents = [bool]$request.run_open_events
+    $excel.DisplayAlerts = $true; $excel.Visible = $true
+    $missing = [Type]::Missing
+    $book = $excel.Workbooks.Open([string]$request.path,0,$false,$missing,$missing,$missing,$true,$missing,$missing,$false,$false,$missing,$false)
+    if ($request.run_open_events) { [void]$book.RunAutoMacros(1) }
+    $excel.EnableEvents = $true
+    Send-Session @{ event='ready'; id=$request.id; result=(Session-Info) }
+    while ($null -ne ($line = [Console]::In.ReadLine())) {
+        $command = $line | ConvertFrom-Json
+        if ($command.session_id -ne $sessionId) { throw 'Wrong session identity.' }
+        if ($command.action -eq 'close') { break }
+        Send-Session @{ event='busy'; id=$command.id; operation=$command.action }
+        try {
+            $excel.AutomationSecurity = 2
+            switch ([string]$command.action) {
+                'run_macro' {
+                    $name = [string]$command.name
+                    if ($name -notmatch '^[^\W\d]\w*(\.[^\W\d]\w*)?$') { throw 'Use a macro name or Module.Macro without workbook qualifiers or arguments.' }
+                    $qualified = "'" + ([string]$book.Name).Replace("'","''") + "'!" + $name
+                    [void]$excel.Run($qualified)
+                }
+                'export_pdf' {
+                    if ($null -eq $excel.ActiveSheet) { throw 'No active sheet to export.' }
+                    [void]$excel.ActiveSheet.ExportAsFixedFormat(0,[string]$command.temp_path,0,$true,$false,$missing,$missing,$false)
+                }
+                'save_copy' { [void]$book.SaveCopyAs([string]$command.temp_path) }
+                default { throw 'Unsupported session action.' }
+            }
+            $excel.EnableEvents = $true; $excel.DisplayAlerts = $true
+            Send-Session @{ event='done'; id=$command.id; operation=$command.action; result=(Session-Info) }
+        } catch {
+            try { $excel.EnableEvents = $true; $excel.DisplayAlerts = $true } catch {}
+            Send-Session @{ event='error'; id=$command.id; operation=$command.action; message=([string]$_.Exception.Message).Substring(0,[Math]::Min(1800,([string]$_.Exception.Message).Length)) }
+        }
+    }
+} catch {
+    Send-Session @{ event='fatal'; message=([string]$_.Exception.Message).Substring(0,[Math]::Min(1800,([string]$_.Exception.Message).Length)) }
+} finally {
+    if ($ownedExcel -and $null -ne $excel) {
+        try { $excel.EnableEvents = $false; foreach ($opened in @($excel.Workbooks)) { [void]$opened.Close($false) } } catch {}
+        try { [void]$excel.Quit() } catch {}
+    }
+    if ($null -ne $book) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($book) } catch {} }
+    if ($null -ne $excel) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($excel) } catch {} }
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+    Send-Session @{ event='closed' }
+}
+'''
+
+
+class ExcelSessionController:
+    """Private working copy + dedicated STA process; no COM calls on the UI thread."""
+    def __init__(self,source_path,root,on_event=None):
+        self.original=Path(os.path.abspath(os.path.expanduser(str(source_path))));self.root=Path(os.path.abspath(os.path.expanduser(str(root))));self.on_event=on_event
+        self.session_id=uid();self.lock=threading.RLock();self.write_lock=threading.Lock();self.cancelled=threading.Event();self.finished=threading.Event()
+        self.process=None;self.owned_process=None;self.thread=None;self.reaper=None;self.dispatcher=None;self.previous=set();self.pending=None;self.temp_root=None;self.staged=None;self._copy_cancel=None
+        self.state={'session_id':self.session_id,'state':'new','job_id':'','operation':'','original_path':str(self.original),'source_path':str(self.original),'staged_path':'','working_copy':'','temp_root':'','pid':0,'hwnd':0,'owned':False,'alive':False,'active_sheet':'','last_result':{},'error':'','events':[],'cancelled':False,'finished':False}
+    def _event(self,event,**fields):
+        with self.lock:
+            seq=self.state['events'][-1]['seq']+1 if self.state['events'] else 1
+            item=dict(fields,event=event,seq=seq,time=utcnow());self.state['events'].append(item);self.state['events']=self.state['events'][-100:]
+        if self.on_event:
+            with contextlib.suppress(Exception):self.on_event(clone(item))
+    def poll(self):
+        with self.lock:
+            self.state['owned']=self.state['alive']=bool(self.owned_process and self.owned_process.alive())
+            return clone(self.state)
+    def start(self,run_open_events=False):
+        if type(run_open_events) is not bool:raise UserError('Nieprawidłowa opcja makr otwarcia.')
+        with self.lock:
+            if self.thread:raise UserError('Ta sesja została już uruchomiona.')
+            self.state.update(state='starting',operation='open',job_id=uid())
+            self.thread=threading.Thread(target=self._run,args=(run_open_events,),name='pivot-excel-session',daemon=False);self.thread.start()
+        return self.session_id
+    def _send(self,document):
+        document=dict(document,session_id=self.session_id)
+        with self.write_lock:
+            process=self.process
+            if process is None or process.poll() is not None:raise UserError('Proces sesji Excel nie działa.')
+            if self.cancelled.is_set() and document.get('action') in ('run_macro','export_pdf','save_copy'):raise Cancelled('Sesja została zamknięta.')
+            process.stdin.write(dumps(document)+'\n');process.stdin.flush()
+    def _run(self,run_open_events):
+        try:
+            available=excel_availability()
+            if not available['available']:raise UserError(available['reason'])
+            self.original=self.original.resolve();self.root=self.root.resolve()
+            if self.original.suffix.lower() not in ('.xlsx','.xlsm') or not self.original.is_file():raise UserError('Wybierz istniejący skoroszyt .xlsx lub .xlsm.')
+            self.root.mkdir(parents=True,exist_ok=True);self.temp_root=Path(tempfile.mkdtemp(prefix='session-',dir=self.root));self.staged=self.temp_root/self.original.name
+            if os.name=='nt':
+                from ctypes import wintypes
+                self._copy_cancel=wintypes.BOOL(self.cancelled.is_set())
+            with self.lock:self.state.update(temp_root=str(self.temp_root),staged_path=str(self.staged),working_copy=str(self.staged))
+            self._event('copying',message='Tworzę prywatną kopię skoroszytu.')
+            before=self.original.stat();excel_copy_workbook(self.original,self.staged,self.cancelled,self._copy_cancel);after=self.original.stat()
+            if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):raise UserError('Skoroszyt zmienił się podczas kopiowania. Otwórz sesję ponownie.')
+            import base64
+            encoded=base64.b64encode(EXCEL_SESSION_POWERSHELL.encode('utf-16-le')).decode('ascii')
+            self.previous=excel_process_ids()
+            if self.cancelled.is_set():raise Cancelled('Anulowano otwieranie sesji.')
+            self.process=subprocess.Popen([available['powershell'],'-NoLogo','-NoProfile','-NonInteractive','-Sta','-EncodedCommand',encoded],
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',bufsize=1,creationflags=CREATE_NO_WINDOW)
+            threading.Thread(target=self._stderr,name='pivot-excel-errors',daemon=True).start()
+            self._send({'action':'open','id':self.state['job_id'],'path':str(self.staged),'run_open_events':run_open_events})
+            while True:
+                line=self.process.stdout.readline(65537)
+                if not line:break
+                if len(line)>65536:raise UserError('Nieprawidłowy komunikat procesu Excel.')
+                try:value=json.loads(line.lstrip('\ufeff'))
+                except ValueError:continue
+                self._consume(value)
+            if self.process.wait(timeout=2)!=0 and not self.cancelled.is_set():raise UserError('Proces obsługi Excel zakończył się nieoczekiwanie.')
+        except Exception as exc:
+            if not self.cancelled.is_set():
+                with self.lock:self.state.update(state='error',error=safe_error(exc),job_id='')
+                self._event('error',message=safe_error(exc))
+        finally:
+            self._finish()
+    def _stderr(self):
+        process=self.process
+        if process is None:return
+        try:
+            while True:
+                line=process.stderr.readline(4097)
+                if not line:break
+                if line.strip():self._event('diagnostic',message=line.strip()[:1800])
+        except (OSError,ValueError):pass
+    def _consume(self,value):
+        if not isinstance(value,dict) or value.get('session_id')!=self.session_id:return
+        event=value.get('event')
+        if event=='created':
+            try:owned=ExcelOwnedProcess(value.get('pid'),value.get('hwnd'),self.previous)
+            except Exception:
+                with contextlib.suppress(Exception):self._send({'action':'close'})
+                raise
+            with self.lock:self.owned_process=owned;self.state.update(pid=owned.pid,hwnd=owned.hwnd,owned=True,alive=True)
+            self._event('created',pid=owned.pid,hwnd=owned.hwnd)
+            self._send({'action':'close' if self.cancelled.is_set() else 'attach'});return
+        if event=='fatal':
+            message=str(value.get('message','Nie ukończono otwierania sesji Excel.'))[:1800]
+            with self.lock:self.state.update(state='error',error=message,job_id='')
+            self._event('error',message=message);return
+        if event=='closed':return
+        with self.lock:
+            if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
+            pending=self.pending if event=='done' else None
+        if pending:
+            try:result=self._publish(pending);value['result']=dict(value.get('result') or {},**result)
+            except Exception as exc:event='error';value['message']=safe_error(exc)
+        with self.lock:
+            if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
+            if event=='busy':self.state['state']='busy'
+            elif event in ('ready','done','error'):
+                self._remove_pending()
+                if event=='error':self.state.update(error=str(value.get('message','Błąd Excel.'))[:1800])
+                else:self.state.update(error='',last_result=clone(value.get('result') or {}),active_sheet=str((value.get('result') or {}).get('active_sheet','')))
+                self.state.update(state='ready',job_id='',operation='')
+        self._event(event,operation=value.get('operation','open'),message=value.get('message',''),result=value.get('result',{}))
+    def submit(self,action,args=None):
+        args=args or {}
+        with self.lock:
+            if self.state['state']!='ready' or self.cancelled.is_set() or not self.owned_process or not self.owned_process.alive():raise UserError('Poczekaj na gotową, własną sesję Excel.')
+            if action not in ('run_macro','export_pdf','save_copy'):raise UserError('Nieobsługiwana akcja sesji Excel.')
+            jid=uid();command={'action':action,'id':jid}
+            if action=='run_macro':
+                name=args.get('name','')
+                if not isinstance(name,str) or not re.fullmatch(r'[^\W\d]\w*(?:\.[^\W\d]\w*)?',name) or len(name)>200:raise UserError('Podaj nazwę makra lub Moduł.Makro, bez argumentów i nazwy skoroszytu.')
+                command['name']=name
+            else:
+                raw=args.get('destination')
+                if not isinstance(raw,str) or not raw or '\0' in raw:raise UserError('Wybierz docelowy plik.')
+                command['destination']=raw
+            self.state.update(state='busy',job_id=jid,operation=action,error='')
+            self.dispatcher=threading.Thread(target=self._dispatch,args=(command,),name='pivot-excel-request',daemon=False);self.dispatcher.start()
+        self._event('submitted',operation=action,id=jid);return jid
+    def _dispatch(self,command):
+        temp=None
+        try:
+            if command['action']!='run_macro':
+                target=Path(command.pop('destination')).expanduser().resolve();extension='.pdf' if command['action']=='export_pdf' else self.original.suffix.lower()
+                if target.suffix.lower()!=extension:raise UserError('Ten zapis wymaga rozszerzenia '+extension+'.')
+                if not target.parent.is_dir() or target.is_dir() or target==self.original or target.is_relative_to(self.root) or (target.exists() and target.samefile(self.original)) or target==Path(__file__).resolve():raise UserError('Wybierz plik poza oryginałem i prywatnym katalogiem sesji.')
+                if self.cancelled.is_set():raise Cancelled('Anulowano zapis.')
+                fd,temp=tempfile.mkstemp(prefix='.'+target.stem+'.',suffix=extension,dir=target.parent);os.close(fd);Path(temp).unlink()
+                with self.lock:
+                    if self.cancelled.is_set() or command['id']!=self.state['job_id']:raise Cancelled('Sesja została zamknięta.')
+                    self.pending={'id':command['id'],'action':command['action'],'temp_path':temp,'destination':str(target)};command['temp_path']=temp
+            with self.lock:
+                if self.cancelled.is_set() or command['id']!=self.state['job_id']:raise Cancelled('Sesja została zamknięta.')
+            self._send(command)
+        except Exception as exc:
+            if temp:
+                with contextlib.suppress(OSError):Path(temp).unlink()
+            with self.lock:
+                if self.pending and self.pending['id']==command['id']:self.pending=None
+                if not self.cancelled.is_set() and command['id']==self.state['job_id']:self.state.update(state='ready',job_id='',operation='',error=safe_error(exc))
+            self._event('error',message=safe_error(exc),operation=command['action'])
+    def _publish(self,pending):
+        if self.cancelled.is_set():raise Cancelled('Anulowano zapis.')
+        temp=Path(pending['temp_path'])
+        if not temp.is_file():raise UserError('Excel nie utworzył pliku wynikowego.')
+        if pending['action']=='export_pdf':
+            with temp.open('rb') as stream:
+                header=stream.read(16);size=temp.stat().st_size;stream.seek(max(0,size-4096));tail=stream.read(4096).rstrip(b'\r\n\t \x00')
+                if size<64 or not re.match(rb'%PDF-[12]\.\d[\r\n]',header) or not tail.endswith(b'%%EOF'):raise UserError('Excel nie utworzył kompletnego pliku PDF.')
+        else:
+            with zipfile.ZipFile(temp) as archive:
+                documents={}
+                for name in ('[Content_Types].xml','xl/workbook.xml'):
+                    info=archive.getinfo(name)
+                    if info.file_size>8*1024*1024:raise UserError('Nieprawidłowy zapis skoroszytu.')
+                    documents[name]=ET.fromstring(archive.read(name))
+                content=documents['[Content_Types].xml'];workbook=documents['xl/workbook.xml'];package='http://schemas.openxmlformats.org/package/2006/content-types'
+                expected='application/vnd.ms-excel.sheet.macroEnabled.main+xml' if self.original.suffix.lower()=='.xlsm' else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'
+                if content.tag!='{'+package+'}Types' or not any(node.get('PartName')=='/xl/workbook.xml' and node.get('ContentType')==expected for node in content.findall('{'+package+'}Override')):raise UserError('Excel zapisał niezgodny format skoroszytu.')
+                namespaces=('http://schemas.openxmlformats.org/spreadsheetml/2006/main','http://purl.oclc.org/ooxml/spreadsheetml/main')
+                if not any(workbook.tag=='{'+ns+'}workbook' and workbook.find('{'+ns+'}sheets') is not None for ns in namespaces):raise UserError('Excel nie utworzył prawidłowego skoroszytu.')
+        with temp.open('r+b') as stream:stream.flush();os.fsync(stream.fileno())
+        size=temp.stat().st_size
+        with self.lock:
+            if self.cancelled.is_set() or pending is not self.pending or pending['id']!=self.state['job_id']:raise Cancelled('Anulowano zapis.')
+            os.replace(temp,pending['destination'])
+        return {'destination':pending['destination'],'bytes':size,'action':pending['action']}
+    def _remove_pending(self):
+        if self.pending:
+            with contextlib.suppress(OSError):Path(self.pending['temp_path']).unlink()
+            self.pending=None
+    def close(self):self._stop(False)
+    def cancel(self):self._stop(True)
+    def _stop(self,force):
+        self.cancelled.set()
+        if self._copy_cancel is not None:self._copy_cancel.value=True
+        with self.lock:
+            if self.finished.is_set():return
+            self.state.update(state='closing',cancelled=bool(force),job_id='')
+            if self.reaper:return
+            self.reaper=threading.Thread(target=self._reap,args=(force,),name='pivot-excel-close',daemon=False);self.reaper.start()
+    def _reap(self,force):
+        with contextlib.suppress(Exception):self._send({'action':'close'})
+        if self.finished.wait(0.2 if force else 2):return
+        # Creation may be in flight. Keep reading the ownership handshake before
+        # stopping the helper; never infer ownership from a newly observed PID.
+        deadline=time.monotonic()+8
+        while not self.finished.is_set() and self.owned_process is None and self.process is not None and self.process.poll() is None and time.monotonic()<deadline:time.sleep(.05)
+        if self.owned_process:
+            with contextlib.suppress(Exception):self.owned_process.terminate()
+        process=self.process
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(Exception):process.terminate()
+        if self.thread is None:self._finish()
+    def _finish(self):
+        with self.lock:
+            if self.finished.is_set():return
+            owned=self.owned_process
+        stopped=True
+        if owned:
+            with contextlib.suppress(Exception):owned.terminate()
+            deadline=time.monotonic()+1.5
+            while owned.alive() and time.monotonic()<deadline:time.sleep(.05)
+            stopped=not owned.alive()
+            if not stopped:self._event('cleanup_pending',message='Nie potwierdzono zatrzymania własnego procesu Excel. Kopia robocza pozostaje w '+str(self.temp_root))
+            with contextlib.suppress(Exception):owned.close()
+        process=self.process
+        if process is not None:
+            if process.poll() is None:
+                with contextlib.suppress(Exception):self._send({'action':'close'});process.wait(timeout=2)
+            if process.poll() is None:
+                with contextlib.suppress(Exception):process.terminate();process.wait(timeout=2)
+            for stream in (process.stdin,process.stdout,process.stderr):
+                with contextlib.suppress(Exception):stream.close()
+        with self.lock:
+            if stopped:self._remove_pending()
+            self.state.update(owned=False,alive=False,job_id='',operation='')
+        if stopped and self.temp_root is not None:
+            # Only the one application-generated directory, after its own Excel
+            # process has stopped; never traverse or delete the supplied root.
+            if self.temp_root.parent==self.root and self.temp_root.name.startswith('session-'):
+                for attempt in range(4):
+                    try:shutil.rmtree(self.temp_root);break
+                    except FileNotFoundError:break
+                    except OSError:
+                        if attempt==3:self._event('cleanup_pending',message='Kopia robocza pozostaje w '+str(self.temp_root))
+                        else:time.sleep(.1)
+        with self.lock:
+            if self.state['state']!='error' or self.cancelled.is_set():self.state['state']='closed'
+            self.state['finished']=True
+            self.finished.set()
+        self._event('closed')
+
+
 def worker_main():
     """Persistent worker; DB connections belong to its executor thread, never the UI."""
     inbox=queue.Queue(); state={'id':None,'adapter':None,'cancel':None}; lock=threading.Lock(); output_lock=threading.Lock()
@@ -4078,6 +4800,8 @@ def worker_main():
                     elif operation=='database_cache_hydrate_batch':value=database_cache_hydrate_batch(adapter,args)
                     elif operation=='database_page': value=database_page(adapter,args)
                     elif operation=='database_join_page': value=database_join_page(adapter,args)
+                    elif operation=='database_cell': value=database_cell(adapter,args)
+                    elif operation=='database_cell_export': value=database_cell_export(adapter,args)
                     elif operation=='tables': value=adapter.tables()
                     elif operation=='test':
                         value={'message':'Sterownik i połączenie działają; odczyt metadanych zakończony.',
@@ -5167,6 +5891,183 @@ class CatalogCacheCoordinator:
         if self.thread and self.thread is not threading.current_thread():self.thread.join()
 
 
+# Native prompt access is independent of COM: Excel can display a modal dialog
+# while its COM worker is blocked. Call these helpers on a local I/O thread.
+EXCEL_NATIVE_SCAN_SECONDS = .8
+
+
+class _ExcelNativeWindows:
+    def __init__(self):
+        if os.name!='nt':raise UserError('Sterowanie komunikatami Excela wymaga Windows.')
+        import ctypes as C
+        self.c=C;self.user=C.WinDLL('user32',use_last_error=True);u=self.user
+        self.callback=C.WINFUNCTYPE(C.c_int,C.c_void_p,C.c_ssize_t)
+        signatures=(
+            ('IsWindow',[C.c_void_p],C.c_int),('IsWindowVisible',[C.c_void_p],C.c_int),
+            ('IsWindowEnabled',[C.c_void_p],C.c_int),('IsChild',[C.c_void_p,C.c_void_p],C.c_int),
+            ('GetWindowThreadProcessId',[C.c_void_p,C.POINTER(C.c_uint32)],C.c_uint32),
+            ('GetWindow',[C.c_void_p,C.c_uint],C.c_void_p),('GetAncestor',[C.c_void_p,C.c_uint],C.c_void_p),
+            ('GetClassNameW',[C.c_void_p,C.c_wchar_p,C.c_int],C.c_int),
+            ('GetWindowLongW',[C.c_void_p,C.c_int],C.c_long),('GetDlgCtrlID',[C.c_void_p],C.c_int),
+            ('EnumWindows',[self.callback,C.c_ssize_t],C.c_int),
+            ('EnumChildWindows',[C.c_void_p,self.callback,C.c_ssize_t],C.c_int),
+            ('SendMessageTimeoutW',[C.c_void_p,C.c_uint,C.c_size_t,C.c_ssize_t,C.c_uint,C.c_uint,C.POINTER(C.c_size_t)],C.c_ssize_t),
+            ('PostMessageW',[C.c_void_p,C.c_uint,C.c_size_t,C.c_ssize_t],C.c_int),
+            ('SetForegroundWindow',[C.c_void_p],C.c_int),('BringWindowToTop',[C.c_void_p],C.c_int))
+        for name,args,result in signatures:fn=getattr(u,name);fn.argtypes=args;fn.restype=result
+    def pid(self,hwnd):
+        value=self.c.c_uint32()
+        return value.value if self.user.IsWindow(hwnd) and self.user.GetWindowThreadProcessId(hwnd,self.c.byref(value)) else 0
+    def visible(self,hwnd):return bool(self.user.IsWindowVisible(hwnd))
+    def enabled(self,hwnd):return bool(self.user.IsWindowEnabled(hwnd))
+    def owner(self,hwnd):return int(self.user.GetWindow(hwnd,4) or 0)
+    def root(self,hwnd):return int(self.user.GetAncestor(hwnd,2) or 0)
+    def child(self,parent,hwnd):return bool(self.user.IsChild(parent,hwnd))
+    def style(self,hwnd):return int(self.user.GetWindowLongW(hwnd,-16)) & 0xffffffff
+    def control_id(self,hwnd):return int(self.user.GetDlgCtrlID(hwnd))
+    def class_name(self,hwnd):
+        buffer=self.c.create_unicode_buffer(256)
+        return buffer.value if self.user.GetClassNameW(hwnd,buffer,len(buffer)) else ''
+    def windows(self,parent=0,deadline=None,limit=1024):
+        result=[];complete=True
+        def visit(hwnd,_):
+            nonlocal complete
+            if len(result)>=limit or (deadline is not None and time.monotonic()>=deadline):complete=False;return 0
+            result.append(int(hwnd));return 1
+        callback=self.callback(visit)
+        if parent:self.user.EnumChildWindows(parent,callback,0)
+        else:self.user.EnumWindows(callback,0)
+        return result,complete
+    def message(self,hwnd,message,wparam,lparam,deadline):
+        remaining=deadline-time.monotonic()
+        if remaining<=0:return None
+        result=self.c.c_size_t()
+        # ABORTIFHUNG | BLOCK | ERRORONEXIT, never NOTIMEOUTIFNOTHUNG.
+        ok=self.user.SendMessageTimeoutW(hwnd,message,wparam,lparam,0x23,max(1,min(50,int(remaining*1000))),self.c.byref(result))
+        return int(result.value) if ok else None
+    def text(self,hwnd,deadline,limit=4096):
+        buffer=self.c.create_unicode_buffer(limit+1)
+        count=self.message(hwnd,0x000d,len(buffer),self.c.addressof(buffer),deadline)
+        return (buffer.value,count is not None and count<limit)
+    def checked(self,hwnd,deadline):return self.message(hwnd,0x00f0,0,0,deadline)
+    def activate(self,hwnd):
+        self.user.BringWindowToTop(hwnd);self.user.SetForegroundWindow(hwnd)
+    def click(self,hwnd):return bool(self.user.PostMessageW(hwnd,0x00f5,0,0))
+
+
+def _excel_native_target(api,pid,main_hwnd):
+    return (isinstance(pid,int) and not isinstance(pid,bool) and 0<pid<=0xffffffff
+            and isinstance(main_hwnd,int) and not isinstance(main_hwnd,bool) and main_hwnd>0
+            and api.pid(main_hwnd)==pid and api.root(main_hwnd)==main_hwnd)
+
+
+def _excel_native_owned_modal(api,pid,main_hwnd,hwnd):
+    if hwnd==main_hwnd or api.pid(hwnd)!=pid or api.root(hwnd)!=hwnd or api.class_name(hwnd)!='#32770' or not api.visible(hwnd):return False
+    seen={hwnd};owner=api.owner(hwnd);disabled=False
+    for _ in range(16):
+        if not owner or owner in seen or api.pid(owner)!=pid:return False
+        disabled=disabled or not api.enabled(owner)
+        # Excel SDI can create another workbook window in the same exclusively
+        # owned process. Its modal prompt belongs to this session as well.
+        if owner==main_hwnd or (api.root(owner)==owner and api.class_name(owner)=='XLMAIN'):return disabled
+        seen.add(owner);owner=api.owner(owner)
+    return False
+
+
+def _excel_native_snapshot(api,pid,main_hwnd,hwnd,deadline):
+    if not _excel_native_target(api,pid,main_hwnd) or not _excel_native_owned_modal(api,pid,main_hwnd,hwnd):return None
+    title,complete=api.text(hwnd,deadline);texts=[];buttons=[];controls=[];total=len(title)
+    children,all_children=api.windows(hwnd,deadline,128);complete=complete and all_children
+    for child in children:
+        if time.monotonic()>=deadline:complete=False;break
+        if api.pid(child)!=pid or not api.child(hwnd,child):complete=False;continue
+        if not api.visible(child):continue
+        class_name=api.class_name(child);style=api.style(child)
+        if class_name.casefold()=='static' and style & 0x1f in (3,14,15):continue  # Icon / bitmap, not text.
+        # Password edit controls are never read or echoed into application state.
+        if class_name.casefold()=='edit' and style & 0x20:text='[Pole hasła — treść ukryta]';read_ok=True
+        else:text,read_ok=api.text(child,deadline)
+        complete=complete and read_ok;total+=len(text)
+        if total>16384:complete=False;break
+        control={'hwnd':child,'class':class_name,'text':text,'enabled':api.enabled(child),'id':api.control_id(child)}
+        if class_name.casefold()=='button':
+            kind=style & 0xf
+            if kind in (0,1,11,12,13,14,15):
+                if len(buttons)>=32:complete=False;break
+                buttons.append({k:control[k] for k in ('hwnd','text','id','enabled')})
+            else:
+                if kind in (2,3,4,5,6,9):
+                    checked=api.checked(child,deadline);complete=complete and checked is not None;control['checked']=checked
+                    text=('☑ ' if checked==1 else '☐ ' if checked==0 else '▣ ')+text
+                if text:texts.append(text)
+        elif text:texts.append(text)
+        controls.append(control)
+    if not _excel_native_target(api,pid,main_hwnd) or not _excel_native_owned_modal(api,pid,main_hwnd,hwnd):return None
+    identity={'pid':pid,'main_hwnd':main_hwnd,'hwnd':hwnd,'owner':api.owner(hwnd),'title':title,
+              'text':'\n'.join(texts),'buttons':buttons,'enabled':api.enabled(hwnd),'complete':bool(complete),'controls':controls}
+    fingerprint=digest(identity);identity.pop('controls');identity['fingerprint']=fingerprint
+    if not complete:identity['notice']='Nie odczytano całego komunikatu. Użyj oryginalnego okna Excela.'
+    return identity
+
+
+def excel_native_dialogs(pid,main_hwnd):
+    """Only native modal dialogs owned by this exact Excel window/process.
+
+    No COM, hooks, keyboard events or automatic actions. Discovery is bounded,
+    but must run outside the GUI thread because foreign WM_GETTEXT can time out.
+    The caller also checks its session's owned process handle remains alive.
+    """
+    if os.name!='nt':return []
+    api=_ExcelNativeWindows()
+    if not _excel_native_target(api,pid,main_hwnd):return []
+    deadline=time.monotonic()+EXCEL_NATIVE_SCAN_SECONDS;result=[]
+    windows,_=api.windows(deadline=deadline)
+    for hwnd in windows:
+        if len(result)>=8 or time.monotonic()>=deadline:break
+        if _excel_native_owned_modal(api,pid,main_hwnd,hwnd):
+            value=_excel_native_snapshot(api,pid,main_hwnd,hwnd,deadline)
+            if value is not None:result.append(value)
+    return result
+
+
+def excel_native_dialog_skip_button(snapshot):
+    """A label suggestion only; callers still require a deliberate user click."""
+    if not isinstance(snapshot,dict) or not snapshot.get('complete') or not snapshot.get('enabled',True):return None
+    buttons=[b for b in snapshot.get('buttons',[]) if isinstance(b,dict) and b.get('enabled')]
+    def caption(button):return re.sub(r'\s+',' ',str(button.get('text','')).replace('&','')).strip().casefold()
+    ignores=[b for b in buttons if caption(b) in ('ignoruj','ignore')]
+    if len(ignores)==1:return clone(ignores[0])
+    prompt=str(snapshot.get('text','')).casefold()
+    asks_abort=bool(re.search(r'\bczy\s+(?:chcesz\s+)?przerwa[ćc]\b|\b(?:do you want to|would you like to)\s+abort\b',prompt))
+    no=[b for b in buttons if caption(b) in ('nie','no')]
+    return clone(no[0]) if asks_abort and len(no)==1 else None
+
+
+def excel_native_dialog_action(pid,main_hwnd,dialog_snapshot,button_hwnd):
+    """Revalidate an observed native button and queue one BM_CLICK, never wait."""
+    stale='Komunikat Excela zmienił się lub został zamknięty. Odśwież jego podgląd; niczego nie kliknięto.'
+    if not isinstance(dialog_snapshot,dict) or not dialog_snapshot.get('complete'):raise UserError('Niepełny podgląd komunikatu. Użyj oryginalnego okna Excela.')
+    if not isinstance(button_hwnd,int) or isinstance(button_hwnd,bool) or button_hwnd<=0:raise UserError(stale)
+    if dialog_snapshot.get('pid')!=pid or dialog_snapshot.get('main_hwnd')!=main_hwnd:raise UserError(stale)
+    hwnd=dialog_snapshot.get('hwnd')
+    if not isinstance(hwnd,int) or isinstance(hwnd,bool) or hwnd<=0:raise UserError(stale)
+    api=_ExcelNativeWindows();deadline=time.monotonic()+EXCEL_NATIVE_SCAN_SECONDS
+    current=_excel_native_snapshot(api,pid,main_hwnd,hwnd,deadline)
+    if not current or not current['complete'] or current['fingerprint']!=dialog_snapshot.get('fingerprint') or not current['enabled']:raise UserError(stale)
+    button=next((b for b in current['buttons'] if b['hwnd']==button_hwnd),None)
+    if not button or not button['enabled'] or api.pid(button_hwnd)!=pid or not api.child(hwnd,button_hwnd):raise UserError(stale)
+    api.activate(hwnd)
+    # Activation may have dismissed/replaced the prompt. Check again before posting.
+    confirmed=_excel_native_snapshot(api,pid,main_hwnd,hwnd,deadline)
+    if (not confirmed or confirmed['fingerprint']!=current['fingerprint'] or not confirmed['complete']
+            or not _excel_native_target(api,pid,main_hwnd) or not _excel_native_owned_modal(api,pid,main_hwnd,hwnd)
+            or api.pid(button_hwnd)!=pid or not api.child(hwnd,button_hwnd)
+            or not api.visible(button_hwnd) or not api.enabled(button_hwnd)):raise UserError(stale)
+    if not api.click(button_hwnd):raise UserError('Windows nie przyjął kliknięcia. Użyj oryginalnego okna Excela i odśwież podgląd.')
+    return {'ok':True,'sent':True,'hwnd':hwnd,'button_hwnd':button_hwnd,
+            'message':'Wysłano kliknięcie do okna Excela. Wynik sprawdź po odświeżeniu komunikatów.'}
+
+
 class ApplicationService:
     def __init__(self,root):
         self.root=private_dir(Path(root)); self.session=private_dir(self.root/'sessions'/uid())
@@ -5241,6 +6142,32 @@ class ApplicationService:
         if result.get('source_fingerprint')!=source_data_fingerprint(source,meta['analysis']['dataset']):
             raise UserError('Definicja połączenia zmieniła się. Odśwież wynik.')
         return result
+    def cell_export_destination(self,value):
+        text=clean_text(value,2048)
+        if not text:raise UserError('Wybierz plik docelowy eksportu komórki.')
+        destination=Path(text).expanduser().resolve()
+        if not destination.parent.is_dir() or destination.is_dir():raise UserError('Wybierz plik w istniejącym katalogu eksportu.')
+        protected={Path(__file__).resolve()}
+        if self.project_path:protected.add(Path(self.project_path).resolve())
+        def protect(path):
+            if path and not str(path).startswith('@'):protected.add(Path(path).expanduser().resolve())
+        for book in self.document.get('workpads',[]):protect(book.get('origin'))
+        for source in self.document['sources']:
+            options=source['options'];kind=source['kind']
+            if kind in ('sqlite','xlsx'):protect(options.get('path'))
+            if kind=='xlsx':
+                protect(options.get('origin'))
+                for dataset in source['workbook']['datasets']:
+                    for version in dataset['versions']:protect(version.get('path'))
+            elif kind=='h2' and options.get('mode','file')=='file':
+                path=options.get('path','');protect(path)
+                if path:
+                    for suffix in ('.mv.db','.h2.db','.lock.db','.trace.db'):protect(path+suffix)
+            elif kind=='firebird' and options.get('host','').lower() in ('','localhost','127.0.0.1','::1'):
+                protect(options.get('database'))
+        if destination in protected or destination.is_relative_to(self.root.resolve()):
+            raise UserError('Eksport komórki nie może nadpisać źródła, projektu ani prywatnych plików aplikacji.')
+        return str(destination)
     def submit_db(self,op,args,source):
         self.authorize(source,args.get('analysis',{}).get('dataset') or args.get('dataset'))
         output=str(self.session/(uid()+'.sqlite')) if op in ('pivot','preview','drill') else ''
@@ -5350,10 +6277,11 @@ class ApplicationService:
                 source=self.source(args['source_id']); self.trusted.add(digest(source))
                 if args.get('sql'): self.trusted_sql.add(digest({'source':source,'sql':validate_select(args['sql'])}))
                 return {'ok':True}
-            if action in ('database_catalog','database_object_details','database_page','database_join_page'):
+            if action in ('database_catalog','database_object_details','database_page','database_join_page','database_cell','database_cell_export'):
                 source=self.source(args['source_id'])
                 if source['kind'] not in ('sqlite','h2','firebird','oracle'):raise UserError('Eksplorator wymaga połączenia z bazą.')
                 payload={k:v for k,v in args.items() if k!='source_id'}
+                if action=='database_cell_export':payload['destination']=self.cell_export_destination(args.get('destination'))
                 return self.submit_db(action,payload,source)
             if action in ('tables','test'):
                 source=self.source(args['source_id'])
@@ -6744,6 +7672,7 @@ def sheet_read_styles(archive):
 
 def sheet_read_xlsx(path,cancelled=None):
     before=local_file_state(path);ns={'s':SHEET_NS};count=0;warnings=set()
+    if Path(path).suffix.lower()=='.xlsm':warnings.add('Makra VBA i obsługa przycisków (nie są uruchamiane; eksport XLSX ich nie zachowuje)')
     def check():
         if cancelled is not None and cancelled.is_set():raise Cancelled('Otwieranie skoroszytu anulowane.')
     with checked_xlsx(path) as archive:
@@ -6763,7 +7692,8 @@ def sheet_read_xlsx(path,cancelled=None):
         names=archive.namelist()
         for needle,warning in [('xl/charts/','Wykresy źródłowego XLSX'),('xl/drawings/','Rysunki i obrazy'),
             ('xl/externalLinks/','Łącza do innych skoroszytów'),('xl/pivot','Natywne tabele przestawne Excela'),
-            ('vbaProject','Makra'),('xl/comments','Komentarze'),('xl/tables/','Definicje tabel Excela (wartości komórek są zachowane)')]:
+            ('vbaProject','Makra VBA i obsługa przycisków (nie są uruchamiane; eksport XLSX ich nie zachowuje)'),('xl/macrosheets/','Arkusze makr Excela (nie są uruchamiane)'),
+            ('xl/comments','Komentarze'),('xl/tables/','Definicje tabel Excela (wartości komórek są zachowane)')]:
             if any(needle in n for n in names):warnings.add(warning)
         if workbook.find('s:definedNames',ns) is not None:warnings.add('Nazwane zakresy i nazwy zdefiniowane')
         for catalog_item in catalog:
@@ -8814,6 +9744,186 @@ def native_ui_types():
             return None
         def flags(self,index):return (Qt.ItemFlag.ItemIsEnabled|Qt.ItemFlag.ItemIsSelectable) if index.isValid() else Qt.ItemFlag.NoItemFlags
 
+    class ExcelSessionDialog(QW.QDialog):
+        """Controls an explicitly opened, separate Excel instance and its prompts."""
+        def __init__(self,window,path=''):
+            super().__init__(window);self._host_window=window;self._controller=None;self._snapshot={};self._epoch=0;self._disposed=False;self._closing=False;self._close_after_save=False
+            self._scan_pending=False;self._action_pending=False;self._command_pending=False;self._sent_prompts={};self._retry_prompts=set();self._last_prompts=[];self._last_scan=0.;self._native_digest=None;self._event_seq=0;self._last_result_key=None
+            self._tasks=AsyncTasks(self);self._timer=QC.QTimer(self);self._timer.setInterval(250);self._timer.timeout.connect(self.poll)
+            self.setWindowTitle('Excel: makra i PDF');self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            outer=QW.QVBoxLayout(self);outer.setContentsMargins(18,16,18,16);outer.setSpacing(9)
+            outer.addWidget(label('Excel: makra i PDF',False));outer.addWidget(label('Osobne, widoczne okno Excela pracuje na kopii. Możesz używać przycisków w skoroszycie albo podać nazwę makra poniżej.',True,True))
+            outer.addWidget(label('Aby zachować zmiany, wybierz „Zapisz kopię…” przed zamknięciem sesji.',True,True))
+            row=QW.QHBoxLayout();self.file=PathField(path,'Skoroszyty Excel (*.xlsx *.xlsm)');row.addWidget(self.file,1);self.open_button=button('Otwórz w Excelu',self.start_session);row.addWidget(self.open_button);outer.addLayout(row)
+            self.open_events=QW.QCheckBox('Uruchom także makra otwarcia');self.open_events.setToolTip('Dotyczy tylko tej zewnętrznej sesji. Excel stosuje własne ustawienia zabezpieczeń makr.');outer.addWidget(self.open_events)
+            row=QW.QHBoxLayout();self.macro_name=QW.QLineEdit();self.macro_name.setPlaceholderText('Nazwa makra, np. Moduł1.PrzygotujRaport');row.addWidget(self.macro_name,1)
+            self.run_button=button('Uruchom makro',self.run_macro);row.addWidget(self.run_button);outer.addLayout(row)
+            row=QW.QHBoxLayout();self.pdf_button=button('PDF bieżącego arkusza…',self.export_pdf);self.pdf_button.setToolTip('Eksportuje arkusz aktywny w widocznym oknie Excela.')
+            self.save_copy_button=button('Zapisz kopię…',self.save_copy);row.addWidget(self.pdf_button);row.addWidget(self.save_copy_button);row.addStretch();outer.addLayout(row)
+            self.state_note=label('',False,True);self.message=label('',True,True);self.state_note.setTextFormat(Qt.TextFormat.PlainText);self.message.setTextFormat(Qt.TextFormat.PlainText);outer.addWidget(self.state_note);outer.addWidget(self.message)
+            self.prompt_frame=QW.QGroupBox('Rzeczywiste komunikaty Excela');self.prompt_layout=QW.QVBoxLayout(self.prompt_frame)
+            self.prompt_scroll=QW.QScrollArea();self.prompt_scroll.setWidgetResizable(True);self.prompt_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.prompt_scroll.setWidget(self.prompt_frame);outer.addWidget(self.prompt_scroll,1)
+            self.history_toggle=QW.QToolButton();self.history_toggle.setText('Historia sesji');self.history_toggle.setCheckable(True);outer.addWidget(self.history_toggle,0,Qt.AlignmentFlag.AlignLeft)
+            self.history=QW.QPlainTextEdit();self.history.setReadOnly(True);self.history.setMaximumBlockCount(100);self.history.setMaximumHeight(110);self.history.hide();self.history_toggle.toggled.connect(self.history.setVisible);outer.addWidget(self.history)
+            row=QW.QHBoxLayout();self.stop_button=button('Przerwij sesję',self.stop_session);row.addWidget(self.stop_button);row.addStretch();self.close_button=button('Zamknij',self.close);row.addWidget(self.close_button);outer.addLayout(row)
+            for control in self.findChildren(QW.QPushButton):control.setAutoDefault(False)
+            self.file.edit.textChanged.connect(self.update_controls);self.macro_name.textChanged.connect(self.update_controls)
+            try:self._availability=excel_availability()
+            except Exception as exc:self._availability={'available':False,'reason':safe_error(exc)}
+            self.state_note.setText('Wybierz skoroszyt i otwórz własną sesję Excela.' if self._availability.get('available') else self._availability.get('reason','Excel nie jest dostępny.'))
+            self.render_prompts([]);self.update_controls();limited_dialog_size(self,900,760);self._timer.start()
+        def session_running(self):
+            return bool(self._controller and (self._snapshot.get('owned') or (not self._snapshot.get('finished') and self._snapshot.get('state')!='closed')))
+        def update_controls(self,*_):
+            state=self._snapshot.get('state','idle');active=self.session_running();ready=state=='ready' and self._snapshot.get('owned') and not self._closing and not self._command_pending
+            self.file.setEnabled(not active and not self._closing);self.open_events.setEnabled(not active and not self._closing)
+            self.open_button.setEnabled(bool(self._availability.get('available') and self.file.text().strip() and not active and not self._closing))
+            self.macro_name.setEnabled(bool(ready));self.run_button.setEnabled(bool(ready and self.macro_name.text().strip()));self.pdf_button.setEnabled(bool(ready));self.save_copy_button.setEnabled(bool(ready))
+            self.stop_button.setEnabled(bool(active and not self._closing));self.close_button.setEnabled(not self._closing)
+        def start_session(self):
+            if self._disposed or self._closing or not self._availability.get('available'):return
+            if self.session_running():return
+            path=self.file.text().strip()
+            if not path or Path(path).suffix.lower() not in WORKBOOK_SUFFIXES:self.message.setText('Wybierz plik XLSM albo XLSX.');return
+            self._epoch+=1;self._event_seq=0;self._last_result_key=None;self._last_scan=0;self._native_digest=None;self._scan_pending=False;self._action_pending=False;self._sent_prompts={};self._retry_prompts=set();self.history.clear();self.message.clear();self.render_prompts([])
+            try:
+                self._controller=ExcelSessionController(path,self._host_window.service.root/'excel-sessions');self._controller.start(run_open_events=self.open_events.isChecked());self._snapshot={'state':'starting'};self.poll()
+            except Exception as exc:self._snapshot={'state':'error'};self.state_note.setText('Nie otwarto sesji Excela.');self.message.setText(safe_error(exc));self.update_controls()
+        def submit(self,action,args):
+            if self._disposed or self._closing or self._command_pending or not self._controller or self._snapshot.get('state')!='ready':return False
+            controller=self._controller;epoch=self._epoch;service=self._host_window.service;self._command_pending=True;self._last_result_key=None;self.message.clear();self.update_controls()
+            def work():
+                payload=dict(args)
+                if action in ('save_copy','export_pdf'):
+                    with service.lock:payload['destination']=service.cell_export_destination(payload.get('destination'))
+                return controller.submit(action,payload)
+            def done(job_id):
+                if self._disposed or epoch!=self._epoch:return
+                self._command_pending=False;self.poll()
+            def failed(error):
+                if self._disposed or epoch!=self._epoch:return
+                self._command_pending=False;self._close_after_save=False;self.poll();self.message.setText(str(error))
+            self._tasks.submit(work,done,failed,'Polecenie Excela');return True
+        def run_macro(self):
+            name=self.macro_name.text().strip()
+            if not name:self.message.setText('Wpisz nazwę makra lub użyj przycisku w oknie Excela.');return
+            self.submit('run_macro',{'name':name})
+        def export_pdf(self):
+            if self._snapshot.get('state')!='ready':return
+            name=Path(self.file.text()).stem+'.pdf';destination=QW.QFileDialog.getSaveFileName(self,'PDF bieżącego arkusza',name,'PDF (*.pdf)')[0]
+            if destination:self.submit('export_pdf',{'destination':destination})
+        def save_copy(self):
+            if self._snapshot.get('state')!='ready':return False
+            source=Path(self.file.text());suffix=source.suffix.lower();destination=QW.QFileDialog.getSaveFileName(self,'Zapisz kopię skoroszytu',source.stem+' - kopia'+suffix,'Skoroszyt Excel (*'+suffix+')')[0]
+            return bool(destination and self.submit('save_copy',{'destination':destination}))
+        def session_identity(self):
+            state=self._snapshot
+            return (self._epoch,state.get('session_id'),state.get('pid'),state.get('hwnd')) if state.get('owned') and state.get('pid') and state.get('hwnd') else None
+        def poll(self):
+            if self._disposed or not self._controller:return
+            try:snapshot=self._controller.poll()
+            except Exception as exc:self.message.setText(safe_error(exc));return
+            previous=self.session_identity();self._snapshot=snapshot;identity=self.session_identity();state=snapshot.get('state')
+            names={'starting':'Otwieranie kopii w Excelu…','ready':'Excel gotowy.','busy':'Excel wykonuje zadanie…','closing':'Zamykanie własnej sesji Excela…','closed':'Sesja Excela zakończona.','error':'Nie udało się wykonać operacji Excela.'}
+            self.state_note.setText(names.get(state,str(state or ''))+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
+            if snapshot.get('error'):self.message.setText(str(snapshot['error']));self._close_after_save=False
+            result=snapshot.get('last_result')
+            if result and state=='ready' and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
+                self._last_result_key=digest(result);destination=result.get('destination') if isinstance(result,dict) else None
+                self.message.setText('Zapisano: '+str(destination) if destination else 'Operacja zakończona.')
+                if self._close_after_save and state=='ready':self._close_after_save=False;self.begin_close()
+            for event in snapshot.get('events',[]):
+                if not isinstance(event,dict):continue
+                seq=event.get('seq',0)
+                if seq>self._event_seq:
+                    text=str(event.get('message',event.get('text',''))).strip()
+                    if text:self.history.appendPlainText(text)
+                    self._event_seq=seq
+            if identity!=previous:self._scan_pending=False;self._action_pending=False;self._sent_prompts={};self._retry_prompts=set();self._native_digest=None;self._last_scan=0;self.render_prompts([])
+            retry={(hwnd,value[0]) for hwnd,value in self._sent_prompts.items() if time.monotonic()-value[1]>=3}
+            if retry-self._retry_prompts:self._retry_prompts|=retry;self.render_prompts(self._last_prompts)
+            if identity and state not in ('closed','error') and not self._scan_pending and not self._action_pending and time.monotonic()-self._last_scan>=.75:self.scan_prompts(identity)
+            elif not identity and self._native_digest is not None:self._native_digest=None;self.render_prompts([])
+            self.update_controls()
+            if self._closing and (state=='closed' or snapshot.get('finished')):self.dispose();self.close()
+        def scan_prompts(self,identity):
+            self._scan_pending=True;self._last_scan=time.monotonic();pid,hwnd=identity[-2:]
+            def done(items):
+                if self._disposed or identity!=self.session_identity():return
+                self._scan_pending=False;fingerprint=digest(items);current={item['hwnd']:item.get('fingerprint') for item in items}
+                self._sent_prompts={hwnd:value for hwnd,value in self._sent_prompts.items() if current.get(hwnd)==value[0]}
+                if fingerprint!=self._native_digest:self._native_digest=fingerprint;self.render_prompts(items)
+            def failed(error):
+                if self._disposed or identity!=self.session_identity():return
+                self._scan_pending=False;self.message.setText('Nie odczytano komunikatów. Użyj okna Excela. '+str(error))
+            self._tasks.submit(lambda:excel_native_dialogs(pid,hwnd),done,failed,'Komunikaty Excela')
+        def render_prompts(self,items):
+            self._last_prompts=clone(items)
+            while self.prompt_layout.count():
+                item=self.prompt_layout.takeAt(0)
+                if item.widget():item.widget().hide();item.widget().deleteLater()
+            if not items:self.prompt_layout.addWidget(label('Jeśli Excel czeka na odpowiedź, możesz wybrać ją bezpośrednio w jego oknie.',True,True))
+            for snapshot in items:
+                frame=QW.QWidget();layout=QW.QVBoxLayout(frame);layout.setContentsMargins(0,0,0,8);title=label(str(snapshot.get('title','Excel')),False,True);title.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(title)
+                text=QW.QPlainTextEdit();text.setReadOnly(True);text.setPlainText(str(snapshot.get('text','')));text.setMaximumHeight(120);layout.addWidget(text)
+                controls=QW.QGridLayout();buttons=snapshot.get('buttons',[]);pending=self._sent_prompts.get(snapshot.get('hwnd'),(None,))[0]==snapshot.get('fingerprint')
+                for index,native in enumerate(buttons):
+                    control=button(str(native.get('text','')),lambda checked=False,s=clone(snapshot),b=clone(native):self.click_prompt(s,b));control.setAutoDefault(False)
+                    control.setEnabled(bool(native.get('enabled') and snapshot.get('enabled',True) and snapshot.get('complete',True) and not self._action_pending and not pending));controls.addWidget(control,index//3,index%3)
+                suggestion=excel_native_dialog_skip_button(snapshot)
+                if suggestion:
+                    skip=button('Pomiń → '+str(suggestion.get('text','')).replace('&',''),lambda checked=False,s=clone(snapshot),b=clone(suggestion):self.click_prompt(s,b));skip.setAutoDefault(False)
+                    skip.setToolTip('Wysyła dokładnie pokazany wybór. Nie omija innych warunków makra.');skip.setEnabled(bool(suggestion.get('enabled') and snapshot.get('enabled',True) and snapshot.get('complete',True) and not self._action_pending and not pending));controls.addWidget(skip,(len(buttons)+2)//3,0,1,3)
+                layout.addLayout(controls)
+                if pending and (snapshot.get('hwnd'),snapshot.get('fingerprint')) in self._retry_prompts:
+                    layout.addWidget(label('Okno nadal czeka. Możesz ponownie wybrać odpowiedź lub użyć okna Excela.',True,True))
+                    layout.addWidget(button('Odblokuj odpowiedzi',lambda checked=False,s=clone(snapshot):self.retry_prompt(s)))
+                if snapshot.get('complete') is False:layout.addWidget(label('Nie odczytano całego okna. Odpowiedz bezpośrednio w Excelu.',True,True))
+                self.prompt_layout.addWidget(frame)
+            self.prompt_layout.addStretch()
+        def click_prompt(self,snapshot,native):
+            identity=self.session_identity()
+            if self._disposed or self._closing or self._action_pending or not identity or self._sent_prompts.get(snapshot.get('hwnd'),(None,))[0]==snapshot.get('fingerprint'):return
+            self._action_pending=True
+            for control in self.prompt_frame.findChildren(QW.QPushButton):control.setEnabled(False)
+            pid,hwnd=identity[-2:];caption=str(native.get('text','')).replace('&','')
+            def done(result):
+                if self._disposed or identity!=self.session_identity():return
+                self._action_pending=False;self._sent_prompts[snapshot['hwnd']]=(snapshot.get('fingerprint'),time.monotonic());self._retry_prompts.discard((snapshot['hwnd'],snapshot.get('fingerprint')));self._native_digest=None;self._last_scan=0;self.message.setText('Wysłano wybór „'+caption+'”. Czekam na odpowiedź Excela.');self.poll()
+            def failed(error):
+                if self._disposed or identity!=self.session_identity():return
+                self._action_pending=False;self._native_digest=None;self._last_scan=0;self.message.setText(str(error));self.poll()
+            self._tasks.submit(lambda:excel_native_dialog_action(pid,hwnd,snapshot,native['hwnd']),done,failed,'Odpowiedź w Excelu')
+        def retry_prompt(self,snapshot):
+            self._sent_prompts.pop(snapshot.get('hwnd'),None);self._retry_prompts.discard((snapshot.get('hwnd'),snapshot.get('fingerprint')));self.render_prompts(self._last_prompts)
+        def stop_session(self):
+            if not self._controller or self._disposed:return
+            self._controller.cancel();self.message.setText('Przerywam własną sesję Excela…');self.poll()
+        def begin_close(self):
+            if self._closing or self._disposed:return
+            self._closing=True;self.message.setText('Zamykanie własnej sesji Excela…')
+            try:self._controller.cancel() if self._snapshot.get('state') in ('starting','busy') else self._controller.close()
+            except Exception as exc:self._closing=False;self.message.setText(safe_error(exc))
+            self.update_controls()
+        def closeEvent(self,event):
+            if self._disposed:event.accept();return
+            if self._closing:event.ignore();return
+            if not self.session_running():
+                self.dispose();event.accept();return
+            if self._snapshot.get('owned') and self._snapshot.get('state') in ('ready','busy'):
+                box=QW.QMessageBox(self);box.setWindowTitle('Zakończyć sesję Excela?');box.setText('Kopia sesji zostanie usunięta. Zapisz osobną kopię, aby zachować wprowadzone zmiany.')
+                save=box.addButton('Zapisz kopię…',QW.QMessageBox.ButtonRole.AcceptRole);save.setEnabled(self._snapshot.get('state')=='ready')
+                discard=box.addButton('Zamknij bez zapisu',QW.QMessageBox.ButtonRole.DestructiveRole);cancel=box.addButton('Anuluj',QW.QMessageBox.ButtonRole.RejectRole);box.setDefaultButton(cancel);box.exec()
+                if box.clickedButton()==save:
+                    self._close_after_save=self.save_copy();event.ignore();return
+                if box.clickedButton()!=discard:event.ignore();return
+            self.begin_close();event.ignore()
+        def reject(self):self.close()
+        def dispose(self):
+            if self._disposed:return
+            self._disposed=True;self._epoch+=1;self._timer.stop();self._tasks.close()
+            if self._controller and self._snapshot.get('state')!='closed':self._controller.cancel()
+
     class TechnologiesDialog(QW.QDialog):
         """On-demand, read-only inventory. No extra toolbar or startup scan."""
         def __init__(self,window):
@@ -9368,7 +10478,7 @@ def native_ui_types():
         def __init__(self,window,path=''):
             super().__init__('Import danych',window);self._host_window=window;self.job='';self.preview_stamp=''
             self._metadata=None;self._file_state=None;self._revision=0;self._pending_read=False;self._close_requested=False
-            self.file=PathField(path,'Dane (*.csv *.tsv *.txt *.xlsx);;Wszystkie pliki (*)')
+            self.file=PathField(path,'Dane (*.csv *.tsv *.txt *.xlsx *.xlsm);;Wszystkie pliki (*)')
             self.header=QW.QCheckBox('Pierwszy wiersz zawiera nazwy kolumn');self.header.setChecked(True)
             self.delimiter=combo({'auto':'Automatycznie',';':'Średnik',',':'Przecinek','\t':'Tabulator','|':'Pionowa kreska'})
             self.encoding=combo({'utf-8-sig':'UTF-8','cp1250':'Windows-1250','utf-16':'UTF-16'})
@@ -9376,8 +10486,8 @@ def native_ui_types():
             self.sheet=QW.QComboBox();self.sheet.setMinimumContentsLength(18)
             self.sheet.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             self.sheet.setPlaceholderText('Odczytuję listę arkuszy…');self.sheet.setEnabled(False)
-            self.sheet.setAccessibleName('Arkusz XLSX do importu')
-            self.form.addRow('Plik',self.file);self.form.addRow('Arkusz XLSX',self.sheet)
+            self.sheet.setAccessibleName('Arkusz XLSX lub XLSM do importu')
+            self.form.addRow('Plik',self.file);self.form.addRow('Arkusz Excel',self.sheet)
             self.form.addRow(self.header);self.form.addRow('Separator CSV',self.delimiter)
             self.form.addRow('Kodowanie CSV',self.encoding);self.form.addRow('Separator dziesiętny',self.decimal)
             self.preview_button=button('Odśwież podgląd',self.preview);self.add_widget(self.preview_button)
@@ -9407,7 +10517,7 @@ def native_ui_types():
                     'sheet':self.sheet.currentData() or ''}
         def stamp(self):
             plan=incoming_file_plan([self.file.text()])
-            if plan[0]['kind']!='tabular':raise UserError('Wybierz XLSX lub CSV. SQLite dodaj przez główne okno.')
+            if plan[0]['kind']!='tabular':raise UserError('Wybierz XLSX, XLSM lub CSV. SQLite dodaj przez główne okno.')
             return digest({'path':plan[0]['path'],'options':self.options()})
         def invalidate_preview(self):
             self._revision+=1;self.preview_stamp='';self._file_state=None;self.ok.setEnabled(False)
@@ -9415,7 +10525,7 @@ def native_ui_types():
             if self.job:self._host_window.watcher.cancel(self.job)
         def path_changed(self,*_):
             self._metadata=None;self.sheet.blockSignals(True);self.sheet.clear();self.sheet.blockSignals(False)
-            is_xlsx=Path(self.file.text()).suffix.lower()=='.xlsx'
+            is_xlsx=Path(self.file.text()).suffix.lower() in WORKBOOK_SUFFIXES
             self.sheet.setEnabled(False);self.delimiter.setEnabled(not is_xlsx);self.encoding.setEnabled(not is_xlsx)
             self.sheet.setPlaceholderText('Odczytuję listę arkuszy…' if is_xlsx else 'Nie dotyczy pliku tekstowego')
             self.sample_table.setRowCount(0);self.columns.setRowCount(0)
@@ -9431,7 +10541,7 @@ def native_ui_types():
             self._pending_read=False;revision=self._revision
             try:
                 plan=incoming_file_plan([self.file.text()])[0]
-                if plan['kind']!='tabular':raise UserError('Ten formularz importuje XLSX lub CSV. Bazę SQLite upuść na główne okno.')
+                if plan['kind']!='tabular':raise UserError('Ten formularz importuje XLSX, XLSM lub CSV. Bazę SQLite upuść na główne okno.')
                 path=plan['path'];metadata=self._metadata
                 self.ok.setEnabled(False);self.preview_button.setEnabled(False);self.preview_stamp='';self._file_state=None
                 inspecting=metadata is None
@@ -9474,7 +10584,8 @@ def native_ui_types():
                             cell=values[col] if col<len(values) else None
                             self.sample_table.setItem(row,col,QW.QTableWidgetItem(display_cell(cell) if cell is not None else 'NULL'))
                     for col in range(self.sample_table.columnCount()):self.sample_table.setColumnWidth(col,150)
-                    self.note.setText(f'Podgląd: {len(value["sample"])} wierszy. '+value['note'])
+                    self.note.setText(f'Podgląd: {len(value["sample"])} wierszy. '+value['note']+
+                        (' '+XLSM_DATA_NOTICE if Path(path).suffix.lower()=='.xlsm' else ''))
                     self.error_label.hide();self.ok.setEnabled(True)
                 def failure(text):
                     self.job='';self.preview_button.setEnabled(True)
@@ -9514,6 +10625,7 @@ def native_ui_types():
                 for d in source['workbook']['datasets']}
             self._pending=False;self._refresh=refresh
             self.add_widget(label(source['name'],False,True))
+            if workbook_file_format(source)=='xlsm':self.add_widget(label(XLSM_DATA_NOTICE,True,True))
             self.add_widget(label('Kliknij nazwę, aby obejrzeć arkusz. Zaznacz pola wyboru przy arkuszach, które chcesz przygotować.',True,True))
             split=QW.QSplitter(Qt.Orientation.Horizontal);split.setChildrenCollapsible(False)
             left=QW.QWidget();left.setMinimumWidth(170);ll=QW.QVBoxLayout(left);ll.setContentsMargins(0,0,10,0);ll.setSpacing(8)
@@ -9540,7 +10652,7 @@ def native_ui_types():
             self.preview_tabs.addTab(self.sample,'Podgląd · do 20 wierszy');self.preview_tabs.addTab(self.columns,'Kolumny i typy');rl.addWidget(self.preview_tabs,1)
             self.note=label('Przygotowuję podgląd…',True,True);rl.addWidget(self.note)
             split.addWidget(right);split.setStretchFactor(1,1);split.setSizes([245,635]);self.add_widget(split)
-            self.scope_note=label('Powstanie lokalna kopia całego XLSX (również niewybranych arkuszy). '
+            self.scope_note=label('Powstanie lokalna kopia całego pliku Excel (również niewybranych arkuszy). '
                 'Tylko zaznaczone arkusze zostaną teraz przygotowane jako osobne zbiory. Oryginał pozostaje bez zmian.',True,True)
             self.add_widget(self.scope_note)
             self.selection_note=label('',True,True);self.add_widget(self.selection_note)
@@ -11604,7 +12716,7 @@ def native_ui_types():
             self._shown=shown;self._title_font=QG.QFont();self._title_font.setPixelSize(13);self._title_font.setBold(True)
             self._field_font=QG.QFont();self._field_font.setPixelSize(12)
             fm=QG.QFontMetrics(self._field_font);tfm=QG.QFontMetrics(self._title_font)
-            available=max(1,graph.viewport().width());card_limit=max(230,min(250,(available-24-3*18)/4))
+            available=graph.layout_width();columns=max(1,int((available-24+18)//(230+18)));card_limit=max(230,min(250,(available-24-(columns-1)*18)/columns))
             width=max(230,min(card_limit,max([tfm.horizontalAdvance(database_label(obj))+28]+[fm.horizontalAdvance(c['name'])+fm.horizontalAdvance(str(c['type']))+66 for c in shown])))
             self._row_h=max(23,fm.height()+6);self._header_h=max(34,tfm.height()+14)
             self._extra=len(cols)-len(shown);height=self._header_h+self._row_h*max(1,len(shown))+8+(21 if self._extra else 0)
@@ -11749,7 +12861,7 @@ def native_ui_types():
         def redraw_edges(self):
             if self._building:return
             for item in self._edges:item.refresh()
-            self._scene.setSceneRect(self._scene.itemsBoundingRect().adjusted(-42,-42,42,42))
+            self._scene.setSceneRect(self._scene.itemsBoundingRect().adjusted(-12,-12,12,12))
         def schedule_save(self,*_):
             if self._source_key and not self._building and not self._restoring and not self._initial_view:self._save_timer.start()
         def _state(self):
@@ -11870,12 +12982,21 @@ def native_ui_types():
                 self.zoomChanged.emit(round(zoom*100));self._selection_changed()
             finally:self._restoring=False
             self.save_state()
+        def layout_width(self):
+            # A tall map needs a vertical scrollbar after layout; reserve its
+            # width up front so arranging at 100% does not add a horizontal one.
+            gutter=0 if self.verticalScrollBar().isVisible() else self.style().pixelMetric(QW.QStyle.PixelMetric.PM_ScrollBarExtent)
+            return max(240,self.viewport().width()-gutter)
         def arrange_nodes(self,preserve=False):
             if not self._plan:return
             self._building=True
             try:
+                if not preserve:
+                    self.resetTransform();selected=set(self.selected_ids())
+                    for oid,old in list(self._nodes.items()):
+                        node=DatabaseNode(old._object,self);self._scene.removeItem(old);self._nodes[oid]=node;self._scene.addItem(node);node.setSelected(oid in selected)
                 sizes={oid:(n.rect().width(),n.rect().height()) for oid,n in self._nodes.items()}
-                positions=database_graph_layout(self._plan['objects'],self._links,sizes,self.viewport().width(),compact=True)
+                positions=database_graph_layout(self._plan['objects'],self._links,sizes,self.layout_width(),compact=True)
                 stored=self._state().get('positions',{}) if preserve else {}
                 raw_manual=self._state().get('manual',[]) if preserve else []
                 self._manual_positions={oid for oid in raw_manual if isinstance(oid,str) and oid in self._nodes} if isinstance(raw_manual,list) else set()
@@ -11885,8 +13006,11 @@ def native_ui_types():
                     if not isinstance(pos,(list,tuple)) or len(pos)!=2 or any(not isinstance(n,(int,float)) or not math.isfinite(n) or abs(n)>1e7 for n in pos):pos=positions[oid]
                     node.setPos(*pos)
             finally:self._building=False
-            self.redraw_edges()
-            if not preserve:self.readable_view();self.schedule_save()
+            self._edge_timer.stop();self.redraw_edges()
+            if not preserve:
+                rect=self._scene.itemsBoundingRect();height=self.viewport().height()
+                self.centerOn(QC.QPointF(rect.center().x(),rect.center().y() if rect.height()<=height else rect.top()+height/2-12))
+                self.zoomChanged.emit(100);self._selection_changed();self._edge_timer.stop();self.save_state()
         def showEvent(self,event):
             super().showEvent(event)
             if self._initial_view:QC.QTimer.singleShot(0,self._initialize_view)
@@ -11966,10 +13090,83 @@ def native_ui_types():
             if role==Qt.ItemDataRole.TextAlignmentRole:return int(Qt.AlignmentFlag.AlignVCenter|(Qt.AlignmentFlag.AlignRight if cell and cell['t']=='n' else Qt.AlignmentFlag.AlignLeft))
             return None
 
+    class DatabaseCellDialog(QW.QDialog):
+        """A single, identified live value; large content stays in the worker."""
+        def __init__(self,page,index):
+            super().__init__(page);self.page=page;self._active=True;self._revision=page._revision;self._generation=page._host_window.service.generation
+            self._source=clone(page.source);self._result={};self._args=None;self._busy=False
+            self.setWindowTitle('Zawartość komórki · tylko odczyt');self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            layout=QW.QVBoxLayout(self);column=page.model._page['columns'][index.column()]
+            layout.addWidget(label(column.get('label',column['name'])))
+            self.note=label('',True,True);layout.addWidget(self.note)
+            self.text=QW.QPlainTextEdit();self.text.setReadOnly(True);self.text.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.NoWrap);layout.addWidget(self.text,1)
+            row=QW.QHBoxLayout();self.copy_button=button('Kopiuj',lambda:QW.QApplication.clipboard().setText(self.text.toPlainText()))
+            self.save_button=button('Zapisz całość…',self.save_full);self.retry_button=button('Ponów',self.fetch)
+            self.close_button=button('Zamknij',self.reject);row.addWidget(self.copy_button);row.addWidget(self.save_button);row.addWidget(self.retry_button);row.addStretch();row.addWidget(self.close_button);layout.addLayout(row)
+            self.retry_button.hide();self.save_button.hide();self.text.setPlainText(str(page.model.data(index) or ''))
+            cell=page.model._page['rows'][index.row()-1][index.column()] if index.row()>0 else None
+            if cell and cell.get('deferred'):
+                tokens=page.model._page.get('row_tokens',[]);token=tokens[index.row()-1] if index.row()-1<len(tokens) else None
+                origin=column.get('origin',{});oid=origin.get('object_id');name=origin.get('column')
+                self.text.clear();self.copy_button.setEnabled(False)
+                if token and oid and name and oid in token.get('objects',{}):
+                    self._args={'row_token':clone(token),'object_id':oid,'column':name};self.note.setText('Pobieram zawartość komórki…')
+                    QC.QTimer.singleShot(0,self,self.fetch)
+                else:self.note.setText('Nie można jednoznacznie wskazać tego rekordu. Otwórz tabelę z kluczem głównym albo odśwież stronę danych.')
+            else:self.note.setText('Wartość z odczytanej strony danych.')
+            self.finished.connect(self.dispose);limited_dialog_size(self,820,560)
+        def live(self):
+            if not self._active or not qt_object_alive(self.page) or self.page._closed or self.page._revision!=self._revision:return False
+            service=self.page._host_window.service
+            try:current=service.generation==self._generation and digest(service.source(self._source['id']))==digest(self._source)
+            except UserError:current=False
+            if not current:self.dispose();self.reject()
+            return current
+        def busy(self,value):
+            self._busy=value;self.save_button.setEnabled(not value);self.retry_button.setEnabled(not value)
+            self.close_button.setText('Anuluj i zamknij' if value else 'Zamknij')
+        def fetch(self):
+            if not self._args or not self.live() or self._busy:return
+            self.busy(True);self.retry_button.hide();self.note.setText('Pobieram zawartość komórki…')
+            def loaded(result):
+                if not self.live():return
+                self.busy(False);self._result=clone(result);self.text.setPlainText(result.get('text',''));self.copy_button.setEnabled(True);self.save_button.show()
+                size=result.get('size');unit=result.get('unit','bytes');parts=[]
+                unit={'bytes':'bajtów','chars':'znaków','utf-16 units':'jednostek UTF-16'}.get(unit,str(unit))
+                if size is not None:parts.append('Rozmiar w bazie: '+str(size)+' '+unit)
+                if result.get('format')=='hex':parts.append('Dane binarne · widok szesnastkowy')
+                elif result.get('format')=='json':parts.append('JSON')
+                if result.get('encoding'):parts.append(str(result['encoding']))
+                if result.get('truncated'):parts.append('Podgląd częściowy — „Zapisz całość…” pobierze pełną wartość do pliku.')
+                else:parts.append('Pobrano pełną wartość.')
+                if result.get('read_at'):parts.append('Odczyt: '+str(result['read_at']).replace('T',' ')[:19])
+                self.note.setText(' · '.join(parts));self.note.setToolTip(result.get('scope',''))
+            def failed(error):
+                if not self.live():return
+                self.busy(False);self.note.setText(str(error));self.retry_button.show()
+            self.page._explorer.queue.submit(self,'database_cell',self._source,self._args,loaded,failed)
+        def save_full(self):
+            if not self._args or not self.live() or self._busy:return
+            fmt=self._result.get('format');suffix='.json' if fmt=='json' else '.txt' if fmt=='text' else '.bin'
+            name=re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',self._args['column'])[:80] or 'wartosc'
+            path=QW.QFileDialog.getSaveFileName(self,'Zapisz całą wartość komórki',name+suffix,'Wszystkie pliki (*)')[0]
+            if not path or not self.live():return
+            self.busy(True);self.note.setText('Pobieram całą wartość i zapisuję plik…')
+            def done(result):
+                if not self.live():return
+                self.busy(False);self.note.setText('Zapisano całą wartość: '+str(result.get('destination',path))+' · '+str(result.get('bytes',0))+' bajtów')
+            def failed(error):
+                if not self.live():return
+                self.busy(False);self.note.setText('Nie zapisano pliku: '+str(error))
+            self.page._explorer.queue.submit(self,'database_cell_export',self._source,dict(self._args,destination=path),done,failed)
+        def dispose(self,*_):
+            if not self._active:return
+            self._active=False;self.page._explorer.queue.cancel_owner(self);self.page._cell_dialogs.discard(self)
+
     class DatabaseDataPage(QW.QWidget):
         def __init__(self,explorer,source,obj):
             super().__init__(explorer);self._explorer=explorer;self._host_window=explorer._host_window;self.source=clone(source);self.obj=clone(obj)
-            self._revision=0;self._offset=0;self._filters=[];self._sort='';self._direction='asc';self._busy=False;self._valid=False;self._closed=False
+            self._revision=0;self._offset=0;self._filters=[];self._sort='';self._direction='asc';self._busy=False;self._valid=False;self._closed=False;self._cell_dialogs=set()
             lay=QW.QVBoxLayout(self);lay.setContentsMargins(0,0,0,0);lay.setSpacing(5)
             bar=QW.QHBoxLayout();self.address=label('A1',True);self.address.setMinimumWidth(48);bar.addWidget(self.address)
             self.value=QW.QLineEdit();self.value.setReadOnly(True);self.value.setPlaceholderText('Pełna zawartość zaznaczonej komórki');self.value.setAccessibleName('Zawartość komórki w bazie — tylko odczyt');bar.addWidget(self.value,1)
@@ -11992,6 +13189,7 @@ def native_ui_types():
             self.load()
         def load(self):
             if self._closed:return
+            self.close_cell_dialogs()
             self._revision+=1;revision=self._revision;self._busy=True;self._valid=False;self.failure.hide();self.controls()
             self.note.setText('Odczytuję stronę… wcześniejszy widok nie odpowiada jeszcze nowemu żądaniu.')
             operation,args=self.request_spec()
@@ -12003,7 +13201,7 @@ def native_ui_types():
                 self.grid.setCurrentIndex(self.model.index(0,0));self.grid.horizontalHeader().setSortIndicator(next((i for i,c in enumerate(page['columns']) if c['name']==self._sort),-1),Qt.SortOrder.DescendingOrder if self._direction=='desc' else Qt.SortOrder.AscendingOrder)
                 self.grid.horizontalHeader().setSortIndicatorShown(bool(self._sort));self.controls()
                 n=len(page['rows']);self.note.setText((f'Rekordy {page["offset"]+1}–{page["offset"]+n}' if n else 'Brak rekordów na tej stronie')+' · tylko odczyt · '+('dalsze dane →' if page['has_more'] else 'koniec wyniku'))
-                self.note.setToolTip(page['scope']+'\nOdczyt: '+page['read_at']+('\nBrak potwierdzonego klucza unikalnego: kolejność remisów może się zmieniać.' if not page['stable_order'] else '')+'\nDuże wartości BLOB/LOB są oznaczane zamiast wyświetlania zawartości; bardzo długi tekst jest jawnie skracany.')
+                self.note.setToolTip(page['scope']+'\nOdczyt: '+page['read_at']+('\nBrak potwierdzonego klucza unikalnego: kolejność remisów może się zmieniać.' if not page['stable_order'] else '')+'\nDwuklik pobiera zawartość BLOB/LOB lub pełny tekst wskazanej komórki. Dużą wartość można zapisać w całości do pliku.')
             def failed(text):
                 if self._closed or revision!=self._revision:return
                 self._busy=False;self._valid=False;self.controls();self.failure.setText(text);self.failure.show();self.note.setText('Odczyt nieudany. Widoczne wcześniej dane nie zostały zastąpione nowym wynikiem.')
@@ -12039,8 +13237,12 @@ def native_ui_types():
             r=0 if index.row()==0 else self.model._page.get('offset',0)+index.row()
             self.address.setText(sheet_address(r,index.column()));self.value.setText(str(self.model.data(index) or ''));self.value.setCursorPosition(0)
         def full_cell(self,index):
-            if not index.isValid():return
-            d=QW.QDialog(self);d.setWindowTitle('Zawartość komórki · tylko odczyt');v=QW.QVBoxLayout(d);text=QW.QPlainTextEdit();text.setReadOnly(True);text.setPlainText(str(self.model.data(index) or ''));v.addWidget(text);v.addWidget(button('Zamknij',d.accept));limited_dialog_size(d,720,420);d.exec()
+            if not self._valid or not index.isValid() or not 0<=index.row()<self.model.rowCount() or not 0<=index.column()<self.model.columnCount():return
+            dialog=DatabaseCellDialog(self,index);self._cell_dialogs.add(dialog);dialog.open();return dialog
+        def close_cell_dialogs(self):
+            for dialog in list(self._cell_dialogs):
+                if qt_object_alive(dialog):dialog.reject()
+            self._cell_dialogs.clear()
         def cell_menu(self,pos):
             menu=QW.QMenu(self);menu.addAction('Kopiuj zaznaczenie',lambda:self._host_window.guard(self.copy_cells))
             menu.addAction('Pełna zawartość',lambda:self.full_cell(self.grid.indexAt(pos)));menu.exec(self.grid.viewport().mapToGlobal(pos))
@@ -12061,12 +13263,13 @@ def native_ui_types():
             for col,column in enumerate(page['columns']):sheet['cells'][sheet_address(0,col)]={'v':pack(column.get('label',column['name'])),'format':{'bold':True}}
             for row,values in enumerate(page['rows'],1):
                 for col,value in enumerate(values):
-                    if value is not None:sheet['cells'][sheet_address(row,col)]={'v':clone(value)}
+                    if value is not None:sheet['cells'][sheet_address(row,col)]={'v':{key:clone(value[key]) for key in ('t','v')}}
             self._host_window.show_sheet_book(sheet_validate_book(book),register=True);self._host_window.service.checkpoint()
         def cancel(self):
+            self.close_cell_dialogs()
             self._revision+=1;self._explorer.queue.cancel_owner(self);self._busy=False;self._valid=False;self.controls()
             self.note.setText('Anulowano odczyt. Poprzednia strona nie jest nowym wynikiem.')
-        def dispose(self):self._closed=True;self._revision+=1;self._explorer.queue.cancel_owner(self)
+        def dispose(self):self.close_cell_dialogs();self._closed=True;self._revision+=1;self._explorer.queue.cancel_owner(self)
 
     class DatabaseJoinDialog(FormDialog):
         """Only used for ambiguous paths or an explicit edit of a join plan."""
@@ -13141,6 +14344,7 @@ def native_ui_types():
             self.action('info','O programie',self.about)
             self.action('author','O autorze',self.show_author)
             self.action('technologies','Technologie i licencje…',self.show_technologies)
+            self.action('excel_session','Excel: makra i PDF…',self.show_excel_session)
             self.action('recover','Odzyskaj kopię roboczą…',self.recover)
             self.action('reset_layout','Przywróć układ paneli',self.reset_layout)
             self.action('new_book','Nowy skoroszyt',self.new_sheet_book,'Ctrl+Alt+N')
@@ -13219,7 +14423,7 @@ def native_ui_types():
             menus={'Plik':['new_book','new','open','save','save_as',None,'export','recover',None,'quit'],
                 'Edycja':['undo','redo','sheet_format',None,'rename','duplicate','delete_analysis'],
                 'Dane':['source','import','analysis','sql','sheet_pivot','sheet_chart'],'Analiza':['run','preview','cancel'],
-                'Narzędzia':['settings'],'Pomoc':['demo','author','technologies','info']}
+                'Narzędzia':['settings','excel_session'],'Pomoc':['demo','author','technologies','info']}
             for title,keys in menus.items():
                 menu=root.addMenu(title)
                 for key in keys:
@@ -13781,7 +14985,7 @@ def native_ui_types():
             try:
                 dialog=WorkbookDialog(self,source,[sheet_id])
                 dialog.ok.setText('Przygotuj arkusze')
-                dialog.scope_note.setText('Przygotowanie korzysta z zapisanej kopii XLSX. Starsze migawki i istniejące analizy pozostają bez zmian.')
+                dialog.scope_note.setText('Przygotowanie korzysta z zapisanej kopii skoroszytu. Starsze migawki i istniejące analizy pozostają bez zmian.')
                 try:
                     if dialog.exec()!=QW.QDialog.DialogCode.Accepted:return
                     selections=dialog.value['selections']
@@ -13805,7 +15009,7 @@ def native_ui_types():
             source=self.service.source(source_id)
             if not self.authorize(source):return
             origin=source['options'].get('origin','')
-            path,_=QW.QFileDialog.getOpenFileName(self,'Nowa wersja tego skoroszytu',origin,'Skoroszyt Excel (*.xlsx)')
+            path,_=QW.QFileDialog.getOpenFileName(self,'Nowa wersja tego skoroszytu',origin,'Skoroszyt Excel (*.xlsx *.xlsm)')
             if not path:return
             self._file_intake_active=True;self.update_actions()
             try:self.open_workbook(path,source_id)
@@ -13814,7 +15018,7 @@ def native_ui_types():
             if self.project_busy or self._file_intake_active:return
             source=self.service.source(source_id)
             if not self.authorize(source):return
-            path,_=QW.QFileDialog.getOpenFileName(self,'Połącz identyczny oryginał XLSX',source['options'].get('origin',''),'Skoroszyt Excel (*.xlsx)')
+            path,_=QW.QFileDialog.getOpenFileName(self,'Połącz identyczny oryginał skoroszytu',source['options'].get('origin',''),'Skoroszyt Excel (*.xlsx *.xlsm)')
             if not path:return
             self._file_intake_active=True;self.update_actions()
             try:
@@ -13865,7 +15069,7 @@ def native_ui_types():
                     if item['kind']=='sqlite':
                         if not self.open_local_sqlite(item['path']):break
                         continue
-                    if Path(item['path']).suffix.lower()=='.xlsx':
+                    if Path(item['path']).suffix.lower() in WORKBOOK_SUFFIXES:
                         if not self.open_sheet_file(item['path']):break
                         continue
                     if Path(item['path']).suffix.lower() in ('.csv','.tsv','.txt'):
@@ -14015,7 +15219,7 @@ def native_ui_types():
             if include:
                 dialog=FormDialog('Co zapisać w projekcie?',self)
                 data=QW.QCheckBox('Dołącz przygotowane dane i migawki używane przez analizy');data.setChecked(True)
-                originals=QW.QCheckBox('Dołącz także całe oryginalne skoroszyty XLSX (również inne i ukryte arkusze)')
+                originals=QW.QCheckBox('Dołącz także całe oryginalne skoroszyty XLSX/XLSM (również makra, inne i ukryte arkusze)')
                 originals.setChecked(False);originals.setVisible(any(s['kind']=='xlsx' for s in self.service.document['sources']))
                 data.toggled.connect(lambda value:originals.setEnabled(value))
                 dialog.form.addRow(data);dialog.form.addRow(originals)
@@ -14100,15 +15304,21 @@ def native_ui_types():
             dialog=TechnologiesDialog(self)
             try:dialog.exec()
             finally:dialog.dispose();dialog.deleteLater()
+        def show_excel_session(self):
+            dialog=getattr(self,'_excel_session_dialog',None)
+            if dialog is not None and qt_object_alive(dialog):dialog.show();dialog.raise_();dialog.activateWindow();return
+            origin=(self.sheet_workspace.session.book.get('origin','') if self.sheet_workspace.session else '')
+            path=origin if Path(origin).suffix.lower() in WORKBOOK_SUFFIXES else ''
+            dialog=ExcelSessionDialog(self,path);self._excel_session_dialog=dialog;dialog.show()
         def about(self):
             dialog=QW.QDialog(self); dialog.setWindowTitle('Pivot Studio — informacje'); lay=QW.QVBoxLayout(dialog)
             lay.addWidget(label(f'Pivot Studio {APP_VERSION} · natywny interfejs PySide6',False,True))
             text=QW.QPlainTextEdit(); text.setReadOnly(True)
             text.setPlainText('Jeden plik .py. Brak HTML, WebEngine i lokalnego serwera.\n\n'+
-                'Obsługa: upuść XLSX, CSV, SQLite lub .pivot na okno; przycisk Importuj uruchamia tę samą ścieżkę. Dwuklik tabeli otwiera dane; analizę tworzysz osobnym poleceniem; przeciągaj pola lub użyj „Dodaj do…”. Dwuklik pozycji układu edytuje ustawienia. F5 przelicza pivot, Ctrl+Enter pobiera podgląd. '+
+                'Obsługa: upuść XLSX, XLSM, CSV, SQLite lub .pivot na okno; przycisk Importuj uruchamia tę samą ścieżkę. Dwuklik tabeli otwiera dane; analizę tworzysz osobnym poleceniem; przeciągaj pola lub użyj „Dodaj do…”. Dwuklik pozycji układu edytuje ustawienia. F5 przelicza pivot, Ctrl+Enter pobiera podgląd. '+
                 'Ctrl+C kopiuje wartości, Ctrl+Shift+C także nagłówki. Dwuklik wartości pivota otwiera rekordy źródłowe.\n\n'+
                 'Podgląd: maks. 1000 rekordów. Pivot: pełna agregacja albo błąd limitu. Eksport XLSX: statyczny wynik. '+
-                'Lokalne arkusze: edycja, formuły, formaty, zakresy A1 i zakładki. Źródła baz pozostają tylko do odczytu. Brak pełnej zgodności z Excelem/makrami. Brak łączenia różnych baz w jednej analizie.\n\n'+THIRD_PARTY+'\n'+LICENSE)
+                'Lokalne arkusze: edycja, formuły, formaty, zakresy A1 i zakładki. Źródła baz pozostają tylko do odczytu. Brak pełnej zgodności z Excelem/makrami. Narzędzia → Excel: makra i PDF uruchamia osobną sesję zainstalowanego Microsoft Excel. Brak łączenia różnych baz w jednej analizie.\n\n'+THIRD_PARTY+'\n'+LICENSE)
             lay.addWidget(text,1); lay.addWidget(button('Zamknij',dialog.accept)); limited_dialog_size(dialog,780,630); dialog.exec()
         def stop_catalog_background(self):
             self.database_explorer.pause_hydration();self.database_explorer.cancel_structure_refresh();self.database_explorer.cancel_catalog_sync()
@@ -14140,6 +15350,17 @@ def native_ui_types():
                     def retry_close(): self.close_pending=False; self.close()
                     QC.QTimer.singleShot(150,self,retry_close)
                 event.ignore(); return
+            excel=getattr(self,'_excel_session_dialog',None)
+            if excel is not None and qt_object_alive(excel) and not excel._disposed:
+                excel.close()
+                if not excel._disposed:
+                    if excel._closing:
+                        self.statusBar().showMessage('Kończenie własnej sesji Excela…',5000)
+                        if not getattr(self,'_excel_close_pending',False):
+                            self._excel_close_pending=True
+                            def retry_excel_close():self._excel_close_pending=False;self.close()
+                            QC.QTimer.singleShot(150,self,retry_excel_close)
+                    event.ignore();return
             try:
                 if not self._restart_confirmed and not self.prompt_unsaved(): event.ignore(); return
                 self.service.call('quit',{'discard':True})
@@ -14193,10 +15414,12 @@ def native_ui_types():
             if existing:
                 self.show_sheet_book(existing);self.statusBar().showMessage('Otwarto lokalną kopię roboczą tego skoroszytu. Oryginał nie został ponownie zaimportowany.',8000);return True
             if len(self.service.document.get('workpads',[]))>=12:raise UserError('Limit 12 skoroszytów w projekcie.')
-            book=self.blocking_io(lambda:sheet_read_xlsx(original) if Path(original).suffix.lower()=='.xlsx' else sheet_read_csv(original),'Otwieranie skoroszytu · komórki i arkusze')
+            book=self.blocking_io(lambda:sheet_read_xlsx(original) if Path(original).suffix.lower() in WORKBOOK_SUFFIXES else sheet_read_csv(original),'Otwieranie skoroszytu · komórki i arkusze')
             if book is None:return False
             self.show_sheet_book(book,register=True);self.service.checkpoint()
-            self.statusBar().showMessage('Otworzono '+str(len(book['sheets']))+' arkuszy. Edytujesz lokalną kopię; oryginał pozostaje bez zmian.'+(' W menu skoroszytu dostępne są ograniczenia zgodności.' if book['warnings'] else ''),12000)
+            self.statusBar().showMessage('Otworzono '+str(len(book['sheets']))+' arkuszy. Edytujesz lokalną kopię; oryginał pozostaje bez zmian.'+
+                (' '+XLSM_DATA_NOTICE if Path(original).suffix.lower()=='.xlsm' else '')+
+                (' W menu skoroszytu dostępne są ograniczenia zgodności.' if book['warnings'] else ''),18000)
             return True
 
 
@@ -14353,7 +15576,7 @@ def native_ui_types():
 
     _NATIVE_TYPES={'AboutAuthorDialog':AboutAuthorDialog,'GoldenLogoWidget':GoldenLogoWidget,'AuthorTitleBar':AuthorTitleBar,'qt_object_alive':qt_object_alive,'SheetInteraction':SheetInteraction,'SheetInput':SheetInput,'TechnologiesDialog':TechnologiesDialog,'TechnologyTableModel':TechnologyTableModel,'DatabaseJoinPage':DatabaseJoinPage,'DatabaseJoinDialog':DatabaseJoinDialog,'DatabaseNode':DatabaseNode,'DatabaseExplorer':DatabaseExplorer,'DatabaseDataModel':DatabaseDataModel,'DatabaseRecordsModel':DatabaseRecordsModel,'DatabaseGraph':DatabaseGraph,'DatabaseTaskQueue':DatabaseTaskQueue,'SheetModel':SheetModel,'SheetGrid':SheetGrid,'SheetWorkspace':SheetWorkspace,'SheetViews':SheetViews,'SheetFormatDialog':SheetFormatDialog,'MainWindow':MainWindow,'ResultTableModel':ResultTableModel,'ResultGrid':ResultGrid,'ResultPane':ResultPane,
                    'PivotBuilder':PivotBuilder,'SourceDialog':SourceDialog,'FilterDialog':FilterDialog,'MeasureDialog':MeasureDialog,
-                   'DimensionDialog':DimensionDialog,'ImportDialog':ImportDialog,'WorkbookDialog':WorkbookDialog,'SourceBrowser':SourceBrowser,'DatasetDialog':DatasetDialog,
+                   'DimensionDialog':DimensionDialog,'ImportDialog':ImportDialog,'WorkbookDialog':WorkbookDialog,'SourceBrowser':SourceBrowser,'DatasetDialog':DatasetDialog,'ExcelSessionDialog':ExcelSessionDialog,
                    'SettingsDialog':SettingsDialog,'FormDialog':FormDialog,'TitleBar':TitleBar,'WelcomePage':WelcomePage,'WrappedHeading':WrappedHeading,
                    'DependencyCoordinator':DependencyCoordinator,'DependencyCard':DependencyCard,'QtFailure':QtFailure,
                    'CalculationsDialog':CalculationsDialog,'EdgeController':EdgeController,'AsyncTasks':AsyncTasks,'JobWatcher':JobWatcher,'configure_app':configure_app,
@@ -14939,6 +16162,315 @@ def workbook_test_suite():
             ProjectStore.save(path,loaded,before)
             backups=list(self.root.glob('*.przed-v'+str(PROJECT_VERSION)+'-*.pivot'));self.assertEqual(len(backups),1);self.assertEqual(file_digest(backups[0]),before)
     return unittest.defaultTestLoader.loadTestsFromTestCase(WorkbookTests)
+
+
+def create_intake_test_xlsm(path,formula='1+122',cached=True):
+    """Synthetic OOXML container; its VBA part is inert bytes, never executable VBA."""
+    book=sheet_new_book('Macro data');sheet=book['sheets'][0];sheet['name']='Dane'
+    sheet['cells']={'A1':sheet_cell_input('Amount'),'A2':sheet_cell_input(123)}
+    with tempfile.TemporaryDirectory() as folder:
+        plain=Path(folder)/'plain.xlsx';sheet_export_xlsx(book,plain)
+        with zipfile.ZipFile(plain) as archive:parts={name:archive.read(name) for name in archive.namelist()}
+    parts['[Content_Types].xml']=parts['[Content_Types].xml'].replace(
+        b'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml',
+        b'application/vnd.ms-excel.sheet.macroEnabled.main+xml').replace(b'</Types>',
+        b'<Override PartName="/xl/vbaProject.bin" ContentType="application/vnd.ms-office.vbaProject"/></Types>')
+    parts['xl/_rels/workbook.xml.rels']=parts['xl/_rels/workbook.xml.rels'].replace(b'</Relationships>',
+        b'<Relationship Id="rMacro" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>')
+    parts['xl/vbaProject.bin']=b'INERT TEST MARKER: VBA MUST NEVER BE LOADED OR EXECUTED'
+    tree=ET.fromstring(parts['xl/worksheets/sheet1.xml']);cell=tree.find('.//s:c[@r="A2"]',XNS)
+    ET.SubElement(cell,'{'+SHEET_NS+'}f').text=formula
+    if not cached:cell.remove(cell.find('s:v',XNS))
+    parts['xl/worksheets/sheet1.xml']=ET.tostring(tree,encoding='utf-8')
+    with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as archive:
+        for name,data in parts.items():archive.writestr(name,data)
+    return Path(path)
+
+
+def xlsm_intake_test_suite():
+    import unittest
+    from unittest.mock import patch
+    class XlsmIntakeTests(unittest.TestCase):
+        def setUp(self):
+            self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
+            self.path=create_intake_test_xlsm(self.root/'source.XLSM');self.before=file_digest(self.path)
+        def test_intake_inspection_and_import_use_saved_formula_values(self):
+            self.assertEqual(incoming_file_plan([self.path])[0]['kind'],'tabular')
+            info=inspect_local_file(self.path);self.assertEqual(info['file_format'],'xlsm');self.assertIn('nie są uruchamiane',info['notice'])
+            preview=import_preview(self.path,{'sheet':'Dane'});self.assertEqual([[unpack(v) for v in row] for row in preview['sample']],[['123']])
+            target=self.root/'data.sqlite';import_file(self.path,{'sheet':'Dane'},preview['columns'],target,threading.Event(),lambda _:None)
+            with test_sqlite_connection(target) as db:self.assertEqual(db.execute('SELECT Amount FROM dane').fetchall(),[(123,)])
+            self.assertEqual(file_digest(self.path),self.before)
+        def test_macro_part_is_not_opened_and_no_program_is_launched(self):
+            real_open=zipfile.ZipFile.open
+            def checked_open(archive,name,*args,**kwargs):
+                filename=name.filename if isinstance(name,zipfile.ZipInfo) else str(name)
+                self.assertNotIn('vbaProject',filename);return real_open(archive,name,*args,**kwargs)
+            with patch.object(zipfile.ZipFile,'open',checked_open),patch.object(subprocess,'Popen',side_effect=AssertionError('program launch')):
+                info=inspect_local_file(self.path);book=sheet_read_xlsx(self.path);rows=list(import_rows(self.path,{'sheet':'Dane'}))
+            self.assertEqual(info['sheets'][0]['name'],'Dane');self.assertEqual(rows,[['Amount'],['123']])
+            self.assertTrue(any('Makra' in warning and 'nie są uruchamiane' in warning for warning in book['warnings']))
+            self.assertEqual(book['sheets'][0]['cells']['A2']['f'],'=1+122');self.assertEqual(unpack(book['sheets'][0]['cells']['A2']['v']),123)
+        def test_macro_udf_import_uses_cache_without_evaluation_and_missing_cache_fails(self):
+            path=create_intake_test_xlsm(self.root/'udf.xlsm','INERT_MACRO_UDF()')
+            self.assertEqual(list(import_rows(path,{'sheet':'Dane'})),[['Amount'],['123']])
+            book=sheet_read_xlsx(path);self.assertEqual(unpack(book['sheets'][0]['cells']['A2']['v']),123)
+            self.assertIsInstance(SheetCalculator(book).cell(book['sheets'][0]['id'],1,0),SheetError)
+            no_cache=create_intake_test_xlsm(self.root/'no-cache.xlsm','INERT_MACRO_UDF()',False)
+            with self.assertRaises(UserError):list(import_rows(no_cache,{'sheet':'Dane'}))
+        def test_readonly_original_staging_and_project_preserve_exact_macro_container(self):
+            self.path.chmod(0o444);self.addCleanup(lambda:self.path.chmod(0o600))
+            source=workbook_stage(self.path,self.root/'stage')['source']
+            self.assertEqual(source['options']['file_format'],'xlsm');self.assertEqual(Path(source['options']['path']).suffix,'.xlsm')
+            source=workbook_prepare_bundle(source,[{'sheet_id':source['workbook']['sheets'][0]['id']}],self.root/'extract')['source']
+            project=new_project();project['sources']=[source];project_path=self.root/'packed.pivot'
+            ProjectStore.save(project_path,project,include_data=True,include_originals=True,owned_roots=(self.root,))
+            restored,_=ProjectStore.load(project_path,self.root/'restored');saved=restored['sources'][0]
+            self.assertEqual(saved['options']['file_format'],'xlsm');self.assertEqual(Path(saved['options']['path']).suffix,'.xlsm')
+            self.assertEqual(file_digest(verify_workbook_copy(saved)),self.before);self.assertEqual(file_digest(self.path),self.before)
+            with zipfile.ZipFile(saved['options']['path']) as archive:self.assertIn('vbaProject.bin',' '.join(archive.namelist()))
+        def test_project_without_original_keeps_prepared_data_and_format(self):
+            source=workbook_stage(self.path,self.root/'stage')['source']
+            source=workbook_prepare_bundle(source,[{'sheet_id':source['workbook']['sheets'][0]['id']}],self.root/'extract')['source']
+            project=new_project();project['sources']=[source];path=self.root/'data-only.pivot'
+            ProjectStore.save(path,project,include_data=True,include_originals=False,owned_roots=(self.root,))
+            restored,_=ProjectStore.load(path,self.root/'restored');source=restored['sources'][0]
+            self.assertEqual(workbook_file_format(source),'xlsm');self.assertEqual(source['options']['path'],'@not-included')
+            version=source['workbook']['datasets'][0]['versions'][0]
+            with test_sqlite_connection(version['path']) as db:self.assertEqual(db.execute('SELECT Amount FROM dane').fetchall(),[(123,)])
+        def test_xlsx_export_requires_loss_consent_and_never_overwrites_xlsm(self):
+            book=sheet_read_xlsx(self.path);target=self.root/'copy.xlsx'
+            with self.assertRaises(UserError):sheet_export_xlsx(book,self.path,allow_loss=True)
+            with self.assertRaises(UserError):sheet_export_xlsx(book,self.root/'fake.xlsm',allow_loss=True)
+            with self.assertRaises(UserError):sheet_export_xlsx(book,target)
+            self.assertFalse(target.exists());sheet_export_xlsx(book,target,allow_loss=True)
+            with zipfile.ZipFile(target) as archive:self.assertFalse(any('vbaProject' in name for name in archive.namelist()))
+            self.assertEqual(file_digest(self.path),self.before)
+    return unittest.defaultTestLoader.loadTestsFromTestCase(XlsmIntakeTests)
+
+
+def _excel_native_test_host():
+    """Isolated Win32 fixture: owned off-screen windows, no Excel/COM/Qt."""
+    import ctypes as C
+    from ctypes import wintypes as W
+    api=_ExcelNativeWindows();u=api.user
+    u.CreateWindowExW.argtypes=(W.DWORD,W.LPCWSTR,W.LPCWSTR,W.DWORD,C.c_int,C.c_int,C.c_int,C.c_int,W.HWND,W.HMENU,W.HINSTANCE,C.c_void_p);u.CreateWindowExW.restype=W.HWND
+    u.DestroyWindow.argtypes=(W.HWND,);u.DestroyWindow.restype=W.BOOL
+    u.EnableWindow.argtypes=(W.HWND,W.BOOL);u.EnableWindow.restype=W.BOOL
+    u.SetWindowTextW.argtypes=(W.HWND,W.LPCWSTR);u.SetWindowTextW.restype=W.BOOL
+    u.PeekMessageW.argtypes=(C.POINTER(W.MSG),W.HWND,W.UINT,W.UINT,W.UINT);u.PeekMessageW.restype=W.BOOL
+    u.TranslateMessage.argtypes=(C.POINTER(W.MSG),);u.TranslateMessage.restype=W.BOOL
+    u.DispatchMessageW.argtypes=(C.POINTER(W.MSG),);u.DispatchMessageW.restype=C.c_ssize_t
+    setter=getattr(u,'SetWindowLongPtrW',u.SetWindowLongW);setter.argtypes=(W.HWND,C.c_int,C.c_ssize_t);setter.restype=C.c_ssize_t
+    u.CallWindowProcW.argtypes=(C.c_void_p,W.HWND,W.UINT,C.c_size_t,C.c_ssize_t);u.CallWindowProcW.restype=C.c_ssize_t
+    refs=[];roots=[];commands=queue.Queue()
+    def emit(value):print(json.dumps(value,ensure_ascii=True),flush=True)
+    def make(kind,title,style,parent=0,identifier=0):
+        hwnd=u.CreateWindowExW(0x80 if not style & 0x40000000 else 0,kind,title,style,
+            5 if style & 0x40000000 else -32000,5 if style & 0x40000000 else -32000,220,65,parent,identifier,0,None)
+        if not hwnd:raise OSError(C.get_last_error(),'fixture CreateWindowExW')
+        return int(hwnd)
+    try:
+        main=make('STATIC','Owned test main',0);roots.append(main);u.EnableWindow(main,False)
+        other=make('STATIC','Unrelated test main',0);roots.append(other);u.EnableWindow(other,False)
+        dialog=make('#32770','Komunikat testowy',0x90c00000,main);roots.append(dialog)
+        unrelated=make('#32770','Nie ta sesja',0x90c00000,other);roots.append(unrelated)
+        text_hwnd=make('STATIC','Czy przerwać generowanie? Zażółć gęślą jaźń.',0x50000000,dialog,101)
+        button=make('BUTTON','&Nie',0x50000000,dialog,7);make('BUTTON','Przerwij',0x50000000,dialog,3)
+        proc_type=C.WINFUNCTYPE(C.c_ssize_t,W.HWND,W.UINT,C.c_size_t,C.c_ssize_t);old=0
+        def button_proc(hwnd,message,wparam,lparam):
+            if message==0x00f5:emit({'event':'click','hwnd':int(hwnd)});return 0
+            return u.CallWindowProcW(old,hwnd,message,wparam,lparam)
+        callback=proc_type(button_proc);refs.append(callback);old=setter(button,-4,C.cast(callback,C.c_void_p).value)
+        if not old:raise OSError(C.get_last_error(),'fixture subclass')
+        def reader():
+            for line in sys.stdin:
+                try:commands.put(json.loads(line))
+                except ValueError:pass
+            commands.put({'op':'quit'})
+        threading.Thread(target=reader,daemon=True).start()
+        emit({'event':'ready','pid':os.getpid(),'main':main,'dialog':dialog,'other':unrelated,'text':text_hwnd,'button':button})
+        running=True;message=W.MSG()
+        while running:
+            while u.PeekMessageW(C.byref(message),None,0,0,1):u.TranslateMessage(C.byref(message));u.DispatchMessageW(C.byref(message))
+            try:command=commands.get(timeout=.005)
+            except queue.Empty:continue
+            op=command.get('op')
+            if op=='quit':running=False
+            elif op=='text':u.SetWindowTextW(text_hwnd,str(command['text']));emit({'event':'ack','op':op})
+            elif op=='disable':u.EnableWindow(button,False);emit({'event':'ack','op':op})
+            elif op=='close':u.DestroyWindow(dialog);emit({'event':'ack','op':op})
+            elif op=='hang':emit({'event':'ack','op':op});time.sleep(2)
+    finally:
+        for hwnd in reversed(roots):
+            if u.IsWindow(hwnd):u.DestroyWindow(hwnd)
+
+
+def excel_native_dialog_test_suite():
+    import unittest
+    from unittest.mock import patch
+    class FakeWindows:
+        def __init__(self):
+            self.nodes={100:dict(pid=20,root=100,owner=0,cls='XLMAIN',enabled=False,visible=True,text='Excel'),
+                200:dict(pid=20,root=200,owner=100,cls='#32770',enabled=True,visible=True,text='Message'),
+                201:dict(pid=20,root=200,owner=0,parent=200,cls='Static',enabled=True,visible=True,text='Czy przerwać generowanie?'),
+                202:dict(pid=20,root=200,owner=0,parent=200,cls='Button',enabled=True,visible=True,text='&Nie',id=7),
+                203:dict(pid=20,root=200,owner=0,parent=200,cls='Button',enabled=True,visible=True,text='Przerwij',id=3)}
+            self.clicked=[];self.after_activate=lambda:None;self.incomplete=False
+        def pid(self,h):return self.nodes.get(h,{}).get('pid',0)
+        def root(self,h):return self.nodes.get(h,{}).get('root',0)
+        def owner(self,h):return self.nodes.get(h,{}).get('owner',0)
+        def visible(self,h):return self.nodes.get(h,{}).get('visible',False)
+        def enabled(self,h):return self.nodes.get(h,{}).get('enabled',False)
+        def class_name(self,h):return self.nodes.get(h,{}).get('cls','')
+        def child(self,p,h):return self.nodes.get(h,{}).get('parent')==p
+        def style(self,h):return self.nodes.get(h,{}).get('style',0)
+        def control_id(self,h):return self.nodes.get(h,{}).get('id',0)
+        def text(self,h,deadline,limit=4096):return self.nodes[h]['text'],not self.incomplete
+        def checked(self,h,deadline):return 0
+        def windows(self,parent=0,deadline=None,limit=1024):return ([h for h,v in self.nodes.items() if v.get('parent')==parent] if parent else [h for h,v in self.nodes.items() if v['root']==h]),True
+        def activate(self,h):self.after_activate()
+        def click(self,h):self.clicked.append(h);return True
+    class NativeDialogTests(unittest.TestCase):
+        def fake(self):
+            api=FakeWindows();mock=patch(__name__+'._ExcelNativeWindows',return_value=api);mock.start();self.addCleanup(mock.stop);return api
+        def snapshot(self,api):return _excel_native_snapshot(api,20,100,200,time.monotonic()+1)
+        def test_snapshot_and_explicit_click_are_scoped_to_verified_native_button(self):
+            api=self.fake();snapshot=self.snapshot(api);self.assertEqual(snapshot['text'],'Czy przerwać generowanie?');self.assertTrue(snapshot['complete'])
+            self.assertEqual(excel_native_dialog_skip_button(snapshot)['hwnd'],202)
+            result=excel_native_dialog_action(20,100,snapshot,202);self.assertTrue(result['sent']);self.assertEqual(api.clicked,[202])
+        def test_changed_text_pid_owner_button_state_or_removed_window_never_clicks(self):
+            for change in ('text','pid','owner','disabled','hidden','deleted','button_pid','button_id'):
+                with self.subTest(change=change):
+                    api=FakeWindows();snapshot=self.snapshot(api)
+                    if change=='text':api.nodes[201]['text']='Czy usunąć dane?'
+                    elif change=='pid':api.nodes[200]['pid']=30
+                    elif change=='owner':api.nodes[200]['owner']=0
+                    elif change=='disabled':api.nodes[202]['enabled']=False
+                    elif change=='hidden':api.nodes[202]['visible']=False
+                    elif change=='deleted':del api.nodes[200]
+                    elif change=='button_pid':api.nodes[202]['pid']=30
+                    elif change=='button_id':api.nodes[202]['id']=6
+                    with patch(__name__+'._ExcelNativeWindows',return_value=api),self.assertRaises(UserError):excel_native_dialog_action(20,100,snapshot,202)
+                    self.assertEqual(api.clicked,[])
+        def test_wrong_main_snapshot_button_or_incomplete_text_never_clicks(self):
+            api=self.fake();snapshot=self.snapshot(api)
+            for pid,main,button,value in [(21,100,202,snapshot),(20,101,202,snapshot),(20,100,201,snapshot),(20,100,202,dict(snapshot,complete=False))]:
+                with self.assertRaises(UserError):excel_native_dialog_action(pid,main,value,button)
+            api.incomplete=True
+            with self.assertRaises(UserError):excel_native_dialog_action(20,100,snapshot,202)
+            self.assertEqual(api.clicked,[])
+        def test_activation_cannot_click_prompt_that_changed_during_focus(self):
+            api=self.fake();snapshot=self.snapshot(api);api.after_activate=lambda:api.nodes[201].update(text='Different prompt')
+            with self.assertRaises(UserError):excel_native_dialog_action(20,100,snapshot,202)
+            self.assertEqual(api.clicked,[])
+        def test_modeless_unowned_or_foreign_dialog_is_not_a_session_prompt(self):
+            for changes in ({'owner':0},{'pid':99},{'cls':'custom'},{'visible':False}):
+                api=FakeWindows();api.nodes[200].update(changes);self.assertIsNone(self.snapshot(api))
+            api=FakeWindows();api.nodes[100]['enabled']=True;self.assertIsNone(self.snapshot(api))
+        def test_another_excel_sdi_window_is_allowed_only_inside_same_owned_process(self):
+            api=self.fake();api.nodes[300]=dict(api.nodes[100],root=300);api.nodes[200]['owner']=300
+            snapshot=self.snapshot(api);self.assertIsNotNone(snapshot);self.assertEqual(snapshot['owner'],300)
+            api.nodes[300]['pid']=99;self.assertIsNone(self.snapshot(api))
+        def test_skip_suggestion_never_equates_arbitrary_no_ok_or_yes_with_ignore(self):
+            api=self.fake();snapshot=self.snapshot(api)
+            for prompt in ('Czy usunąć plik?','Czy nie przerwać sprawdzania?','Continue?',''):
+                self.assertIsNone(excel_native_dialog_skip_button(dict(snapshot,text=prompt)))
+            for text in ('&Tak','OK','Yes','Ignore all security rules'):
+                self.assertIsNone(excel_native_dialog_skip_button(dict(snapshot,buttons=[dict(snapshot['buttons'][0],text=text)])))
+            for text in ('&Ignoruj','&Ignore'):
+                self.assertEqual(excel_native_dialog_skip_button(dict(snapshot,text='',buttons=[dict(snapshot['buttons'][0],text=text)]))['hwnd'],202)
+        def test_password_control_is_not_read_or_exposed(self):
+            api=self.fake();api.nodes[204]=dict(api.nodes[201],cls='Edit',style=0x20,text='secret-never-read')
+            snapshot=self.snapshot(api);self.assertNotIn('secret-never-read',dumps(snapshot));self.assertIn('treść ukryta',snapshot['text'])
+    @unittest.skipUnless(os.name=='nt','Native Win32 test requires Windows')
+    class NativeProcessTests(unittest.TestCase):
+        def setUp(self):
+            self.events=queue.Queue();self.process=subprocess.Popen([sys.executable,'-B','-u','-c','import PivotStudio as p; p._excel_native_test_host()'],
+                cwd=Path(__file__).resolve().parent,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+            self.addCleanup(self.cleanup_process)
+            def reader():
+                for line in self.process.stdout:
+                    try:self.events.put(json.loads(line))
+                    except ValueError:self.events.put({'event':'bad','text':line})
+            self.reader=threading.Thread(target=reader,daemon=True);self.reader.start();self.ready=self.event('ready')
+        def event(self,kind,timeout=5):
+            deadline=time.monotonic()+timeout
+            while time.monotonic()<deadline:
+                try:value=self.events.get(timeout=max(.01,deadline-time.monotonic()))
+                except queue.Empty:break
+                if value.get('event')==kind:return value
+            if self.process.poll() is not None:self.fail('Native fixture exited: '+self.process.stderr.read())
+            self.fail('Native fixture timeout: '+kind)
+        def command(self,op,**kwargs):
+            self.process.stdin.write(dumps(dict(op=op,**kwargs))+'\n');self.process.stdin.flush()
+            if op!='quit':self.event('ack')
+        def cleanup_process(self):
+            if self.process.poll() is None:
+                with contextlib.suppress(OSError,ValueError):self.command('quit')
+                try:self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:self.process.terminate();self.process.wait(timeout=3)
+            for stream in (self.process.stdin,self.process.stdout,self.process.stderr):
+                with contextlib.suppress(Exception):stream.close()
+        def dialogs(self):return excel_native_dialogs(self.ready['pid'],self.ready['main'])
+        def test_cross_process_text_and_click_with_same_pid_unrelated_window_excluded(self):
+            values=self.dialogs();self.assertEqual([v['hwnd'] for v in values],[self.ready['dialog']]);snapshot=values[0]
+            self.assertIn('Zażółć gęślą jaźń',snapshot['text']);self.assertTrue(snapshot['complete']);self.assertEqual(excel_native_dialog_skip_button(snapshot)['text'],'&Nie')
+            self.assertEqual(excel_native_dialogs(os.getpid(),self.ready['main']),[])
+            # Off-screen fixture must not steal desktop focus. Verify the actual
+            # queued BM_CLICK at its receiving WndProc in the other process.
+            with patch.object(_ExcelNativeWindows,'activate',lambda *args:None):value=excel_native_dialog_action(self.ready['pid'],self.ready['main'],snapshot,self.ready['button'])
+            self.assertTrue(value['sent']);self.assertEqual(self.event('click')['hwnd'],self.ready['button'])
+        def test_cross_process_changed_and_destroyed_dialog_are_rejected(self):
+            snapshot=self.dialogs()[0];self.command('text',text='Changed warning')
+            with self.assertRaises(UserError):excel_native_dialog_action(self.ready['pid'],self.ready['main'],snapshot,self.ready['button'])
+            fresh=self.dialogs()[0];self.command('disable')
+            with self.assertRaises(UserError):excel_native_dialog_action(self.ready['pid'],self.ready['main'],fresh,self.ready['button'])
+            self.command('close');self.assertEqual(self.dialogs(),[])
+        def test_hung_foreign_window_read_has_deadline_and_never_clicks(self):
+            self.command('hang');started=time.monotonic();values=self.dialogs();elapsed=time.monotonic()-started
+            self.assertLess(elapsed,1.5);self.assertTrue(all(not value['complete'] for value in values))
+            for value in values:
+                with self.assertRaises(UserError):excel_native_dialog_action(self.ready['pid'],self.ready['main'],value,self.ready['button'])
+    return unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(NativeDialogTests),unittest.defaultTestLoader.loadTestsFromTestCase(NativeProcessTests)])
+
+
+def database_cell_service_test_suite():
+    import unittest
+    from unittest.mock import patch
+    class DatabaseCellServiceTests(unittest.TestCase):
+        def setUp(self):
+            self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
+            self.service=ApplicationService(self.root/'private');self.addCleanup(self.service.close)
+            self.path=self.root/'source.sqlite';self.path.touch()
+            self.source=validate_source({'kind':'sqlite','options':{'path':str(self.path)}})
+            self.service.document['sources']=[self.source]
+        def test_cell_actions_require_trust_and_keep_source_generation_guard(self):
+            payload={'source_id':self.source['id'],'row_token':{},'object_id':'obj','column':'large'}
+            with self.assertRaisesRegex(UserError,'Potwierdź'):self.service.call('database_cell',payload)
+            self.service.trusted.add(digest(self.source));calls=[]
+            def submit(operation,args,*rest):
+                calls.append((operation,args));jid=uid();self.service.hub.jobs[jid]={'id':jid,'operation':operation,'status':'done','source_id':self.source['id'],'value':{}};return jid
+            with patch.object(self.service.hub,'submit',side_effect=submit):
+                response=self.service.call('database_cell',payload);job=self.service.hub.jobs[response['job_id']]
+                self.assertEqual(job['source_fingerprint'],source_data_fingerprint(self.source));self.assertEqual(job['generation'],self.service.generation)
+                self.service.generation+=1;self.service.finalize(response['job_id']);self.assertEqual(job['status'],'cancelled')
+                dest=self.root/'cell.bin';self.service.call('database_cell_export',dict(payload,destination=str(dest)))
+            self.assertEqual(calls[-1][0],'database_cell_export');self.assertEqual(calls[-1][1]['destination'],str(dest.resolve()))
+        def test_export_refuses_known_originals_project_private_storage_and_h2_files(self):
+            service=self.service;service.project_path=str(self.root/'current.pivot')
+            workbook=workbook_stage(create_intake_test_xlsm(self.root/'original.xlsm'),self.root/'stage')['source'];service.document['sources'].append(workbook)
+            book=sheet_new_book();book['origin']=str(self.root/'workpad.csv');service.document['workpads']=[book]
+            service.document['sources'].append(validate_source({'kind':'h2','options':{'mode':'file','path':str(self.root/'h2db')}}))
+            blocked=[self.path,service.project_path,Path(__file__),self.root/'original.xlsm',workbook['options']['path'],book['origin'],
+                     self.root/'h2db.mv.db',service.root/'metadata-v1.sqlite',service.session/'result.bin']
+            for path in blocked:
+                with self.subTest(path=str(path)),self.assertRaises(UserError):service.cell_export_destination(str(path))
+            allowed=self.root/'cell.txt';allowed.write_text('previous','utf-8');self.assertEqual(service.cell_export_destination(str(allowed)),str(allowed.resolve()))
+        def test_export_refuses_empty_directory_and_missing_parent(self):
+            for path in ('',str(self.root),str(self.root/'missing'/'file.bin')):
+                with self.subTest(path=path),self.assertRaises(UserError):self.service.cell_export_destination(path)
+    return unittest.defaultTestLoader.loadTestsFromTestCase(DatabaseCellServiceTests)
 
 
 def sheet_test_suite():
@@ -15805,6 +17337,341 @@ def oracle_catalog_test_suite():
     return unittest.defaultTestLoader.loadTestsFromTestCase(OracleCatalogTests)
 
 
+def excel_session_test_suite():
+    import unittest
+    from unittest.mock import patch
+    fake_processor=r'''
+import json,sys,time,shutil
+sys.stdin.reconfigure(encoding='utf-8');sys.stdout.reconfigure(encoding='utf-8')
+def send(event,**kw):
+ print(json.dumps(dict(kw,event=event,session_id=session),ensure_ascii=True),flush=True)
+request=json.loads(sys.stdin.readline());session=request['session_id'];original=request['path']
+send('created',id=request['id'],pid=424242,hwnd=848484)
+attach=json.loads(sys.stdin.readline())
+if attach['action']!='attach':send('closed');raise SystemExit()
+send('ready',id=request['id'],result={'active_sheet':'Raport','workbook_name':'copy.xlsm'})
+for line in sys.stdin:
+ command=json.loads(line);action=command['action']
+ if action=='close':break
+ send('busy',id=command['id'],operation=action)
+ if action=='run_macro' and command['name']=='Wait':time.sleep(30)
+ if action=='run_macro' and command['name']=='Fail':send('error',id=command['id'],operation=action,message='synthetic macro failure');continue
+ if action=='export_pdf':
+  with open(command['temp_path'],'wb') as f:f.write(b'%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n')
+ if action=='save_copy':shutil.copyfile(original,command['temp_path'])
+ send('done',id=command['id'],operation=action,result={'active_sheet':'Raport','workbook_name':'copy.xlsm'})
+send('closed')
+'''
+    class ExcelSessionTests(unittest.TestCase):
+        def setUp(self):
+            self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name);self.original=self.root/"Dane 'żółć'.xlsm";self.private=self.root/'private'
+            self.workbook(self.original);self.before=self.original.read_bytes();self.controllers=[];self.handles=[];self.launches=[]
+            class Owned:
+                def __init__(inner,pid,hwnd,previous):
+                    if pid in previous:raise UserError('Existing Excel must not be owned.')
+                    inner.pid=pid;inner.hwnd=hwnd;inner.running=True;inner.terminations=0;self.handles.append(inner)
+                def alive(inner):return inner.running
+                def terminate(inner):inner.terminations+=1;inner.running=False
+                def close(inner):inner.running=False
+            original_popen=subprocess.Popen;self.original_popen=original_popen
+            def launch(command,**kwargs):self.launches.append(command);return original_popen([sys.executable,'-u','-c',fake_processor],**kwargs)
+            for target,replacement in [('excel_availability',lambda:{'available':True,'powershell':'synthetic'}),('excel_process_ids',lambda:{7,8}),('ExcelOwnedProcess',Owned)]:
+                mocked=patch(__name__+'.'+target,replacement);mocked.start();self.addCleanup(mocked.stop)
+            mocked=patch.object(subprocess,'Popen',side_effect=launch);mocked.start();self.addCleanup(mocked.stop)
+            self.addCleanup(self.cleanup_sessions)
+        def workbook(self,path):
+            main='application/vnd.ms-excel.sheet.macroEnabled.main+xml' if path.suffix=='.xlsm' else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'
+            with zipfile.ZipFile(path,'w') as z:
+                z.writestr('[Content_Types].xml','<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/xl/workbook.xml" ContentType="'+main+'"/></Types>')
+                z.writestr('xl/workbook.xml','<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets><sheet name="Raport" sheetId="1"/></sheets></workbook>')
+                if path.suffix=='.xlsm':z.writestr('xl/vbaProject.bin',b'opaque VBA is never inspected')
+        def cleanup_sessions(self):
+            for controller in self.controllers:controller.cancel()
+            for controller in self.controllers:self.assertTrue(controller.finished.wait(4),'Session did not clean up')
+        def wait(self,controller,predicate,timeout=4):
+            until=time.monotonic()+timeout
+            while time.monotonic()<until:
+                state=controller.poll()
+                if predicate(state):return state
+                time.sleep(.01)
+            self.fail('Session state timeout: '+str(controller.poll()))
+        def start(self):
+            controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller);controller.start();self.wait(controller,lambda s:s['state']=='ready');return controller
+        def test_ctor_is_lazy_and_copy_is_private(self):
+            controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller);self.assertFalse(self.private.exists());controller.start()
+            state=self.wait(controller,lambda s:s['state']=='ready');self.assertTrue(state['owned']);self.assertEqual(Path(state['staged_path']).read_bytes(),self.before);self.assertNotEqual(state['staged_path'],str(self.original));self.assertEqual(self.original.read_bytes(),self.before)
+            import base64
+            command=self.launches[0];self.assertNotIn('-ExecutionPolicy',command);self.assertIn('-EncodedCommand',command);self.assertEqual(base64.b64decode(command[-1]).decode('utf-16-le'),EXCEL_SESSION_POWERSHELL)
+        def test_macro_errors_leave_session_ready_for_direct_pdf(self):
+            controller=self.start();controller.submit('run_macro',{'name':'Fail'});state=self.wait(controller,lambda s:s['state']=='ready' and bool(s['error']));self.assertIn('synthetic',state['error'])
+            out=self.root/'report.pdf';out.write_bytes(b'previous');controller.submit('export_pdf',{'destination':str(out)});state=self.wait(controller,lambda s:s['state']=='ready' and s['last_result'].get('destination')==str(out));self.assertTrue(out.read_bytes().startswith(b'%PDF-'));self.assertEqual(state['active_sheet'],'Raport');self.assertEqual(self.original.read_bytes(),self.before)
+        def test_save_copy_preserves_macro_container(self):
+            controller=self.start();out=self.root/'saved.xlsm';controller.submit('save_copy',{'destination':str(out)});self.wait(controller,lambda s:s['state']=='ready' and bool(s['last_result'].get('destination')))
+            self.assertEqual(out.read_bytes(),self.before);self.assertEqual(self.original.read_bytes(),self.before)
+        def test_unicode_macro_name_is_transported_without_shell_interpolation(self):
+            controller=self.start();jid=controller.submit('run_macro',{'name':'Moduł1.PrzygotujRaport'});state=self.wait(controller,lambda s:s['state']=='ready' and any(e.get('event')=='done' and e.get('operation')=='run_macro' for e in s['events']))
+            self.assertFalse(state['error']);self.assertTrue(jid)
+        def test_cancel_during_fsync_is_responsive_and_does_not_publish(self):
+            controller=self.start();out=self.root/'slow.pdf';out.write_bytes(b'previous');entered=threading.Event();release=threading.Event();original=os.fsync
+            def slow(fd):entered.set();release.wait(3);return original(fd)
+            with patch.object(os,'fsync',side_effect=slow):
+                controller.submit('export_pdf',{'destination':str(out)});self.assertTrue(entered.wait(2));started=time.monotonic();controller.poll();controller.cancel();self.assertLess(time.monotonic()-started,.2);release.set();self.assertTrue(controller.finished.wait(4))
+            self.assertEqual(out.read_bytes(),b'previous');self.assertFalse(list(self.root.glob('.slow.*.pdf')))
+        def test_reject_macro_injection_and_wrong_format_or_original(self):
+            controller=self.start()
+            for name in ("Module.Print');Remove-Item *;#",'Other.xlsm!Print','A.B.C','Print(1)'):
+                with self.assertRaises(UserError):controller.submit('run_macro',{'name':name})
+            for action,target in [('save_copy',self.original),('save_copy',self.root/'wrong.xlsx'),('export_pdf',self.private/'bad.pdf')]:
+                controller.submit(action,{'destination':str(target)});self.wait(controller,lambda s:s['state']=='ready' and bool(s['error']))
+            self.assertEqual(self.original.read_bytes(),self.before)
+        def test_cancel_busy_macro_closes_only_owned_process_and_cleans_copy(self):
+            controller=self.start();stage=Path(controller.poll()['temp_root']);controller.submit('run_macro',{'name':'Wait'});self.wait(controller,lambda s:any(e.get('event')=='busy' and e.get('operation')=='run_macro' for e in s['events']))
+            before=time.monotonic();controller.cancel();self.assertLess(time.monotonic()-before,.2);self.assertTrue(controller.finished.wait(4));state=controller.poll();self.assertEqual(state['state'],'closed');self.assertTrue(state['cancelled']);self.assertFalse(stage.exists());self.assertTrue(self.handles[0].terminations);self.assertEqual(self.original.read_bytes(),self.before)
+        def test_preexisting_pid_is_never_adopted(self):
+            with patch(__name__+'.excel_process_ids',return_value={424242}):
+                controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller);controller.start();self.assertTrue(controller.finished.wait(4))
+            self.assertEqual(controller.poll()['state'],'error');self.assertFalse(self.handles);self.assertFalse(controller.poll()['owned'])
+        def test_missing_excel_has_friendly_error_and_no_working_copy(self):
+            with patch(__name__+'.excel_availability',return_value={'available':False,'reason':'Brak Microsoft Excel.'}):
+                controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller);controller.start();self.assertTrue(controller.finished.wait(2))
+            self.assertIn('Brak Microsoft Excel',controller.poll()['error']);self.assertFalse(self.launches);self.assertFalse(self.private.exists())
+        def test_stale_event_cannot_change_session_or_publish(self):
+            controller=self.start();before=controller.poll();controller._consume({'session_id':'wrong','event':'done','id':before['job_id'],'result':{'active_sheet':'wrong'}});self.assertEqual(controller.poll()['active_sheet'],'Raport')
+            controller._consume({'session_id':controller.session_id,'event':'done','id':'old','result':{'active_sheet':'wrong'}});self.assertEqual(controller.poll()['active_sheet'],'Raport')
+        def test_invalid_output_does_not_replace_existing_file(self):
+            controller=self.start()
+            for action,raw,extension in [('export_pdf',b'%PDF-','.pdf'),('save_copy',b'garbage','.xlsm')]:
+                out=self.root/('existing'+extension);out.write_bytes(b'previous');temp=self.root/('partial'+extension);temp.write_bytes(raw);pending={'id':uid(),'action':action,'temp_path':str(temp),'destination':str(out)}
+                controller.pending=pending;controller.state['job_id']=pending['id']
+                with self.assertRaises(Exception):controller._publish(pending)
+                self.assertEqual(out.read_bytes(),b'previous');controller._remove_pending();controller.state['job_id']=''
+            out=self.root/'junk.xlsm';self.workbook(out)
+            with zipfile.ZipFile(self.root/'junk-temp.xlsm','w') as z:z.writestr('[Content_Types].xml','junk');z.writestr('xl/workbook.xml','junk')
+            pending={'id':uid(),'action':'save_copy','temp_path':str(self.root/'junk-temp.xlsm'),'destination':str(out)};before=out.read_bytes();controller.pending=pending;controller.state['job_id']=pending['id']
+            with self.assertRaises(Exception):controller._publish(pending)
+            self.assertEqual(out.read_bytes(),before);controller._remove_pending();controller.state['job_id']=''
+        @unittest.skipUnless(os.name=='nt','NTFS stream preservation')
+        def test_working_copy_preserves_mark_of_the_web(self):
+            zone=Path(str(self.original)+':Zone.Identifier');zone.write_text('[ZoneTransfer]\nZoneId=3\n',encoding='utf-8');controller=self.start();copy=Path(controller.poll()['staged_path']+':Zone.Identifier')
+            self.assertEqual(copy.read_text('utf-8'),zone.read_text('utf-8'))
+        def test_read_only_original_yields_editable_removable_private_copy(self):
+            os.chmod(self.original,0o400);self.addCleanup(lambda:os.chmod(self.original,0o600));controller=self.start();copy=Path(controller.poll()['staged_path'])
+            with copy.open('ab') as stream:stream.write(b'')
+            controller.close();self.assertTrue(controller.finished.wait(4));self.assertFalse(copy.exists());self.assertEqual(self.original.read_bytes(),self.before)
+        def test_static_script_keeps_macro_policy_and_only_explicit_open_events(self):
+            text=EXCEL_SESSION_POWERSHELL;self.assertIn('$excel.AutomationSecurity = 2',text);self.assertNotIn('AutomationSecurity = 1',text);self.assertNotIn('VBProject',text);self.assertIn('$excel.EnableEvents = [bool]$request.run_open_events',text);self.assertIn('$excel.EnableEvents = $true',text);self.assertNotIn('IgnoreRemoteRequests',text)
+            self.assertIn('.RunAutoMacros(1)',text);self.assertIn('$excel.ActiveSheet.ExportAsFixedFormat',text);self.assertIn('$book.SaveCopyAs',text);self.assertIn('Session cancelled before opening',text)
+        @unittest.skipUnless(os.name=='nt','Windows PowerShell parser')
+        def test_powershell_parses_static_worker_without_running_excel(self):
+            import base64
+            powershell=Path(os.environ.get('SystemRoot',r'C:\Windows'))/'System32/WindowsPowerShell/v1.0/powershell.exe'
+            if not powershell.is_file():self.skipTest('No Windows PowerShell')
+            source=base64.b64encode(EXCEL_SESSION_POWERSHELL.encode('utf-8')).decode('ascii')
+            script='$tokens=$null; $errors=$null; $null=[System.Management.Automation.Language.Parser]::ParseInput([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("'+source+'")),[ref]$tokens,[ref]$errors); if($errors.Count){$errors|Out-String|Write-Output;exit 1};exit 0'
+            encoded=base64.b64encode(script.encode('utf-16-le')).decode('ascii')
+            with patch.object(subprocess,'Popen',self.original_popen):result=subprocess.run([str(powershell),'-NoProfile','-NonInteractive','-EncodedCommand',encoded],capture_output=True,timeout=20,creationflags=CREATE_NO_WINDOW)
+            self.assertEqual(result.returncode,0,(result.stdout+result.stderr).decode('utf-8','replace'))
+    return unittest.defaultTestLoader.loadTestsFromTestCase(ExcelSessionTests)
+
+
+def database_cell_test_suite():
+    import unittest
+    from unittest.mock import patch
+    class DatabaseCellTests(unittest.TestCase):
+        def setUp(self):
+            self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name);self.path=self.root/'cells.sqlite3'
+            self.large=('Zażółć 😀\n'*100000);self.json_bytes='{"tekst":"Zażółć 😀","duża":9007199254740993}'.encode('utf-8');self.binary=bytes(range(256))*9000
+            with test_sqlite_connection(self.path) as c:
+                c.executescript('CREATE TABLE payload(id INTEGER PRIMARY KEY,body TEXT,raw BLOB,label TEXT);CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES payload(id),raw BLOB);CREATE TABLE no_key(body BLOB);CREATE VIEW shown AS SELECT body FROM payload;CREATE TABLE compound(a TEXT,b BLOB,raw BLOB,PRIMARY KEY(a,b)) WITHOUT ROWID;')
+                c.executemany('INSERT INTO payload VALUES(?,?,?,?)',[(1,'small',self.json_bytes,'[BLOB: 12 bajtów]'),(2,self.large,self.binary,'second'),(3,None,None,'third')])
+                c.execute('INSERT INTO child VALUES(10,1,?)',[b'child bytes']);c.execute('INSERT INTO no_key VALUES(?)',[self.json_bytes]);c.execute('INSERT INTO compound VALUES(?,?,?)',('007',b'\x00\xff',self.json_bytes))
+            self.source=validate_source({'kind':'sqlite','name':'Cells','options':{'path':str(self.path)}})
+        def adapter(self):return SQLiteAdapter(self.source).connect()
+        def page(self,table='payload',**kw):
+            a=self.adapter()
+            try:return database_page(a,dict(object={'schema':'main','name':table,'kind':'view' if table=='shown' else 'table'},**kw))
+            finally:a.close()
+        def args(self,page,row,column):
+            col=next(c for c in page['columns'] if c['name']==column)
+            return dict(row_token=page['row_tokens'][row],object_id=col['origin']['object_id'],column=col['origin']['column'])
+        def cell(self,args):
+            a=self.adapter()
+            try:return database_cell(a,args)
+            finally:a.close()
+        def export(self,args,destination):
+            a=self.adapter()
+            try:return database_cell_export(a,dict(args,destination=str(destination)))
+            finally:a.close()
+        def test_flags_are_typed_and_placeholder_lookalike_is_plain_text(self):
+            page=self.page();names=[c['name'] for c in page['columns']]
+            self.assertTrue(page['rows'][0][names.index('raw')]['deferred']);self.assertNotIn('deferred',page['rows'][0][names.index('label')])
+            self.assertTrue(page['rows'][1][names.index('body')]['deferred']);self.assertIsNone(page['rows'][2][names.index('raw')])
+        def test_blob_json_decodes_strictly_and_preserves_large_numbers(self):
+            value=self.cell(self.args(self.page(),0,'raw'))
+            self.assertEqual(value['format'],'json');self.assertIn('Zażółć 😀',value['text']);self.assertIn('9007199254740993',value['text']);self.assertFalse(value['truncated']);self.assertEqual(value['size'],len(self.json_bytes))
+        def test_json_number_lexemes_and_whitespace_are_not_reencoded(self):
+            raw=b'{ "amount":123456789.123456789, "tiny":1e-400, "scale":1.2300 }\n'
+            with test_sqlite_connection(self.path) as c:c.execute('UPDATE payload SET raw=? WHERE id=1',[raw])
+            args=self.args(self.page(),0,'raw');value=self.cell(args);self.assertEqual(value['format'],'json');self.assertEqual(value['text'],raw.decode('utf-8'))
+            out=self.root/'exact.json';self.export(args,out);self.assertEqual(out.read_bytes(),raw)
+        def test_binary_hex_is_bounded_and_export_preserves_every_byte(self):
+            args=self.args(self.page(),1,'raw');value=self.cell(args)
+            self.assertEqual(value['format'],'hex');self.assertTrue(value['truncated']);self.assertEqual(value['preview_bytes'],DATABASE_CELL_MAX_BYTES)
+            out=self.root/'binary.bin';result=self.export(args,out);self.assertEqual(out.read_bytes(),self.binary);self.assertEqual(result['bytes'],len(self.binary));self.assertEqual(result['encoding'],'binary')
+        def test_large_unicode_preview_and_export_are_distinct(self):
+            args=self.args(self.page(),1,'body');value=self.cell(args)
+            self.assertEqual(value['format'],'text');self.assertTrue(value['truncated']);self.assertNotIn('\ufffd',value['text']);self.assertTrue(self.large.startswith(value['text']))
+            out=self.root/'unicode.txt';self.export(args,out);self.assertEqual(out.read_bytes(),self.large.encode('utf-8'))
+        def test_sqlite_utf16_endianness_and_embedded_nul_export_as_utf8(self):
+            for encoding in ('UTF-16le','UTF-16be'):
+                path=self.root/(encoding+'.sqlite3');text='a\x00b'+('Zażółć 😀'*10000)
+                with test_sqlite_connection(path) as c:
+                    c.execute("PRAGMA encoding='"+encoding+"'");c.execute('CREATE TABLE payload(id INTEGER PRIMARY KEY,body TEXT,raw BLOB)');c.execute('INSERT INTO payload VALUES(1,?,?)',[text,self.json_bytes])
+                self.source=validate_source(dict(self.source,options={'path':str(path)}));page=self.page();args=self.args(page,0,'body');value=self.cell(args)
+                self.assertEqual(value['text'],text);self.assertEqual(value['format'],'text');out=self.root/(encoding+'.txt');self.export(args,out);self.assertEqual(out.read_bytes(),text.encode('utf-8'))
+                out=self.root/(encoding+'.bin');self.export(self.args(page,0,'raw'),out);self.assertEqual(out.read_bytes(),self.json_bytes)
+        def test_sqlite_real_uses_native_precision_in_preview_and_export(self):
+            value=0.12345678901234566
+            with test_sqlite_connection(self.path) as c:c.execute('ALTER TABLE payload ADD COLUMN exact REAL');c.execute('UPDATE payload SET exact=? WHERE id=1',[value])
+            args=self.args(self.page(),0,'exact');self.assertEqual(self.cell(args)['text'],str(value));out=self.root/'number.txt';self.export(args,out);self.assertEqual(out.read_text('utf-8'),str(value))
+        def test_key_survives_changed_order_and_deleted_record_is_not_replaced(self):
+            args=self.args(self.page(sort='label'),1,'raw')
+            with test_sqlite_connection(self.path) as c:c.execute('INSERT INTO payload VALUES(0,?,?,?)',('new',b'wrong row','!!!'))
+            self.assertEqual(self.cell(args)['format'],'hex')
+            with test_sqlite_connection(self.path) as c:c.execute('DELETE FROM payload WHERE id=2')
+            with self.assertRaises(UserError):self.cell(args)
+        def test_compound_binary_key_is_not_preview_string(self):
+            args=self.args(self.page('compound'),0,'raw');values=next(iter(args['row_token']['objects'].values()))['locator']['values']
+            self.assertEqual(values,[{'type':'str','value':'007'},{'type':'bytes','value':'00ff'}]);self.assertEqual(self.cell(args)['format'],'json')
+        def test_keyless_table_and_view_fail_explicitly(self):
+            for table,column in [('no_key','body'),('shown','body')]:
+                args=self.args(self.page(table),0,column);self.assertEqual(args['row_token']['objects'],{})
+                with self.assertRaises(UserError):self.cell(args)
+        def test_wrong_source_column_or_forged_key_does_not_query_payload(self):
+            args=self.args(self.page(),0,'raw')
+            for broken in [dict(args,column='raw";DROP TABLE payload;--'),dict(args,row_token=dict(args['row_token'],source_key='wrong'))]:
+                with self.assertRaises(UserError):self.cell(broken)
+            altered=clone(args);next(iter(altered['row_token']['objects'].values()))['locator']['columns']=['label']
+            with self.assertRaises(UserError):self.cell(altered)
+        def test_cancel_export_keeps_existing_destination_and_removes_temp(self):
+            args=self.args(self.page(),1,'raw');out=self.root/'existing.bin';out.write_bytes(b'keep');a=self.adapter();checks=0;original=a.check_cancel
+            def cancelled():
+                nonlocal checks
+                checks+=1
+                if checks>=10:a.cancelled.set()
+                original()
+            a.check_cancel=cancelled
+            try:
+                with self.assertRaises(Cancelled):database_cell_export(a,dict(args,destination=str(out)))
+            finally:a.close()
+            self.assertEqual(out.read_bytes(),b'keep');self.assertFalse(list(self.root.glob('.existing.bin.*.tmp')))
+        def test_failed_replace_preserves_existing_destination(self):
+            args=self.args(self.page(),0,'raw');out=self.root/'existing.bin';out.write_bytes(b'keep')
+            with patch.object(os,'replace',side_effect=OSError('injected')):
+                with self.assertRaises(OSError):self.export(args,out)
+            self.assertEqual(out.read_bytes(),b'keep');self.assertFalse(list(self.root.glob('.existing.bin.*.tmp')))
+        def test_join_cell_uses_origin_and_unmatched_parent_has_no_token(self):
+            a=self.adapter()
+            try:
+                cat=DatabaseInspector(a).read();ids=[o['id'] for o in cat['objects'] if o['name'] in ('payload','child') and o['kind']=='table'];base=database_object_id('main','table','payload');plan=database_join_plan(cat,ids,base,join_type='left');page=database_join_page(a,{'plan':plan})
+            finally:a.close()
+            col=next(c for c in page['columns'] if c['origin']=={'object_id':database_object_id('main','table','child'),'column':'raw'})
+            args={'row_token':page['row_tokens'][0],**{'object_id':col['origin']['object_id'],'column':col['origin']['column']}}
+            self.assertEqual(self.cell(args)['text'],'child bytes');self.assertNotIn(col['origin']['object_id'],page['row_tokens'][1]['objects'])
+        def remote(self,kind='oracle',binary=False,primary=True):
+            data=self.binary if binary else self.large;calls=[]
+            class Lob:
+                position=0
+                sub_type=0 if binary else 1
+                _charset='utf-8'
+                def size(inner):return len(data) if binary else len(data.encode('utf-8')) if kind=='firebird' else len(data.encode('utf-16-le'))//2
+                @property
+                def length(inner):return inner.size()
+                def is_text(inner):return not binary
+                def read(inner,size=None,*,offset=None,amount=None):
+                    if offset is not None:
+                        calls.append((offset,amount));raw=data if binary else data.encode('utf-16-le');part=raw[(offset-1)*(1 if binary else 2):(offset-1+amount)*(1 if binary else 2)]
+                        return part if binary else part.decode('utf-16-le')
+                    calls.append(size);raw=data if binary else data.encode('utf-8');part=raw[inner.position:inner.position+size];inner.position+=len(part)
+                    return part.decode(inner._charset) if inner.sub_type==1 else part
+                def close(inner):pass
+            lob=Lob()
+            class Cursor:
+                stream_blob_threshold=None
+                def fetchmany(inner,n):return [(lob,)]
+                def close(inner):pass
+            class Remote(Adapter):
+                def fetch(inner,sql,params=(),limit=None):
+                    if 'ALL_TAB_COLUMNS' in sql or 'INFORMATION_SCHEMA.COLUMNS' in sql:return [('ID','NUMBER'),('BODY','BLOB' if binary else 'CLOB')]
+                    if 'RDB$RELATION_FIELDS' in sql:return [('ID',8),('BODY',261)]
+                    return [('ID',)] if primary else []
+                def execute(inner,sql,params=()):inner.last=(sql,list(params));inner.active_cursor=Cursor();return inner.active_cursor
+            a=Remote(dict(self.source,kind=kind));a.kind=kind;obj={'schema':'APP' if kind!='firebird' else '','name':'T','kind':'table'};cols=database_relation_meta(a,obj);spec=database_row_identity(a,obj,cols,'ps_db')
+            token=database_row_token(a,[spec],[7 if primary else 'AAArXqAAEAAAAGsAAA']);args={'row_token':token,'object_id':spec['object']['id'],'column':'BODY'}
+            return a,args,lob,calls
+        def test_oracle_clob_uses_bounded_amount_and_utf16_offsets(self):
+            a,args,lob,calls=self.remote();value=database_cell(a,args)
+            self.assertEqual(value['format'],'text');self.assertTrue(self.large.startswith(value['text']));self.assertTrue(value['truncated']);self.assertEqual(value['unit'],'utf-16 units')
+            self.assertTrue(all(0<n<=DATABASE_CELL_CHUNK+1 for _,n in calls));self.assertIn('ps_cell."ID" = :p1',a.last[0]);self.assertEqual(a.last[1],[7]);self.assertNotIn('OFFSET',a.last[0])
+        def test_oracle_rowid_is_only_fallback_and_binary_export_is_exact(self):
+            a,args,lob,calls=self.remote(binary=True,primary=False);out=self.root/'oracle.bin';database_cell_export(a,dict(args,destination=str(out)))
+            self.assertEqual(out.read_bytes(),self.binary);self.assertIn('ps_cell.ROWID = :p1',a.last[0]);self.assertEqual(a.last[1],['AAArXqAAEAAAAGsAAA'])
+        def test_oracle_unicode_export_preserves_surrogate_boundaries(self):
+            a,args,lob,calls=self.remote();out=self.root/'oracle.txt';database_cell_export(a,dict(args,destination=str(out)))
+            self.assertEqual(out.read_bytes(),self.large.encode('utf-8'));self.assertTrue(all(n<=DATABASE_CELL_CHUNK+1 for _,n in calls))
+        def test_premature_lob_eof_is_not_published_as_complete_export(self):
+            a,args,lob,calls=self.remote(binary=True);lob.read=lambda **kw:b'';out=self.root/'truncated.bin';out.write_bytes(b'previous')
+            with self.assertRaises(UserError):database_cell_export(a,dict(args,destination=str(out)))
+            self.assertEqual(out.read_bytes(),b'previous');self.assertFalse(list(self.root.glob('.truncated.bin.*.tmp')))
+        def test_h2_jdbc_binary_and_clob_use_bounded_lob_methods(self):
+            import array
+            jp=type('JP',(),{'JByte':'b','JChar':'H','JArray':staticmethod(lambda typ:lambda count:array.array(typ,[0])*count)})
+            for binary in (True,False):
+                a,args,_,_=self.remote(kind='h2',binary=binary);data=self.binary if binary else self.large;calls=[]
+                class Reader:
+                    offset=0
+                    def read(inner,buffer,start,size):
+                        raw=data if binary else data.encode('utf-16-le' if sys.byteorder=='little' else 'utf-16-be');width=1 if binary else 2
+                        part=raw[inner.offset:inner.offset+size*width]
+                        if not part:return -1
+                        calls.append(size);memoryview(buffer).cast('B')[:len(part)]=part;inner.offset+=len(part);return len(part)//width
+                    def close(inner):pass
+                class JdbcLob:
+                    freed=False
+                    streams=0
+                    def length(inner):return len(data) if binary else len(data.encode('utf-16-le'))//2
+                    def getBinaryStream(inner):inner.streams+=1;return Reader()
+                    def getCharacterStream(inner):inner.streams+=1;return Reader()
+                    def free(inner):inner.freed=True
+                lob=JdbcLob()
+                class Result:
+                    index=0
+                    def next(inner):inner.index+=1;return inner.index==1
+                    def getBlob(inner,index):return lob
+                    def getClob(inner,index):return lob
+                class Cursor:
+                    types=[2004 if binary else 2005]
+                    def __init__(inner):inner.result=Result()
+                    def close(inner):pass
+                a.execute=lambda *unused:Cursor();out=self.root/('h2.bin' if binary else 'h2.txt')
+                with patch.dict(sys.modules,jpype=jp):database_cell_export(a,dict(args,destination=str(out)))
+                self.assertEqual(out.read_bytes(),data if binary else data.encode('utf-8'));self.assertTrue(lob.freed);self.assertEqual(lob.streams,1);self.assertTrue(all(n<=DATABASE_CELL_CHUNK for n in calls))
+        def test_firebird_reader_uses_size_not_oracle_offset(self):
+            a,args,lob,calls=self.remote(kind='firebird',binary=True);value=database_cell(a,args)
+            self.assertEqual(value['format'],'hex');self.assertTrue(value['truncated']);self.assertTrue(all(n==DATABASE_CELL_CHUNK for n in calls))
+        def test_firebird_text_decoder_spans_byte_chunk_boundaries(self):
+            self.large='a'*65535+'ą😀'+self.large;a,args,lob,calls=self.remote(kind='firebird');out=self.root/'firebird.txt'
+            database_cell_export(a,dict(args,destination=str(out)));self.assertEqual(out.read_bytes(),self.large.encode('utf-8'));self.assertEqual(lob.sub_type,1);self.assertTrue(all(n==DATABASE_CELL_CHUNK for n in calls))
+        def test_identity_roundtrip_preserves_decimal_dates_and_binary(self):
+            a=Adapter(self.source);a.kind='oracle'
+            for value in (Decimal('9007199254740993.125'),dt.datetime(2026,10,6,12,34,56,123456),dt.date(2026,10,6),b'\x00\xff',True,7,'007'):
+                self.assertEqual(database_identity_unpack(database_identity_value(value),a),value)
+        def test_utf16_bom_blob_and_null(self):
+            with test_sqlite_connection(self.path) as c:c.execute('UPDATE payload SET raw=? WHERE id=1',['{"x":"😀"}'.encode('utf-16')])
+            self.assertEqual(self.cell(self.args(self.page(),0,'raw'))['format'],'json');value=self.cell(self.args(self.page(),2,'raw'));self.assertTrue(value['is_null']);self.assertEqual(value['text'],'NULL')
+    return unittest.defaultTestLoader.loadTestsFromTestCase(DatabaseCellTests)
+
+
 def database_explorer_test_suite():
     """Real SQLite and worker IPC. UI source checks are not Qt/Windows execution."""
     import unittest
@@ -16374,6 +18241,24 @@ def database_join_test_suite():
         def test_layout_120_nodes_bounded_work(self):
             objs=[{'id':str(i),'name':'T'+str(i),'schema':'main'} for i in range(120)];sizes={o['id']:(320,180) for o in objs};t=time.monotonic()
             p=database_graph_layout(objs,[],sizes,1360);self.assertEqual(len(p),120);self.assertLess(time.monotonic()-t,1)
+        def test_layout_adapts_to_canvas_width_without_four_column_cap(self):
+            objs=[{'id':str(i),'name':f'T{i:03d}','schema':'main'} for i in range(40)];sizes={o['id']:(230,160+(i%3)*30) for i,o in enumerate(objs)}
+            edges=[{'source':str(i),'target':str(i+1)} for i in range(39)]
+            for width,expected in ((760,3),(1040,4),(1800,7),(2300,9)):
+                with self.subTest(width=width):
+                    positions=database_graph_layout(objs,edges,sizes,width,compact=True);first=[oid for oid,(x,y) in positions.items() if y==12]
+                    self.assertEqual(len(first),expected);self.assertAlmostEqual(max(positions[oid][0]+sizes[oid][0] for oid in first),width-12)
+                    self.assertEqual(positions,database_graph_layout(list(reversed(objs)),list(reversed(edges)),sizes,width,compact=True))
+                    for index,a in enumerate(objs):
+                        x,y=positions[a['id']];w,h=sizes[a['id']]
+                        for b in objs[index+1:]:
+                            xx,yy=positions[b['id']];ww,hh=sizes[b['id']];self.assertTrue(x+w<=xx or xx+ww<=x or y+h<=yy or yy+hh<=y)
+        def test_layout_compact_keeps_components_together(self):
+            objs=[{'id':str(i),'name':f'T{i}','schema':'main'} for i in range(6)];sizes={o['id']:(230,160) for o in objs}
+            edges=[{'source':'0','target':'5'},{'source':'1','target':'4'},{'source':'2','target':'3'}]
+            positions=database_graph_layout(objs,edges,sizes,1800,compact=True)
+            for edge in edges:
+                a,b=positions[edge['source']],positions[edge['target']];self.assertEqual(a[1],b[1]);self.assertLess(abs(a[0]-b[0]),300)
         def test_graph_ui_has_no_automatic_fit_in_show_plan(self):
             tree=ast.parse(Path(__file__).read_text('utf-8'));cls=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='DatabaseGraph')
             method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='show_plan')
@@ -17607,6 +19492,11 @@ def self_test():
     suite.addTests(catalog_cache_test_suite())
     suite.addTests(catalog_cache_graph_test_suite())
     suite.addTests(catalog_hydration_test_suite())
+    suite.addTests(xlsm_intake_test_suite())
+    suite.addTests(database_cell_service_test_suite())
+    suite.addTests(database_cell_test_suite())
+    suite.addTests(excel_native_dialog_test_suite())
+    suite.addTests(excel_session_test_suite())
     suite.addTests(catalog_cache_service_test_suite())
     result=unittest.TextTestRunner(verbosity=2).run(suite)
     print('Testy rdzenia nie zastępują integracji z H2 / Firebird / Oracle. Testy Qt: --ui-test.',flush=True)
@@ -18182,6 +20072,17 @@ def ui_test():
             ex.merge_cached_structure(self.progressive_graph_payload([self.progressive_structure(o) for o in objects]));ex.graph.arrange_nodes(preserve=False);app.processEvents()
             nodes=list(ex.graph._nodes.values());rows=collections.Counter(round(n.pos().y()) for n in nodes);self.assertGreaterEqual(max(rows.values()),4,[(n.pos().x(),n.pos().y(),n.rect().width()) for n in nodes]);self.assertTrue(all(220<=n.rect().width()<=250 for n in nodes))
             self.assertAlmostEqual(ex.graph.transform().m11(),1.0,places=3)
+        def test_graph_arrange_uses_resized_canvas_and_releases_manual_positions(self):
+            source,ex,requests,events=self.persistent_oracle_fixture(progressive=True);objects=[self.oracle_scope_table('APP','LONG_TABLE_NAME_'+str(i).zfill(3)) for i in range(100)]
+            requests[-1]['done'](self.persistent_oracle_catalog(source,objects));ex.tabs.setCurrentIndex(1);app.processEvents();self.wait(lambda:not ex.graph._initial_view)
+            graph=ex.graph;oid=objects[0]['id'];counts=[]
+            for width in (800,1100,1900):
+                self.window.resize(width,780);app.processEvents();graph._nodes[oid].setPos(6000,6000);graph._nodes[oid].setSelected(True);graph.zoom_by(.5);graph.centerOn(6000,6000)
+                action=next(action for menu in ex.findChildren(QW.QMenu) for action in menu.actions() if action.text()=='Uporządkuj według relacji');action.trigger();app.processEvents();nodes=list(graph._nodes.values());row=min(n.pos().y() for n in nodes);first=[n for n in nodes if n.pos().y()==row];counts.append(len(first))
+                self.assertAlmostEqual(graph.transform().m11(),1.0,places=3);self.assertFalse(graph._manual_positions);self.assertEqual(graph.selected_ids(),[oid]);self.assertLess(graph._nodes[oid].pos().x(),graph.viewport().width())
+                self.assertLess(graph.mapToScene(graph.viewport().rect()).boundingRect().top(),row+30);self.assertGreaterEqual(max(n.sceneBoundingRect().right() for n in first),graph.viewport().width()-35)
+                self.assertLessEqual(max(n.sceneBoundingRect().right() for n in first),graph.viewport().width());self.assertTrue(graph.verticalScrollBar().maximum()>0)
+            self.assertLess(counts[0],counts[1]);self.assertGreaterEqual(counts[1],4);self.assertGreaterEqual(counts[2],7)
         def test_progressive_close_waits_for_background_without_foreground_warning(self):
             from unittest import mock
             source,ex,requests,events=self.persistent_oracle_fixture(trusted=True,progressive=True);requests[-1]['done'](self.persistent_oracle_catalog(source,[self.oracle_scope_table('APP')]));job=events[-1]
@@ -18335,6 +20236,82 @@ def ui_test():
             catalog['complete']=False;return catalog
         def oracle_details_result(self,source,obj,related=(),warnings=()):
             return {'source_id':source['id'],'object':clone(obj),'related_objects':clone(list(related)),'relations':[], 'warnings':list(warnings),'complete':not warnings}
+        def database_cell_fixture(self,deferred=True,identity=True):
+            source,ex,requests=self.oracle_scope_fixture('APP');obj=self.oracle_scope_table('APP','DOCUMENTS');obj['columns'].append(dict(obj['columns'][0],name='PAYLOAD',type='BLOB',position=1,pk_position=0))
+            requests[-1]['done'](self.oracle_scope_catalog(source,'APP',[obj]));ex.open_data(obj['id']);page=ex._data_pages[obj['id']]
+            token={'version':1,'source_key':digest(source),'objects':{obj['id']:{'object':{k:obj[k] for k in ('id','name','schema','kind')},'locator':{'kind':'pk','columns':['ID'],'values':[pack(1)]}}}}
+            columns=[dict(c,origin={'object_id':obj['id'],'column':c['name']}) for c in obj['columns']];cell=pack('[BLOB: 42 bajtów]')
+            if deferred:cell['deferred']=True
+            value={'object':obj,'columns':columns,'rows':[[pack(1),cell]],'row_tokens':[token] if identity else [],'offset':0,'limit':100,'has_more':False,'scope':'Bieżąca strona','read_at':utcnow(),'stable_order':identity}
+            requests[-1]['done'](value);app.processEvents();return source,ex,page,requests,token
+        def test_database_cell_double_click_fetches_marked_lob_and_json(self):
+            source,ex,page,requests,token=self.database_cell_fixture();index=page.model.index(1,1);point=page.grid.visualRect(index).center()
+            QTest.mouseClick(page.grid.viewport(),Qt.MouseButton.LeftButton,pos=point);QTest.mouseDClick(page.grid.viewport(),Qt.MouseButton.LeftButton,pos=point);app.processEvents()
+            self.assertEqual(len(page._cell_dialogs),1);dialog=next(iter(page._cell_dialogs));self.assertEqual(requests[-1]['operation'],'database_cell');self.assertEqual(requests[-1]['args'],{'row_token':token,'object_id':page.obj['id'],'column':'PAYLOAD'})
+            self.assertFalse(dialog.copy_button.isEnabled());requests[-1]['done']({'text':'{\n  "message": "Zażółć"\n}','format':'json','size':24,'unit':'bytes','encoding':'utf-8','truncated':False,'read_at':utcnow()})
+            self.assertIn('Zażółć',dialog.text.toPlainText());self.assertIn('JSON',dialog.note.text());self.assertIn('pełną wartość',dialog.note.text());self.assertTrue(dialog.copy_button.isEnabled());self.assertFalse(dialog.save_button.isHidden());dialog.reject()
+        def test_database_cell_literal_placeholder_does_not_fetch(self):
+            source,ex,page,requests,token=self.database_cell_fixture(deferred=False);count=len(requests);dialog=page.full_cell(page.model.index(1,1));app.processEvents()
+            self.assertEqual(len(requests),count);self.assertEqual(dialog.text.toPlainText(),'[BLOB: 42 bajtów]');self.assertIsNone(dialog._args);self.assertTrue(dialog.save_button.isHidden());self.assertTrue(dialog.copy_button.isEnabled());dialog.reject()
+        def test_database_cell_missing_identity_is_explicit_and_never_uses_offset(self):
+            source,ex,page,requests,token=self.database_cell_fixture(identity=False);count=len(requests);dialog=page.full_cell(page.model.index(1,1));app.processEvents()
+            self.assertEqual(len(requests),count);self.assertIn('jednoznacznie',dialog.note.text());self.assertEqual(dialog.text.toPlainText(),'');self.assertFalse(dialog.copy_button.isEnabled());self.assertTrue(dialog.save_button.isHidden());dialog.reject()
+        def test_database_cell_binary_partial_is_marked_and_full_export_uses_identity(self):
+            from unittest import mock
+            source,ex,page,requests,token=self.database_cell_fixture();dialog=page.full_cell(page.model.index(1,1));app.processEvents()
+            requests[-1]['done']({'text':'00 ff 10','format':'hex','size':10000000,'unit':'bytes','encoding':'binary','truncated':True});self.assertIn('szesnastkowy',dialog.note.text());self.assertIn('częściowy',dialog.note.text());self.assertNotIn('Pobrano pełną',dialog.note.text())
+            target=str(self.root/'complete.bin')
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(target,'')):dialog.save_full()
+            request=requests[-1];self.assertEqual(request['operation'],'database_cell_export');self.assertEqual(request['args']['row_token'],token);self.assertEqual(request['args']['destination'],target);self.assertNotIn('text',request['args']);self.assertFalse(dialog.save_button.isEnabled())
+            request['failed']('Brak miejsca');self.assertIn('Nie zapisano',dialog.note.text());self.assertTrue(dialog.save_button.isEnabled())
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(target,'')):dialog.save_full()
+            requests[-1]['done']({'destination':target,'bytes':10000000});self.assertIn('10000000',dialog.note.text());self.assertIn('Zapisano całą',dialog.note.text());dialog.reject()
+        def test_database_cell_failure_retry_and_close_cancel_export(self):
+            from unittest import mock
+            source,ex,page,requests,token=self.database_cell_fixture();dialog=page.full_cell(page.model.index(1,1));app.processEvents();requests[-1]['failed']('Rekord usunięto')
+            self.assertIn('Rekord usunięto',dialog.note.text());self.assertFalse(dialog.retry_button.isHidden());dialog.retry_button.click();self.assertEqual(requests[-1]['operation'],'database_cell');requests[-1]['done']({'text':'test','format':'text','truncated':False})
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(self.root/'full.txt'),'')),mock.patch.object(ex.queue,'cancel_owner') as cancel:
+                dialog.save_full();late=requests[-1];dialog.reject();cancel.assert_called_with(dialog);self.assertFalse(dialog._active);late['done']({'bytes':1});late['failed']('late');self.assertFalse(page._cell_dialogs)
+        def test_database_cell_reload_closes_dialog_and_ignores_late_result(self):
+            from unittest import mock
+            source,ex,page,requests,token=self.database_cell_fixture();dialog=page.full_cell(page.model.index(1,1));app.processEvents();late=requests[-1]
+            with mock.patch.object(ex.queue,'cancel_owner') as cancel:page.load();cancel.assert_called_with(dialog)
+            self.assertFalse(dialog._active);self.assertFalse(page._cell_dialogs);late['done']({'text':'wrong page','format':'text'});late['failed']('old failure');self.assertEqual(requests[-1]['operation'],'database_page')
+        def test_database_cell_stale_source_and_project_cancel_and_suppress(self):
+            from unittest import mock
+            source,ex,page,requests,token=self.database_cell_fixture();dialog=page.full_cell(page.model.index(1,1));app.processEvents();late=requests[-1]
+            self.service.document['sources'][0]['name']='Zmienione źródło'
+            with mock.patch.object(ex.queue,'cancel_owner') as cancel:late['done']({'text':'stale','format':'text'});cancel.assert_called_with(dialog)
+            self.assertFalse(dialog._active);self.service.document['sources'][0]['name']=page.source['name'];second=page.full_cell(page.model.index(1,1));app.processEvents();late=requests[-1];self.assertIs(late['owner'],second)
+            self.service.call('project_new',{'discard':True})
+            with mock.patch.object(ex.queue,'cancel_owner') as cancel:late['failed']('stary projekt');cancel.assert_called_with(second)
+            self.assertFalse(second._active);self.assertFalse(page._cell_dialogs)
+        def test_database_cell_close_before_deferred_timer_does_not_fetch(self):
+            source,ex,page,requests,token=self.database_cell_fixture();count=len(requests);dialog=page.full_cell(page.model.index(1,1));dialog.reject();app.processEvents();self.assertEqual(len(requests),count);self.assertFalse(page._cell_dialogs)
+        def test_database_cell_copy_page_keeps_placeholder_without_transport_flags(self):
+            from unittest import mock
+            source,ex,page,requests,token=self.database_cell_fixture();shown=[]
+            with mock.patch.object(QW.QMessageBox,'exec',lambda box:next(b for b in box.buttons() if b.text()=='Kontynuuj').click()),mock.patch.object(self.window,'show_sheet_book',side_effect=lambda book,register:shown.append(book)),mock.patch.object(self.service,'checkpoint'):
+                page.to_sheet()
+            self.assertEqual(len(shown),1);book=sheet_validate_book(shown[0]);value=book['sheets'][0]['cells']['B2']['v'];self.assertEqual(value,pack('[BLOB: 42 bajtów]'));self.assertNotIn('deferred',value)
+        def sqlite_cell_page(self,value):
+            path=self.root/'cell-source.sqlite'
+            with test_sqlite_connection(path) as conn:conn.execute('CREATE TABLE documents(id INTEGER PRIMARY KEY,payload)');conn.execute('INSERT INTO documents VALUES(1,?)',[value])
+            self.window.open_local_sqlite(str(path));ex=self.window.database_explorer;self.wait(lambda:bool(ex.catalog));obj=next(o for o in ex.catalog['objects'] if o['name']=='documents');ex.open_data(obj['id']);page=ex._data_pages[obj['id']];self.wait(lambda:page._valid);return page
+        def test_database_cell_sqlite_worker_json_blob_and_original_export(self):
+            from unittest import mock
+            original='{"message":"Zażółć gęślą jaźń","values":[1,2,3]}'.encode('utf-8');page=self.sqlite_cell_page(original)
+            self.assertTrue(page.model._page['rows'][0][1]['deferred']);self.assertTrue(page.model._page['row_tokens'][0]['objects']);dialog=page.full_cell(page.model.index(1,1));self.wait(lambda:dialog._result.get('format')=='json')
+            self.assertEqual(json.loads(dialog.text.toPlainText()),json.loads(original));self.assertFalse(dialog._result['truncated']);target=self.root/'original.json'
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(target),'')):dialog.save_full()
+            self.wait(lambda:target.exists() and not dialog._busy);self.assertEqual(target.read_bytes(),original);self.assertIn('Zapisano całą',dialog.note.text());dialog.reject()
+        def test_database_cell_sqlite_worker_large_text_is_partial_but_export_complete(self):
+            from unittest import mock
+            original='Zażółć gęślą jaźń.\n'*60000;self.assertGreater(len(original.encode('utf-8')),DATABASE_CELL_MAX_BYTES);page=self.sqlite_cell_page(original)
+            self.assertTrue(page.model._page['rows'][0][1]['deferred']);dialog=page.full_cell(page.model.index(1,1));self.wait(lambda:bool(dialog._result),30000)
+            self.assertTrue(dialog._result['truncated']);self.assertIn('częściowy',dialog.note.text());self.assertLess(len(dialog.text.toPlainText()),len(original));self.assertNotIn('Pobrano pełną',dialog.note.text());target=self.root/'complete-text.txt'
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(target),'')):dialog.save_full()
+            self.wait(lambda:target.exists() and not dialog._busy,30000);self.assertEqual(target.read_bytes(),original.encode('utf-8'));dialog.reject()
         def test_oracle_inventory_all_pages_and_open_data_survive(self):
             from unittest import mock
             source,ex,requests=self.oracle_scope_fixture();first=self.oracle_scope_table('BIG','T000001');last=self.oracle_scope_table('BIG','T049294')
@@ -18823,6 +20800,94 @@ def ui_test():
             ws=self.window.sheet_workspace;self.assertEqual(ws.sheet_tabs.count(),2);ws.sheet_tabs.setCurrentIndex(1);app.processEvents()
             self.assertEqual(ws.active_sheet()['name'],'Drugi – dane');self.assertEqual(self.service.document['analyses'],[])
             self.assertEqual(file_digest(path),before);self.assertTrue(self.window._sheet_mode)
+        def test_xlsm_drop_opens_cells_warns_about_macros_and_preserves_original(self):
+            path=create_intake_test_xlsm(self.root/'Makra #1.XLSM');before=file_digest(path)
+            self.native_drop(self.window,self.file_mime(path));self.wait(lambda:bool(self.service.document.get('workpads')),25000)
+            ws=self.window.sheet_workspace;self.assertEqual(ws.active_sheet()['name'],'Dane');self.assertEqual(str(ws.model.data(ws.model.index(1,0))),'123')
+            self.assertTrue(any('Makra' in warning and 'nie są uruchamiane' in warning for warning in ws.session.book['warnings']));self.assertIn('nie są uruchamiane',self.window.statusBar().currentMessage());self.assertEqual(file_digest(path),before)
+        def test_xlsm_import_dialog_selects_sheet_disables_csv_and_shows_notice(self):
+            path=create_intake_test_xlsm(self.root/'preview.xlsm');dialog=ui['ImportDialog'](self.window,str(path));dialog.show()
+            try:
+                self.wait(lambda:dialog.ok.isEnabled());self.assertTrue(dialog.sheet.isEnabled());self.assertEqual(dialog.sheet.currentData(),'Dane');self.assertFalse(dialog.delimiter.isEnabled());self.assertFalse(dialog.encoding.isEnabled())
+                self.assertIn('nie są uruchamiane',dialog.note.text());self.assertEqual(dialog.sample_table.item(0,0).text(),'123')
+            finally:dialog.reject();self.wait(lambda:not dialog.job);dialog.deleteLater()
+        def excel_session_fixture(self,available=True,prompts=None):
+            from unittest import mock
+            instances=[];path=self.root/'session.xlsm';path.write_bytes(b'INERT GUI FIXTURE; no Excel is started')
+            class FakeController:
+                def __init__(inner,source,root):
+                    inner.calls=[];inner.snapshot={'session_id':uid(),'state':'new','owned':False,'pid':701,'hwnd':702,'active_sheet':'Raport','events':[],'last_result':{},'error':'','finished':False};instances.append(inner)
+                def start(inner,**options):inner.calls.append(('start',options));inner.snapshot.update(state='ready',owned=True);return inner.snapshot['session_id']
+                def poll(inner):return clone(inner.snapshot)
+                def submit(inner,action,args):inner.calls.append((action,clone(args)));inner.snapshot.update(state='busy',operation=action,error='');return uid()
+                def close(inner):inner.calls.append(('close',{}));inner.snapshot.update(state='closed',owned=False,finished=True)
+                def cancel(inner):inner.calls.append(('cancel',{}));inner.snapshot.update(state='closed',owned=False,finished=True,cancelled=True)
+            patches=[mock.patch(__name__+'.excel_availability',return_value={'available':available,'reason':'Microsoft Excel nie jest zainstalowany.'}),mock.patch(__name__+'.ExcelSessionController',FakeController),mock.patch(__name__+'.excel_native_dialogs',return_value=clone(prompts or [])),mock.patch(__name__+'.excel_native_dialog_action',return_value={'ok':True,'sent':True})]
+            active=[]
+            for patch in patches:active.append(patch.start());self.addCleanup(patch.stop)
+            dialog=ui['ExcelSessionDialog'](self.window,str(path));dialog.show();self.addCleanup(lambda:(dialog.dispose(),dialog.close()) if ui['qt_object_alive'](dialog) else None);app.processEvents()
+            return dialog,instances,active[-2],active[-1]
+        def excel_prompt_fixture(self):
+            return {'pid':701,'main_hwnd':702,'hwnd':703,'title':'Microsoft Excel','text':'Znaleziono błąd: Nieprawidłowy numer projektu. Dopuszczalne: Pxxxx KIT-xxxxx KIT-xxxxx Czy przerwać sprawdzanie?',
+                'buttons':[{'hwnd':704,'text':'Tak','id':6,'enabled':True},{'hwnd':705,'text':'Nie','id':7,'enabled':True}],'fingerprint':'prompt-one','complete':True,'enabled':True}
+        def excel_button(self,dialog,text):
+            app.processEvents();return next(b for b in dialog.findChildren(QW.QPushButton) if b.text()==text and b.isVisible())
+        def test_excel_session_unavailable_is_readable_and_never_starts(self):
+            dialog,instances,scan,action=self.excel_session_fixture(available=False)
+            self.assertIn('nie jest zainstalowany',dialog.state_note.text());self.assertFalse(dialog.open_button.isEnabled());dialog.start_session();self.assertFalse(instances);scan.assert_not_called();action.assert_not_called();self.assertIn('excel_session',self.window.app_actions)
+        def test_excel_session_open_is_explicit_and_open_events_are_opt_in(self):
+            dialog,instances,scan,action=self.excel_session_fixture();self.assertFalse(instances);self.assertFalse(dialog.open_events.isChecked());dialog.open_button.click();self.assertEqual(len(instances),1)
+            self.assertEqual(instances[0].calls,[('start',{'run_open_events':False})]);self.assertTrue(dialog.pdf_button.isEnabled());self.assertFalse(dialog.run_button.isEnabled())
+            instances[0].snapshot.update(state='closed',owned=False,finished=True);dialog.poll();dialog.open_events.setChecked(True);dialog.open_button.click();self.assertEqual(instances[1].calls,[('start',{'run_open_events':True})])
+        def test_excel_session_macro_pdf_and_copy_are_explicit_async_commands(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();controller=instances[0];dialog.macro_name.setText('Module1.Report');dialog.run_button.click();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual(controller.calls[-1],('run_macro',{'name':'Module1.Report'}));self.assertFalse(dialog.run_button.isEnabled())
+            for operation,control,name in (('export_pdf',dialog.pdf_button,'report.pdf'),('save_copy',dialog.save_copy_button,'copy.xlsm')):
+                controller.snapshot.update(state='ready',last_result={},error='');dialog.poll();target=str(self.root/name)
+                with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(target,'')):control.click()
+                self.wait(lambda:not dialog._command_pending);self.assertEqual(controller.calls[-1],(operation,{'destination':target}))
+            controller.snapshot.update(state='ready',last_result={},error='');dialog.poll();before=len(controller.calls)
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(self.service.root/'protected.xlsm'),'')):dialog.save_copy_button.click()
+            self.wait(lambda:not dialog._command_pending);self.assertEqual(len(controller.calls),before);self.assertTrue(dialog.message.text())
+        def test_excel_session_skip_sends_exact_no_once_and_keeps_pending(self):
+            prompt=self.excel_prompt_fixture();dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);dialog.start_session();self.wait(lambda:not dialog._scan_pending)
+            self.assertEqual(dialog._last_prompts,[prompt]);self.assertIn(prompt['text'],[v.toPlainText() for v in dialog.prompt_frame.findChildren(QW.QPlainTextEdit)])
+            self.excel_button(dialog,'Pomiń → Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending);action.assert_called_once_with(701,702,prompt,705)
+            self.assertIn('Wysłano wybór „Nie”',dialog.message.text());self.assertFalse(self.excel_button(dialog,'Pomiń → Nie').isEnabled());dialog.click_prompt(prompt,prompt['buttons'][1]);self.assertEqual(action.call_count,1)
+        def test_excel_session_prompt_stale_error_never_clicks_an_alternative(self):
+            prompt=self.excel_prompt_fixture();dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);action.side_effect=UserError('Komunikat zmienił się; niczego nie kliknięto.')
+            dialog.start_session();self.wait(lambda:not dialog._scan_pending);self.excel_button(dialog,'Pomiń → Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending)
+            self.assertEqual(action.call_count,1);self.assertIn('niczego nie kliknięto',dialog.message.text());self.assertFalse(dialog._sent_prompts)
+        def test_excel_session_unanswered_prompt_can_be_manually_reenabled(self):
+            prompt=self.excel_prompt_fixture();dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);dialog.start_session();self.wait(lambda:not dialog._scan_pending)
+            self.excel_button(dialog,'Pomiń → Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending);dialog._sent_prompts[703]=('prompt-one',time.monotonic()-4);dialog.poll()
+            self.excel_button(dialog,'Odblokuj odpowiedzi').click();self.assertEqual(action.call_count,1);self.assertTrue(self.excel_button(dialog,'Pomiń → Nie').isEnabled())
+            self.excel_button(dialog,'Pomiń → Nie').click();self.wait(lambda:not dialog._action_pending);self.assertEqual(action.call_count,2)
+        def test_excel_session_scan_runs_off_gui_and_foreign_session_cannot_publish(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();gate=threading.Event();started=threading.Event();thread_ids=[]
+            def discover(*args):thread_ids.append(threading.get_ident());started.set();gate.wait(2);return [self.excel_prompt_fixture()]
+            scan.side_effect=discover;dialog.start_session();flag=[];QC.QTimer.singleShot(20,lambda:flag.append(True));self.wait(lambda:bool(flag));self.assertTrue(started.is_set());self.assertNotEqual(thread_ids[0],threading.get_ident());self.assertTrue(dialog._scan_pending)
+            instances[0].snapshot.update(state='closed',owned=False,finished=True);dialog.poll();gate.set();self.wait(lambda:not dialog._tasks.pending);self.assertFalse(dialog._last_prompts);action.assert_not_called()
+        def test_excel_session_unowned_and_incomplete_prompts_are_not_actionable(self):
+            dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();self.wait(lambda:not dialog._scan_pending);scan.reset_mock();instances[0].snapshot['owned']=False;dialog.poll();dialog._last_scan=0;dialog.poll();scan.assert_not_called();self.assertFalse(dialog.pdf_button.isEnabled())
+            prompt=self.excel_prompt_fixture();prompt['complete']=False;dialog.render_prompts([prompt]);self.assertFalse(any(b.isEnabled() for b in dialog.prompt_frame.findChildren(QW.QPushButton)));self.assertFalse(any(b.text().startswith('Pomiń') for b in dialog.prompt_frame.findChildren(QW.QPushButton)))
+        def test_excel_session_close_waits_for_owned_cleanup_and_error_finish(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();controller=instances[0];controller.snapshot.update(state='error',error='Cleanup pending',owned=True,finished=False);dialog.poll();dialog.start_session();self.assertEqual(len(instances),1);self.assertFalse(dialog.open_button.isEnabled())
+            controller.close=lambda:controller.calls.append(('close',{}));dialog.close();self.assertTrue(dialog._closing);self.assertFalse(dialog._disposed);self.assertEqual(controller.calls[-1][0],'close')
+            controller.snapshot.update(finished=True,owned=False);dialog.poll();self.assertTrue(dialog._disposed)
+        def test_excel_session_close_can_save_copy_before_ending_own_session(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();controller=instances[0];target=str(self.root/'saved-copy.xlsm')
+            with mock.patch.object(QW.QMessageBox,'exec',lambda box:next(b for b in box.buttons() if b.text()=='Zapisz kopię…').click()),mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(target,'')):dialog.close()
+            self.wait(lambda:not dialog._command_pending);self.assertEqual(controller.calls[-1][0],'save_copy');self.assertFalse(dialog._closing)
+            controller.snapshot.update(state='ready',last_result={'destination':target},error='');dialog.poll();self.assertEqual(controller.calls[-1][0],'close');dialog.poll();self.assertTrue(dialog._disposed)
+        def test_excel_session_native_text_is_plain_and_empty_history_events_are_ignored(self):
+            prompt=self.excel_prompt_fixture();prompt.update(title='<b>Workbook prompt</b>',text='<script>not markup</script>');dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);dialog.start_session();self.wait(lambda:not dialog._scan_pending)
+            title=next(v for v in dialog.prompt_frame.findChildren(QW.QLabel) if v.text()==prompt['title']);self.assertEqual(title.textFormat(),Qt.TextFormat.PlainText);self.assertEqual(dialog.prompt_frame.findChild(QW.QPlainTextEdit).toPlainText(),prompt['text'])
+            instances[0].snapshot['events']=[{'seq':1,'event':'created'},{'seq':2,'message':'Gotowe'}];dialog.poll();dialog.poll();self.assertEqual(dialog.history.toPlainText(),'Gotowe')
 
         def test_picker_csv_preserves_existing_analysis(self):
             self.demo();before=clone(self.window.analysis);rid=self.window.pivot.rid;count=len(self.service.document['analyses'])
