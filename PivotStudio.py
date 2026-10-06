@@ -4649,7 +4649,26 @@ try {
     $sessionId = [string]$request.session_id
     $workbookId = $sessionId+'-book'
     if ($request.action -ne 'open') { throw 'First request must open a working copy.' }
-    Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PivotExcelProcess { [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid); }'
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PivotExcelProcess { [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid); }
+[ComImport, Guid("00000016-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IPivotOleMessageFilter {
+    [PreserveSig] int HandleInComingCall(int callType, IntPtr caller, int tickCount, IntPtr interfaceInfo);
+    [PreserveSig] int RetryRejectedCall(IntPtr callee, int tickCount, int rejectType);
+    [PreserveSig] int MessagePending(IntPtr callee, int tickCount, int pendingType);
+}
+public sealed class PivotExcelMessageFilter : IPivotOleMessageFilter {
+    [DllImport("ole32.dll")] static extern int CoRegisterMessageFilter(IPivotOleMessageFilter filter, out IPivotOleMessageFilter previous);
+    public static int Register() { IPivotOleMessageFilter previous; return CoRegisterMessageFilter(new PivotExcelMessageFilter(), out previous); }
+    public int HandleInComingCall(int callType, IntPtr caller, int tickCount, IntPtr interfaceInfo) { return 0; }
+    // SERVERCALL_RETRYLATER: Excel edits a cell or shows a modal window. Retry briefly, then report.
+    public int RetryRejectedCall(IntPtr callee, int tickCount, int rejectType) { return rejectType == 2 && tickCount < 15000 ? 250 : -1; }
+    public int MessagePending(IntPtr callee, int tickCount, int pendingType) { return 2; }
+}
+'@
+    [void][PivotExcelMessageFilter]::Register()
     $previous = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
     Send-Session @{ event='busy'; id=$request.id; operation='open' }
     $excel = New-Object -ComObject Excel.Application
@@ -4748,13 +4767,21 @@ try {
 '''
 
 
+def excel_session_error_text(message):
+    """Office refuses automation while a cell is edited or one of its windows is modal."""
+    text=str(message or '')
+    if re.search(r'0x800AC472|0x8001010A|0x80010001|RPC_E_SERVERCALL_RETRYLATER|RPC_E_CALL_REJECTED',text,re.IGNORECASE):
+        return 'Excel jest zajęty: edytujesz komórkę albo w Excelu jest otwarte okno. Zakończ to w Excelu i spróbuj ponownie.'
+    return text
+
+
 class ExcelSessionController:
     """Durable working copy + dedicated STA process; no COM calls on the UI thread."""
     def __init__(self,source_path,root,on_event=None):
         self.original=Path(os.path.abspath(os.path.expanduser(str(source_path))));self.root=Path(os.path.abspath(os.path.expanduser(str(root))));self.on_event=on_event
         self.session_id=uid();self.lock=threading.RLock();self.write_lock=threading.Lock();self.cancelled=threading.Event();self.finished=threading.Event()
         self.process=None;self.owned_process=None;self.thread=None;self.reaper=None;self.dispatcher=None;self.previous=set();self.pending=None;self.temp_root=None;self.staged=None;self._copy_cancel=None
-        self.state={'session_id':self.session_id,'workbook_id':self.session_id+'-book','state':'new','job_id':'','operation':'','original_path':str(self.original),'source_path':str(self.original),'staged_path':'','working_copy':'','temp_root':'','workspace_path':'','last_saved_path':'','pid':0,'hwnd':0,'owned':False,'alive':False,'active_sheet':'','last_result':{},'error':'','events':[],'cancelled':False,'finished':False}
+        self.state={'session_id':self.session_id,'workbook_id':self.session_id+'-book','state':'new','job_id':'','operation':'','original_path':str(self.original),'source_path':str(self.original),'staged_path':'','working_copy':'','temp_root':'','workspace_path':'','last_saved_path':'','pid':0,'hwnd':0,'owned':False,'alive':False,'active_sheet':'','last_result':{},'last_operation':'','error':'','error_operation':'','events':[],'cancelled':False,'finished':False}
     def _event(self,event,**fields):
         with self.lock:
             if isinstance(fields.get('result'),dict) and 'snapshot' in fields['result']:
@@ -4846,7 +4873,7 @@ class ExcelSessionController:
             if self.process.wait(timeout=2)!=0 and not self.cancelled.is_set():raise UserError('Proces obsługi Excel zakończył się nieoczekiwanie.')
         except Exception as exc:
             if not self.cancelled.is_set():
-                with self.lock:self.state.update(state='error',error=safe_error(exc),job_id='')
+                with self.lock:self.state.update(state='error',error=safe_error(exc),error_operation='open',job_id='')
                 self._event('error',message=safe_error(exc))
         finally:
             self._finish()
@@ -4872,7 +4899,7 @@ class ExcelSessionController:
             self._send({'action':'close' if self.cancelled.is_set() else 'attach'});return
         if event=='fatal':
             message=str(value.get('message','Nie ukończono otwierania sesji Excel.'))[:1800]
-            with self.lock:self.state.update(state='error',error=message,job_id='')
+            with self.lock:self.state.update(state='error',error=excel_session_error_text(message),error_operation='open',job_id='')
             self._event('error',message=message);return
         if event=='closed':return
         with self.lock:
@@ -4891,12 +4918,12 @@ class ExcelSessionController:
             if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
             if event=='busy':self.state['state']='busy'
             elif event in ('ready','done','error'):
-                self._remove_pending()
+                self._remove_pending();self.state['last_operation']=str(value.get('operation') or operation or 'open')
                 if event=='error':
-                    self.state.update(error=str(value.get('message','Błąd Excel.'))[:1800],applied=value.get('applied',0))
+                    self.state.update(error=excel_session_error_text(value.get('message','Błąd Excel.'))[:1800],error_operation=str(value.get('operation') or operation or 'open'),applied=value.get('applied',0))
                     if value.get('result'):self.state.update(last_result=clone(value['result']),active_sheet=str(value['result'].get('active_sheet','')))
                 else:
-                    result=value.get('result') or {};self.state.update(error='',last_result=clone(result),active_sheet=str(result.get('active_sheet','')))
+                    result=value.get('result') or {};self.state.update(error='',error_operation='',last_result=clone(result),active_sheet=str(result.get('active_sheet','')))
                     if result.get('saved_path'):self.state['last_saved_path']=result['saved_path']
                 self.state.update(state='ready',job_id='',operation='')
         self._event(event,operation=value.get('operation','open'),message=value.get('message',''),result=value.get('result',{}),applied=value.get('applied',0),retry_safe=False)
@@ -4930,7 +4957,7 @@ class ExcelSessionController:
                     if type(value) is not int or not 1<=value<=maximum:raise UserError('Nieprawidłowy zakres podglądu Excel.')
                     command[key]=value
                 if command['top']+command['rows']-1>1048576 or command['left']+command['cols']-1>16384:raise UserError('Podgląd wychodzi poza arkusz Excel.')
-            self.state.update(state='busy',job_id=jid,operation=action,error='')
+            self.state.update(state='busy',job_id=jid,operation=action,error='',error_operation='')
             self.dispatcher=threading.Thread(target=self._dispatch,args=(command,),name='pivot-excel-request',daemon=False);self.dispatcher.start()
         self._event('submitted',operation=action,id=jid);return jid
     def _dispatch(self,command):
@@ -4954,7 +4981,7 @@ class ExcelSessionController:
                 with contextlib.suppress(OSError):Path(temp).unlink()
             with self.lock:
                 if self.pending and self.pending['id']==command['id']:self.pending=None
-                if not self.cancelled.is_set() and command['id']==self.state['job_id']:self.state.update(state='ready',job_id='',operation='',error=safe_error(exc))
+                if not self.cancelled.is_set() and command['id']==self.state['job_id']:self.state.update(state='ready',job_id='',operation='',error=safe_error(exc),error_operation=command['action'])
             self._event('error',message=safe_error(exc),operation=command['action'])
     def _publish(self,pending):
         if self.cancelled.is_set():raise Cancelled('Anulowano zapis.')
@@ -10452,27 +10479,56 @@ def native_ui_types():
             editor=super().createEditor(parent,option,index);editor.setStyleSheet('color: '+index.data(Qt.ItemDataRole.ForegroundRole).color().name()+'; background: '+index.data(Qt.ItemDataRole.BackgroundRole).color().name()+'; padding: 0px;')
             return editor
 
+    class ExcelStatusLine(QW.QLabel):
+        """One line of the latest message; the full text is in the tooltip and the options tab."""
+        clicked=QC.Signal()
+        def __init__(self,parent=None):
+            super().__init__(parent);self._full='';self.setObjectName('muted');self.setTextFormat(Qt.TextFormat.PlainText)
+            self.setCursor(Qt.CursorShape.PointingHandCursor);self.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed)
+        def set_full_text(self,text):
+            text=str(text or '')
+            if text!=self._full:self._full=text;self.setToolTip(text);self.elide()
+        def elide(self):
+            line=' '.join(self._full.split());self.setText(self.fontMetrics().elidedText(line,Qt.TextElideMode.ElideRight,max(24,self.width()-4)))
+        def resizeEvent(self,event):super().resizeEvent(event);self.elide()
+        def mouseReleaseEvent(self,event):
+            super().mouseReleaseEvent(event)
+            if event.button()==Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):self.clicked.emit()
+        def minimumSizeHint(self):return QC.QSize(0,super().minimumSizeHint().height())
+
     class ExcelSessionDialog(QW.QDialog):
         """Controls an explicitly opened, separate Excel instance and its prompts."""
         nativeCopyReady=QC.Signal(str)
         def __init__(self,window,path=''):
             super().__init__(window);self._host_window=window;self._controller=None;self._snapshot={};self._epoch=0;self._disposed=False;self._closing=False;self._close_after_save=False
             self._scan_pending=False;self._action_pending=False;self._command_pending=False;self._sent_prompts={};self._retry_prompts=set();self._last_prompts=[];self._last_scan=0.;self._native_digest=None;self._event_seq=0;self._last_result_key=None
+            self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
             self._office_context=None;self._native_book_id='';self._native_controls=[];self._native_loading=False;self._last_view_refresh=0.;self._initial_control_pending=False;self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._companion_paths=[]
             self._tasks=AsyncTasks(self);self._timer=QC.QTimer(self);self._timer.setInterval(250);self._timer.timeout.connect(self.poll)
             self.setWindowTitle('Excel: makra i PDF');self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-            outer=QW.QVBoxLayout(self);outer.setContentsMargins(18,16,18,16);outer.setSpacing(9)
-            outer.addWidget(label('Excel: makra i PDF',False));outer.addWidget(label('Osobne, widoczne okno Excela pracuje na kopii. Możesz używać przycisków w skoroszycie albo podać nazwę makra poniżej.',True,True))
-            outer.addWidget(label('Przed zamknięciem zapisz stan sesji lub osobną kopię, aby zachować zmiany.',True,True))
-            row=QW.QHBoxLayout();self.file=PathField(path,'Skoroszyty Excel (*.xlsx *.xlsm)');row.addWidget(self.file,1);self.open_button=button('Otwórz w Excelu',self.start_session);row.addWidget(self.open_button);outer.addLayout(row)
-            self.open_events=QW.QCheckBox('Uruchom także makra otwarcia');self.open_events.setToolTip('Dotyczy tylko tej zewnętrznej sesji. Excel stosuje własne ustawienia zabezpieczeń makr.');outer.addWidget(self.open_events)
-            companion_row=QW.QHBoxLayout();self.companion_button=button('Dodaj pliki powiązane…',self.choose_companions);companion_row.addWidget(self.companion_button)
-            self.companion_note=label('Szablony i dokumenty zostaną skopiowane obok skoroszytu.',True,True);companion_row.addWidget(self.companion_note,1);outer.addLayout(companion_row)
+            self._work_screen=None;self._screen_handle=None
+            outer=QW.QVBoxLayout(self);outer.setContentsMargins(12,10,12,10);outer.setSpacing(6)
+            self.state_note=label('',False);self.state_note.setTextFormat(Qt.TextFormat.PlainText);self.state_note.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);outer.addWidget(self.state_note)
+            self.selected_note=label('',True);self.selected_note.setTextFormat(Qt.TextFormat.PlainText);self.selected_note.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);outer.addWidget(self.selected_note)
+            self.control_bar=QW.QWidget();control_row=QW.QHBoxLayout(self.control_bar);control_row.setContentsMargins(0,0,0,0);control_row.addWidget(label('Przycisk:'))
+            self.native_controls=QW.QComboBox();self.native_controls.setPlaceholderText('Wybierz przycisk skoroszytu');control_row.addWidget(self.native_controls,1);outer.addWidget(self.control_bar)
+            self.body_tabs=QW.QTabWidget();outer.addWidget(self.body_tabs,1);self._prompt_tab_key=None
+            self.options_frame=QW.QWidget();options=QW.QVBoxLayout(self.options_frame);options.setContentsMargins(10,10,10,10)
+            options.addWidget(label('Uruchom sesję Excela, a potem wybierz przycisk skoroszytu i kliknij „Uruchom”. Excel pracuje na osobnej kopii pliku.',True,True))
+            self.file=PathField(path,'Skoroszyty Excel (*.xlsx *.xlsm)');options.addWidget(self.file)
+            self.open_events=QW.QCheckBox('Uruchom także makra otwarcia');self.open_events.setToolTip('Dotyczy tylko tej zewnętrznej sesji. Excel stosuje własne ustawienia zabezpieczeń makr.');options.addWidget(self.open_events)
+            self.companion_button=button('Dodaj pliki powiązane…',self.choose_companions);options.addWidget(self.companion_button,0,Qt.AlignmentFlag.AlignLeft)
+            self.companion_note=label('Szablony i dokumenty zostaną skopiowane obok skoroszytu.',True,True);options.addWidget(self.companion_note)
+            self.session_options=QW.QWidget();session_options=QW.QVBoxLayout(self.session_options);session_options.setContentsMargins(0,0,0,0)
+            session_options.addWidget(label('Makro po nazwie',False))
             row=QW.QHBoxLayout();self.macro_name=QW.QLineEdit();self.macro_name.setPlaceholderText('Nazwa makra, np. Moduł1.PrzygotujRaport');row.addWidget(self.macro_name,1)
-            self.run_button=button('Uruchom makro',self.run_macro);row.addWidget(self.run_button);outer.addLayout(row)
-            row=QW.QHBoxLayout();self.pdf_button=button('PDF bieżącego arkusza…',self.export_pdf);self.pdf_button.setToolTip('Eksportuje arkusz aktywny w widocznym oknie Excela.')
-            self.save_copy_button=button('Zapisz kopię…',self.save_copy);self.save_working_button=button('Zapisz stan sesji',lambda:self.submit('save_working',{}));self.open_workspace_button=button('Folder sesji',self.open_workspace);row.addWidget(self.pdf_button);row.addWidget(self.save_working_button);row.addWidget(self.save_copy_button);row.addWidget(self.open_workspace_button);row.addStretch();outer.addLayout(row)
-            self.state_note=label('',False,True);self.message=label('',True,True);self.state_note.setTextFormat(Qt.TextFormat.PlainText);self.message.setTextFormat(Qt.TextFormat.PlainText);outer.addWidget(self.state_note);outer.addWidget(self.message)
+            self.run_button=button('Uruchom makro',self.run_macro);row.addWidget(self.run_button);session_options.addLayout(row)
+            self.pdf_button=button('PDF arkusza…',self.export_pdf);self.pdf_button.setToolTip('Eksportuje arkusz aktywny w widocznym oknie Excela.')
+            self.save_copy_button=button('Zapisz kopię…',self.save_copy);self.save_working_button=button('Zapisz stan sesji',lambda:self.submit('save_working',{}));self.open_workspace_button=button('Folder sesji',self.open_workspace)
+            commands=QW.QGridLayout()
+            for i,control in enumerate((self.pdf_button,self.save_working_button,self.save_copy_button,self.open_workspace_button)):commands.addWidget(control,i//2,i%2)
+            session_options.addLayout(commands);session_options.addWidget(label('Przed zamknięciem zapisz stan sesji lub osobną kopię, aby zachować zmiany.',True,True));options.addWidget(self.session_options)
+            self.message=label('',True,True);self.message.setTextFormat(Qt.TextFormat.PlainText);options.addWidget(self.message)
             self.native_frame=QW.QGroupBox('Bieżący arkusz w Excelu');native_layout=QW.QVBoxLayout(self.native_frame)
             native_row=QW.QHBoxLayout();self.native_sheets=QW.QComboBox();native_row.addWidget(self.native_sheets,1)
             self.native_top=QW.QSpinBox();self.native_top.setRange(1,SHEET_MAX_ROWS);self.native_top.setPrefix('Wiersz ');native_row.addWidget(self.native_top)
@@ -10481,24 +10537,56 @@ def native_ui_types():
             self.native_model=ExcelViewportModel(self);self.native_model.editRequested.connect(self.edit_native);self.native_table=QW.QTableView();self.native_table.setModel(self.native_model)
             self.native_table.setObjectName('excelLiveGrid');self.native_table.setStyleSheet('QTableView#excelLiveGrid { background: #ffffff; color: #000000; gridline-color: #cccccc; } QHeaderView::section { padding: 0px 5px; }');self.native_table.setItemDelegate(ExcelViewportDelegate(self.native_table))
             self.native_table.setMinimumHeight(150);self.native_table.horizontalHeader().setDefaultSectionSize(95);self.native_table.verticalHeader().setDefaultSectionSize(24);self.native_table.horizontalHeader().setMinimumSectionSize(1);self.native_table.verticalHeader().setMinimumSectionSize(1);native_layout.addWidget(self.native_table,1)
-            control_row=QW.QHBoxLayout();self.native_controls=QW.QComboBox();control_row.addWidget(self.native_controls,1)
-            self.native_reveal=button('Pokaż w Excelu',self.reveal_control);control_row.addWidget(self.native_reveal)
-            self.native_macro=button('Uruchom przypisane makro',self.run_control_macro);control_row.addWidget(self.native_macro);native_layout.addLayout(control_row)
+            self.native_reveal=button('Pokaż w Excelu',self.reveal_control)
+            self.native_macro=button('Uruchom',self.run_control_macro,True)
             self.native_note=label('Dane i obliczenia pochodzą z tej sesji Excela. Edycja komórki jest wysyłana do otwartego skoroszytu.',True,True);native_layout.addWidget(self.native_note)
             self.native_macro.setToolTip('Uruchamia przypisane makro po nazwie. Kontrolki wymagające Application.Caller lub ActiveX kliknij w oknie Excela.')
             self.native_sheets.currentIndexChanged.connect(self.native_sheet_changed);self.native_controls.currentIndexChanged.connect(self.update_controls)
-            self.body_tabs=QW.QTabWidget();self.body_tabs.addTab(self.native_frame,'Arkusz Excela');self.body_tabs.setTabVisible(0,False);self._prompt_tab_key=None
+            self.native_scroll=QW.QScrollArea();self.native_scroll.setWidgetResizable(True);self.native_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.native_scroll.setWidget(self.native_frame);self.body_tabs.addTab(self.native_scroll,'Arkusz Excela');self.body_tabs.setTabVisible(0,False)
             self.prompt_frame=QW.QGroupBox('Rzeczywiste komunikaty Excela');self.prompt_layout=QW.QVBoxLayout(self.prompt_frame)
-            self.prompt_scroll=QW.QScrollArea();self.prompt_scroll.setWidgetResizable(True);self.prompt_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.prompt_scroll.setWidget(self.prompt_frame);self.body_tabs.addTab(self.prompt_scroll,'Komunikaty');outer.addWidget(self.body_tabs,1)
-            self.history_toggle=QW.QToolButton();self.history_toggle.setText('Historia sesji');self.history_toggle.setCheckable(True);outer.addWidget(self.history_toggle,0,Qt.AlignmentFlag.AlignLeft)
-            self.history=QW.QPlainTextEdit();self.history.setReadOnly(True);self.history.setMaximumBlockCount(100);self.history.setMaximumHeight(110);self.history.hide();self.history_toggle.toggled.connect(self.history.setVisible);outer.addWidget(self.history)
-            row=QW.QHBoxLayout();self.stop_button=button('Przerwij sesję',self.stop_session);row.addWidget(self.stop_button);row.addStretch();self.close_button=button('Zamknij',self.close);row.addWidget(self.close_button);outer.addLayout(row)
+            self.prompt_scroll=QW.QScrollArea();self.prompt_scroll.setWidgetResizable(True);self.prompt_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.prompt_scroll.setWidget(self.prompt_frame);self.body_tabs.addTab(self.prompt_scroll,'Komunikaty')
+            self.history_toggle=QW.QToolButton();self.history_toggle.setText('Historia sesji');self.history_toggle.setCheckable(True);options.addWidget(self.history_toggle,0,Qt.AlignmentFlag.AlignLeft)
+            self.history=QW.QPlainTextEdit();self.history.setReadOnly(True);self.history.setMaximumBlockCount(100);self.history.setMaximumHeight(110);self.history.hide();self.history_toggle.toggled.connect(self.history.setVisible);options.addWidget(self.history)
+            self.stop_button=button('Przerwij sesję',self.stop_session);options.addWidget(self.stop_button,0,Qt.AlignmentFlag.AlignLeft);options.addStretch()
+            self.options_scroll=QW.QScrollArea();self.options_scroll.setWidgetResizable(True);self.options_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.options_scroll.setWidget(self.options_frame);self.body_tabs.addTab(self.options_scroll,'Plik i opcje');self.body_tabs.setCurrentIndex(2)
+            self.notice_button=ExcelStatusLine();self.notice_button.clicked.connect(self.show_message);outer.addWidget(self.notice_button)
+            row=QW.QHBoxLayout();self.open_button=button('Uruchom sesję Excela',self.start_session,True);row.addWidget(self.open_button);row.addWidget(self.native_macro);row.addWidget(self.native_reveal);row.addStretch();self.close_button=button('Zamknij',self.close);row.addWidget(self.close_button);outer.addLayout(row)
+            # Only the footer and short status rows constrain the window. Each page can scroll.
+            for area in (self.native_scroll,self.prompt_scroll,self.options_scroll):area.setMinimumSize(0,0);area.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Ignored)
+            for combo in (self.native_sheets,self.native_controls):combo.setMinimumContentsLength(1);combo.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);combo.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed)
             for control in self.findChildren(QW.QPushButton):control.setAutoDefault(False)
-            self.file.edit.textChanged.connect(self.update_controls);self.macro_name.textChanged.connect(self.update_controls)
+            self.file.edit.textChanged.connect(self.update_controls);self.macro_name.textChanged.connect(self.update_controls);self.body_tabs.currentChanged.connect(self.update_controls)
             try:self._availability=excel_availability()
             except Exception as exc:self._availability={'available':False,'reason':safe_error(exc)}
             self.state_note.setText('Wybierz skoroszyt i otwórz własną sesję Excela.' if self._availability.get('available') else self._availability.get('reason','Excel nie jest dostępny.'))
-            self.render_prompts([]);self.update_controls();limited_dialog_size(self,900,760);self._timer.start()
+            if not self._availability.get('available'):self.message.setText(self.state_note.text())
+            self.render_prompts([]);self.update_controls();self.resize(900,700);self.fit_to_screen();self._timer.start()
+        def available_work_area(self):
+            handle=self.windowHandle();parent=self.parentWidget()
+            screen=handle.screen() if self.isVisible() and handle else parent.screen() if parent else self.screen()
+            return (screen or QW.QApplication.primaryScreen()).availableGeometry()
+        def fit_to_screen(self,available=None):
+            if self._disposed:return
+            bounds=QC.QRect(available if available is not None else self.available_work_area()).adjusted(8,8,-8,-8)
+            self.layout().activate();frame=self.frameGeometry();dw=max(0,frame.width()-self.width());dh=max(0,frame.height()-self.height())
+            self.setMaximumSize(max(1,bounds.width()-dw),max(1,bounds.height()-dh))
+            self.resize(min(self.width(),self.maximumWidth()),min(self.height(),self.maximumHeight()))
+            frame=self.frameGeometry();self.move(max(bounds.left(),min(frame.left(),bounds.right()-frame.width()+1)),max(bounds.top(),min(frame.top(),bounds.bottom()-frame.height()+1)))
+        def _work_area_changed(self,*_):
+            if not self._disposed:self.fit_to_screen()
+        def _screen_changed(self,screen):
+            if self._work_screen is not None:
+                with contextlib.suppress(RuntimeError,TypeError):self._work_screen.availableGeometryChanged.disconnect(self._work_area_changed)
+            self._work_screen=screen
+            if screen is not None:screen.availableGeometryChanged.connect(self._work_area_changed)
+            self._work_area_changed()
+        def showEvent(self,event):
+            super().showEvent(event);handle=self.windowHandle()
+            if handle and handle is not self._screen_handle:
+                self._screen_handle=handle;handle.screenChanged.connect(self._screen_changed);self._screen_changed(handle.screen())
+            self.fit_to_screen();QC.QTimer.singleShot(0,self._work_area_changed)
+        def show_message(self):
+            self.body_tabs.setCurrentIndex(2);self.options_scroll.ensureWidgetVisible(self.message)
         def session_running(self):
             return bool(self._controller and (self._snapshot.get('owned') or (not self._snapshot.get('finished') and self._snapshot.get('state')!='closed')))
         def choose_companions(self):
@@ -10514,28 +10602,40 @@ def native_ui_types():
             self.setWindowModality(Qt.WindowModality.WindowModal);self._initial_control_pending=bool(context.get('control'))
             edits=context.get('edits',[])
             if edits:self.open_events.setChecked(False);self.open_events.setToolTip('Najpierw przenosimy '+str(len(edits))+' jawnych edycji. Makra otwarcia nie mogą uruchomić się przed tym zapisem.')
-            self.message.setText('Przygotowano '+str(len(edits))+' jawnych edycji. Wyniki lokalnego kalkulatora nie są wysyłane do Excela.');self.update_controls()
+            self.message.setText(('Zmiany z arkusza Pivot do przeniesienia do kopii w Excelu: '+str(len(edits))+'. ' if edits else '')+'Kliknij „Uruchom sesję Excela” na dole okna.');self.update_controls()
+        def blocking_error(self):
+            # Only a partly transferred handoff blocks macros until the sheet is read again.
+            return bool(self._snapshot.get('error')) and self._snapshot.get('error_operation','open') in ('open','')
+        def background_read_active(self):
+            return bool(self._auto_read and (self._command_pending or self._snapshot.get('state')=='busy'))
         def update_controls(self,*_):
             state=self._snapshot.get('state','idle');active=self.session_running();ready=state=='ready' and self._snapshot.get('owned') and not self._closing and not self._command_pending
+            # An automatic sheet read never disables explicit commands: they wait for it and run once.
+            usable=bool(self._snapshot.get('owned') and not self._closing and self._queued is None and (ready or self.background_read_active()));blocked=self.blocking_error()
             self.file.setEnabled(not active and not self._closing and not self._office_context);self.open_events.setEnabled(not active and not self._closing and not (self._office_context or {}).get('edits'))
             self.companion_button.setEnabled(not active and not self._closing)
             for widget in (self.file,self.open_button,self.open_events,self.companion_button,self.companion_note):widget.setVisible(not active)
+            self.session_options.setVisible(active or bool(self._snapshot.get('workspace_path')));self.control_bar.setVisible(active);self.native_macro.setVisible(active);self.native_reveal.setVisible(active);self.stop_button.setVisible(active)
+            target=(self._office_context or {}).get('control') or {};caption=str(target.get('caption') or target.get('name') or '')
+            self.selected_note.setText('Wybrany przycisk: '+caption);self.selected_note.setToolTip(self.selected_note.text());self.selected_note.setVisible(bool(caption and not active))
+            self.state_note.setToolTip(self.state_note.text());self.notice_button.set_full_text(self.message.text());self.notice_button.setVisible(bool(self.message.text()) and self.body_tabs.currentWidget() is not self.options_scroll)
             self.open_button.setEnabled(bool(self._availability.get('available') and self.file.text().strip() and not active and not self._closing))
-            self.macro_name.setEnabled(bool(ready));self.run_button.setEnabled(bool(ready and self.macro_name.text().strip()));self.pdf_button.setEnabled(bool(ready));self.save_copy_button.setEnabled(bool(ready))
-            if self._snapshot.get('error'):self.run_button.setEnabled(False)
-            self.save_working_button.setEnabled(bool(ready))
+            self.macro_name.setEnabled(usable);self.run_button.setEnabled(bool(usable and self.macro_name.text().strip() and not blocked));self.pdf_button.setEnabled(usable);self.save_copy_button.setEnabled(usable)
+            self.save_working_button.setEnabled(usable)
             self.open_workspace_button.setEnabled(bool(self._snapshot.get('workspace_path') or self._snapshot.get('temp_root')))
             self.stop_button.setEnabled(bool(active and not self._closing));self.close_button.setEnabled(not self._closing)
-            native_ready=bool(ready and self._native_book_id);self.native_model.editable=native_ready and not self._snapshot.get('error')
+            native_ready=bool(ready and self._native_book_id);native_usable=bool(usable and self._native_book_id);self.native_model.editable=native_ready and not blocked
             for widget in (self.native_sheets,self.native_top,self.native_left,self.native_refresh):widget.setEnabled(native_ready)
-            control=self.native_controls.currentData() or {};self.native_controls.setEnabled(native_ready);self.native_reveal.setEnabled(native_ready and bool(control))
-            self.native_macro.setEnabled(native_ready and bool(control.get('macro_supported')) and not self._snapshot.get('error'))
+            control=self.native_controls.currentData() or {};self.native_controls.setEnabled(native_usable);self.native_reveal.setEnabled(native_usable and bool(control))
+            self.native_macro.setEnabled(native_usable and bool(control.get('macro_supported')) and not blocked)
+            self.native_controls.setToolTip(self.native_controls.currentText());self.native_macro.setToolTip('Uruchom makro przycisku: '+self.native_controls.currentText()+'. Jeśli wymaga Application.Caller, kliknij przycisk bezpośrednio w Excelu.' if control.get('macro_supported') else 'Tę kontrolkę uruchom w oknie Excela. Kliknij „Pokaż w Excelu”.')
         def start_session(self):
             if self._disposed or self._closing or not self._availability.get('available'):return
             if self.session_running():return
             path=self.file.text().strip()
-            if not path or Path(path).suffix.lower() not in WORKBOOK_SUFFIXES:self.message.setText('Wybierz plik XLSM albo XLSX.');return
+            if not path or Path(path).suffix.lower() not in WORKBOOK_SUFFIXES:self.message.setText('Wybierz plik XLSM albo XLSX.');self.update_controls();return
             self._epoch+=1;self._event_seq=0;self._last_result_key=None;self._last_scan=0;self._native_digest=None;self._scan_pending=False;self._action_pending=False;self._sent_prompts={};self._retry_prompts=set();self.history.clear();self.message.clear();self.render_prompts([])
+            self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
             try:
                 self._native_book_id='';self.body_tabs.setTabVisible(0,False);self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._native_loading=True
                 self.native_model.set_snapshot({});self.native_sheets.clear();self.native_controls.clear();self._native_controls=[];self._native_loading=False
@@ -10546,9 +10646,14 @@ def native_ui_types():
                 if self._controller:
                     with contextlib.suppress(Exception):self._controller.cancel()
                 self._controller=None;self._snapshot={'state':'error','finished':True};self.state_note.setText('Nie otwarto sesji Excela.');self.message.setText(safe_error(exc));self.update_controls()
-        def submit(self,action,args):
-            if self._disposed or self._closing or self._command_pending or not self._controller or self._snapshot.get('state')!='ready':return False
-            controller=self._controller;epoch=self._epoch;service=self._host_window.service;self._command_pending=True;self._last_result_key=None;self.message.clear();self.update_controls()
+        def submit(self,action,args,background=False):
+            if self._disposed or self._closing or not self._controller:return False
+            if self._command_pending or self._snapshot.get('state')!='ready':
+                if background or self._queued is not None or not self.background_read_active():return False
+                self._queued=(action,clone(args));self.message.setText('Kończę odczyt arkusza w Excelu, potem wykonam polecenie.');self.update_controls();return True
+            controller=self._controller;epoch=self._epoch;service=self._host_window.service;self._command_pending=True;self._auto_read=bool(background);self._last_result_key=None
+            if not background:self._quiet_read_error=False;self.message.clear()
+            self.update_controls()
             def work():
                 payload=dict(args)
                 if action in ('save_copy','export_pdf'):
@@ -10559,20 +10664,22 @@ def native_ui_types():
                 self._command_pending=False;self.poll()
             def failed(error):
                 if self._disposed or epoch!=self._epoch:return
-                self._command_pending=False;self._close_after_save=False;self.poll();self.message.setText(str(error))
+                self._command_pending=False
+                if background:self.poll();self.native_note.setText('Nie odświeżono podglądu: '+str(error));return
+                self._close_after_save=False;self.poll();self.message.setText(str(error))
             self._tasks.submit(work,done,failed,'Polecenie Excela');return True
         def run_macro(self):
             name=self.macro_name.text().strip()
             if not name:self.message.setText('Wpisz nazwę makra lub użyj przycisku w oknie Excela.');return
-            self.submit('run_macro',{'name':name})
+            if self.submit('run_macro',{'name':name}):self.body_tabs.setCurrentIndex(1)
         def native_sheet_changed(self,*_):
             if self._native_loading:return
             self.native_top.setValue(1);self.native_left.setValue(1)
             self.submit('activate_sheet',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'top':1,'left':1,'rows':30,'cols':12})
-        def refresh_native(self):
+        def refresh_native(self,background=False):
             if self._native_loading or not self._native_book_id:return False
             self._last_view_refresh=time.monotonic()
-            return self.submit('read_range',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'top':self.native_top.value(),'left':self.native_left.value(),'rows':min(30,SHEET_MAX_ROWS-self.native_top.value()+1),'cols':min(12,SHEET_MAX_COLS-self.native_left.value()+1)})
+            return self.submit('read_range',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'top':self.native_top.value(),'left':self.native_left.value(),'rows':min(30,SHEET_MAX_ROWS-self.native_top.value()+1),'cols':min(12,SHEET_MAX_COLS-self.native_left.value()+1)},background=background)
         def edit_native(self,edit):
             if not self._native_book_id:return
             self.submit('apply_edits',{'workbook_id':self._native_book_id,'edits':[edit]})
@@ -10581,7 +10688,8 @@ def native_ui_types():
             if control:self.submit('reveal_control',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'control_id':control['id']})
         def run_control_macro(self):
             control=self.native_controls.currentData() or {}
-            if control.get('macro_supported'):self.submit('run_control_macro',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'control_id':control['id']})
+            if control.get('macro_supported') and not self.blocking_error():
+                if self.submit('run_control_macro',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'control_id':control['id']}):self.body_tabs.setCurrentIndex(1)
         def show_native_view(self):
             first=not self.body_tabs.isTabVisible(0);self.body_tabs.setTabVisible(0,True)
             if first and not self._last_prompts:self.body_tabs.setCurrentIndex(0)
@@ -10630,6 +10738,7 @@ def native_ui_types():
                     if 0<=r<self.native_model.rowCount() and 0<=c<self.native_model.columnCount() and (nr>1 or nc>1):self.native_table.setSpan(r,c,min(nr,self.native_model.rowCount()-r),min(nc,self.native_model.columnCount()-c))
                 if position[0]>=0 and position[0]<self.native_model.rowCount() and position[1]<self.native_model.columnCount():self.native_table.setCurrentIndex(self.native_model.index(*position))
                 self.native_table.verticalScrollBar().setValue(v);self.native_table.horizontalScrollBar().setValue(h)
+                first_view=view.get('sheet_id')!=self._controls_sheet;self._controls_sheet=view.get('sheet_id')
                 previous=self.native_controls.currentData() or {};self._native_controls=view.get('controls',[]);self.native_controls.clear()
                 for control in self._native_controls:self.native_controls.addItem(str(control.get('caption') or control.get('name') or control.get('id','Kontrolka')),control)
                 target=(self._office_context or {}).get('control') if self._initial_control_pending else previous;matched=False
@@ -10639,6 +10748,9 @@ def native_ui_types():
                         matches=[n for n,c in enumerate(self._native_controls) if target.get(key) and c.get(key)==target[key]]
                         if len(matches)==1:i=matches[0];break
                     if i>=0:self.native_controls.setCurrentIndex(i);matched=True
+                    else:self.native_controls.setCurrentIndex(-1)
+                # A sole control on a newly shown sheet is unambiguous. Otherwise never pick one by position.
+                if not matched and first_view and len(self._native_controls)==1 and not (self._office_context or {}).get('control'):self.native_controls.setCurrentIndex(0)
                 note='Dane i obliczenia pochodzą z tej sesji Excela. Edycja komórki jest wysyłana do otwartego skoroszytu.'
                 if result.get('sheets_complete') is False:note+=' Lista arkuszy jest częściowa; pozostałe wybierz w Excelu.'
                 if view.get('controls_complete') is False:note+=' Lista kontrolek jest częściowa; pozostałe są dostępne w Excelu.'
@@ -10649,11 +10761,11 @@ def native_ui_types():
                 if matched:QC.QTimer.singleShot(0,self.reveal_control)
                 else:self.message.setText('Nie rozpoznano wskazanej kontrolki. Wybierz ją bezpośrednio w oknie Excela.')
         def export_pdf(self):
-            if self._snapshot.get('state')!='ready':return
+            if self._snapshot.get('state')!='ready' and not self.background_read_active():return
             name=Path(self.file.text()).stem+'.pdf';destination=QW.QFileDialog.getSaveFileName(self,'PDF bieżącego arkusza',name,'PDF (*.pdf)')[0]
             if destination:self.submit('export_pdf',{'destination':destination})
         def save_copy(self):
-            if self._snapshot.get('state')!='ready':return False
+            if self._snapshot.get('state')!='ready' and not self.background_read_active():return False
             source=Path(self.file.text());suffix=source.suffix.lower();destination=QW.QFileDialog.getSaveFileName(self,'Zapisz kopię skoroszytu',source.stem+' - kopia'+suffix,'Skoroszyt Excel (*'+suffix+')')[0]
             return bool(destination and self.submit('save_copy',{'destination':destination}))
         def session_identity(self):
@@ -10664,20 +10776,38 @@ def native_ui_types():
             try:snapshot=self._controller.poll()
             except Exception as exc:self.message.setText(safe_error(exc));return
             previous=self.session_identity();self._snapshot=snapshot;identity=self.session_identity();state=snapshot.get('state')
+            if self._auto_read and state!='busy' and not self._command_pending:
+                # The automatic read has ended. Its failure is shown under the sheet, not as a command error.
+                self._auto_read=False;self._quiet_read_error=bool(snapshot.get('error')) and snapshot.get('error_operation')=='read_range'
             names={'starting':'Otwieranie kopii w Excelu…','ready':'Excel gotowy.','busy':'Excel wykonuje zadanie…','closing':'Zamykanie własnej sesji Excela…','closed':'Sesja Excela zakończona.','error':'Nie udało się wykonać operacji Excela.'}
-            self.state_note.setText(names.get(state,str(state or ''))+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
-            if snapshot.get('error'):self.message.setText(str(snapshot['error']));self._close_after_save=False
+            status='Excel gotowy · odświeżam podgląd arkusza…' if self.background_read_active() else names.get(state,str(state or ''))
+            self.state_note.setText(status+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
             result=snapshot.get('last_result')
             if result and snapshot.get('error') and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);self.apply_native_result(result,allow_reveal=False)
             if result and state=='ready' and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);destination=result.get('destination') if isinstance(result,dict) else None
-                operation=result.get('action',snapshot.get('operation')) if isinstance(result,dict) else ''
+                operation=(result.get('action') or snapshot.get('last_operation') or snapshot.get('operation') or '') if isinstance(result,dict) else ''
                 if operation in ('save_working','save_copy') and isinstance(result,dict) and (result.get('saved_path') or destination):self.saved_copy_path=str(result.get('saved_path') or destination);self.saved_copy_revision=str(result.get('saved_revision',''))
-                if operation!='read_range':self.message.setText('Zapisano: '+str(destination) if destination else 'Operacja zakończona.')
+                if operation not in ('read_range','open'):
+                    done={'reveal_control':'Przycisk jest wskazany w Excelu. Kliknij „Uruchom” tutaj albo ten przycisk w Excelu.','run_control_macro':'Makro zakończyło działanie.','run_macro':'Makro zakończyło działanie.','apply_edits':'Zapisano zmianę komórki w Excelu.'}
+                    text='Zapisano: '+str(destination) if destination else done.get(operation,'Operacja zakończona.')
+                    if operation=='reveal_control' and result.get('foreground') is False:text+=' Jeśli okno Excela nie wyszło na wierzch, wybierz je na pasku zadań.'
+                    self.message.setText(text)
                 self.apply_native_result(result)
-                if self._close_after_save and state=='ready':self._close_after_save=False;self.begin_close()
+                if self._close_after_save and operation in ('save_working','save_copy'):self._close_after_save=False;self.begin_close()
             elif not self._native_book_id and state=='ready' and snapshot.get('snapshot'):self.apply_native_result(snapshot)
+            if snapshot.get('error'):
+                # After the (previous) result is shown, so its default sheet note cannot hide this.
+                if self._quiet_read_error:self.native_note.setText('Nie odświeżono podglądu: '+str(snapshot['error']))
+                else:self.message.setText(str(snapshot['error']))
+                self._close_after_save=False
+            if self._queued and state=='ready' and not self._command_pending and not self._closing:
+                action,args=self._queued;self._queued=None
+                if action=='run_control_macro' and not any(c.get('id')==args.get('control_id') for c in self._native_controls):self.message.setText('Przycisk zmienił się w Excelu podczas odczytu. Wybierz go ponownie i kliknij „Uruchom”.')
+                elif action in ('run_macro','run_control_macro') and self.blocking_error():self.message.setText(str(snapshot.get('error')))
+                else:self.submit(action,args)
+            elif self._queued and state not in ('ready','busy'):self._queued=None
             for event in snapshot.get('events',[]):
                 if not isinstance(event,dict):continue
                 seq=event.get('seq',0)
@@ -10691,7 +10821,11 @@ def native_ui_types():
             if identity and state not in ('closed','error') and not self._scan_pending and not self._action_pending and time.monotonic()-self._last_scan>=.75:self.scan_prompts(identity)
             elif not identity and self._native_digest is not None:self._native_digest=None;self.render_prompts([])
             self.update_controls()
-            if self._native_book_id and state=='ready' and not snapshot.get('error') and not self._closing and not self._command_pending and not self._last_prompts and time.monotonic()-self._last_view_refresh>=3 and self.native_table.state()!=QW.QAbstractItemView.State.EditingState:self.refresh_native()
+            # Each read is hundreds of COM calls. Mirror Excel only while this view is looked at; never while Excel asks something.
+            interval=10 if snapshot.get('error') else 3
+            if (self._native_book_id and state=='ready' and not self.blocking_error() and not self._closing and not self._command_pending and self._queued is None and not self._last_prompts
+                    and self.isActiveWindow() and self.body_tabs.currentWidget() is self.native_scroll and time.monotonic()-self._last_view_refresh>=interval
+                    and self.native_table.state()!=QW.QAbstractItemView.State.EditingState):self.refresh_native(background=True)
             if self._closing and (state=='closed' or snapshot.get('finished')):self.dispose();self.close()
         def scan_prompts(self,identity):
             self._scan_pending=True;self._last_scan=time.monotonic();pid,hwnd=identity[-2:]
@@ -10710,11 +10844,10 @@ def native_ui_types():
             elif not key and self._prompt_tab_key and self._native_book_id and self.body_tabs.currentIndex()==1:self.body_tabs.setCurrentIndex(0)
             self._prompt_tab_key=key
             self._last_prompts=clone(items)
-            self.prompt_scroll.setMinimumHeight(230 if items else 60)
             while self.prompt_layout.count():
                 item=self.prompt_layout.takeAt(0)
                 if item.widget():item.widget().hide();item.widget().deleteLater()
-            if not items:self.prompt_layout.addWidget(label('Jeśli Excel czeka na odpowiedź, możesz wybrać ją bezpośrednio w jego oknie.',True,True))
+            if not items:self.prompt_layout.addWidget(label('Odpowiedzi, np. „Tak” i „Nie”, pojawią się tutaj, gdy Excel wyświetli pytanie. Najpierw uruchom sesję, wybierz przycisk skoroszytu i kliknij „Uruchom”. Możesz też użyć przycisku bezpośrednio w oknie Excela.',True,True))
             for snapshot in items:
                 frame=QW.QWidget();layout=QW.QVBoxLayout(frame);layout.setContentsMargins(0,0,0,8);title=label(str(snapshot.get('title','Excel')),False,True);title.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(title)
                 text=QW.QPlainTextEdit();text.setReadOnly(True);body=str(snapshot.get('text',''));text.setPlainText(body);text.setFixedHeight(min(110,max(56,20*max(body.count('\n')+1,math.ceil(len(body)/95))+12)));layout.addWidget(text)
@@ -18572,8 +18705,15 @@ send('closed')
             import base64
             command=self.launches[0];self.assertNotIn('-ExecutionPolicy',command);self.assertIn('-EncodedCommand',command);self.assertEqual(base64.b64decode(command[-1]).decode('utf-16-le'),EXCEL_SESSION_BOOTSTRAP);self.assertLess(sum(map(len,command)),32760)
         def test_macro_errors_leave_session_ready_for_direct_pdf(self):
-            controller=self.start();controller.submit('run_macro',{'name':'Fail'});state=self.wait(controller,lambda s:s['state']=='ready' and bool(s['error']));self.assertIn('synthetic',state['error'])
+            controller=self.start();self.assertEqual(controller.poll()['last_operation'],'open');controller.submit('run_macro',{'name':'Fail'});state=self.wait(controller,lambda s:s['state']=='ready' and bool(s['error']));self.assertIn('synthetic',state['error']);self.assertEqual(state['error_operation'],'run_macro')
             out=self.root/'report.pdf';out.write_bytes(b'previous');controller.submit('export_pdf',{'destination':str(out)});state=self.wait(controller,lambda s:s['state']=='ready' and s['last_result'].get('destination')==str(out));self.assertTrue(out.read_bytes().startswith(b'%PDF-'));self.assertEqual(state['active_sheet'],'Raport');self.assertEqual(self.original.read_bytes(),self.before)
+            self.assertEqual((state['error'],state['error_operation'],state['last_operation']),('','','export_pdf'))
+        def test_busy_office_errors_are_explained_and_calls_are_retried_by_a_message_filter(self):
+            for raw in ('Exception from HRESULT: 0x800AC472','Wywołanie zostało odrzucone przez wywoływanego. (Wyjątek od HRESULT: 0x80010001 (RPC_E_CALL_REJECTED))','(Exception from HRESULT: 0x8001010A (RPC_E_SERVERCALL_RETRYLATER))'):
+                self.assertIn('Excel jest zajęty',excel_session_error_text(raw))
+            self.assertEqual(excel_session_error_text('synthetic macro failure'),'synthetic macro failure')
+            text=EXCEL_SESSION_POWERSHELL;self.assertIn('CoRegisterMessageFilter',text);self.assertIn('rejectType == 2 && tickCount < 15000',text)
+            self.assertLess(text.index('[PivotExcelMessageFilter]::Register()'),text.index('New-Object -ComObject Excel.Application'))
         def test_save_copy_preserves_macro_container(self):
             controller=self.start();out=self.root/'saved.xlsm';controller.submit('save_copy',{'destination':str(out)});self.wait(controller,lambda s:s['state']=='ready' and bool(s['last_result'].get('destination')))
             self.assertEqual(out.read_bytes(),self.before);self.assertEqual(self.original.read_bytes(),self.before)
@@ -18767,6 +18907,17 @@ if ($controls[0].macro_supported -or $controls[0].enabled_known -or -not $contro
             encoded=base64.b64encode(script.encode('utf-16-le')).decode('ascii')
             with patch.object(subprocess,'Popen',self.original_popen):result=subprocess.run([str(powershell),'-NoProfile','-NonInteractive','-EncodedCommand',encoded],input=EXCEL_SESSION_POWERSHELL.encode('utf-8'),capture_output=True,timeout=20,creationflags=CREATE_NO_WINDOW)
             self.assertEqual(result.returncode,0,(result.stdout+result.stderr).decode('utf-8','replace'))
+        @unittest.skipUnless(os.name=='nt','Windows PowerShell and COM')
+        def test_message_filter_compiles_and_registers_on_the_sta_thread(self):
+            import base64
+            powershell=Path(os.environ.get('SystemRoot',r'C:\Windows'))/'System32/WindowsPowerShell/v1.0/powershell.exe'
+            if not powershell.is_file():self.skipTest('No Windows PowerShell')
+            block=re.search(r"Add-Type -TypeDefinition @'\n.*?\n'@\n",EXCEL_SESSION_POWERSHELL,re.S).group(0)
+            probe=block+'[PivotExcelMessageFilter]::Register();$f=New-Object PivotExcelMessageFilter;$f.RetryRejectedCall([IntPtr]::Zero,0,2);$f.RetryRejectedCall([IntPtr]::Zero,15000,2);$f.RetryRejectedCall([IntPtr]::Zero,0,1)'
+            encoded=base64.b64encode(probe.encode('utf-16-le')).decode('ascii')
+            with patch.object(subprocess,'Popen',self.original_popen):result=subprocess.run([str(powershell),'-NoProfile','-NonInteractive','-Sta','-EncodedCommand',encoded],capture_output=True,timeout=60,creationflags=CREATE_NO_WINDOW)
+            self.assertEqual(result.returncode,0,(result.stdout+result.stderr).decode('utf-8','replace'))
+            self.assertEqual(result.stdout.decode('utf-8','replace').split(),['0','250','-1','-1'])
     return unittest.defaultTestLoader.loadTestsFromTestCase(ExcelSessionTests)
 
 
@@ -22247,7 +22398,7 @@ def ui_test():
             dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();controller=instances[0];controller.snapshot.update(last_result=self.native_excel_payload(),workspace_path=str(self.root));dialog.poll()
             with mock.patch.object(ui['QtGui'].QDesktopServices,'openUrl',return_value=True) as opened:
                 self.assertEqual(opened.call_count,0);dialog.open_workspace_button.click();self.assertEqual(Path(opened.call_args.args[0].toLocalFile()),self.root)
-            controller.snapshot.update(state='closed',owned=False,finished=True);dialog.poll();dialog.start_session();self.assertEqual(dialog.native_model.rowCount(),0);self.assertTrue(dialog.native_frame.isHidden());self.assertEqual(dialog.native_controls.count(),0)
+            controller.snapshot.update(state='closed',owned=False,finished=True);dialog.poll();dialog.start_session();self.assertEqual(dialog.native_model.rowCount(),0);self.assertFalse(dialog.body_tabs.isTabVisible(0));self.assertEqual(dialog.native_controls.count(),0)
         def test_office_native_cell_paint_preserves_source_background_in_dark_theme(self):
             dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();instances[0].snapshot['last_result']=self.native_excel_payload();dialog.poll();QTest.qWait(60);app.processEvents()
             rect=dialog.native_table.visualRect(dialog.native_model.index(2,0));image=dialog.native_table.viewport().grab().toImage();self.assertEqual(image.pixelColor(rect.right()-5,rect.top()+3).name(),'#ffffff')
@@ -22268,6 +22419,137 @@ def ui_test():
             self.assertLessEqual(dialog.height(),760);self.assertEqual(dialog.body_tabs.currentIndex(),1);skip=self.excel_button(dialog,'Pomiń → Nie');self.assertTrue(dialog.prompt_scroll.viewport().rect().contains(skip.mapTo(dialog.prompt_scroll.viewport(),skip.rect().center())))
             dialog.body_tabs.setCurrentIndex(0);dialog.render_prompts([prompt]);self.assertEqual(dialog.body_tabs.currentIndex(),0)
             prompt['fingerprint']='new-prompt';dialog.render_prompts([prompt]);self.assertEqual(dialog.body_tabs.currentIndex(),1);dialog.render_prompts([]);self.assertEqual(dialog.body_tabs.currentIndex(),0)
+        def test_office_screen_matrix_keeps_footer_inside_work_area_with_large_font_and_long_context(self):
+            from unittest import mock
+            areas=[QC.QRect(0,0,1366,728),QC.QRect(0,0,910,485),QC.QRect(0,0,683,364),QC.QRect(-1530,70,910,485)]
+            for available in areas:
+                with self.subTest(work_area=(available.x(),available.y(),available.width(),available.height())):
+                    dialog,instances,scan,action=self.excel_session_fixture();dialog._timer.stop()
+                    font=dialog.font();font.setPointSizeF(max(1,font.pointSizeF())*1.25);dialog.setFont(font)
+                    long_path=str(self.root/('Długi katalog źródłowy z odstępami '*7)/('Skoroszyt z długą nazwą '*8+'.xlsm'))
+                    dialog.configure_office_context({'source_path':long_path,'source_revision':'a'*64,'sheet':'Raport','control':{'name':'Button 1','caption':'Generuj bardzo szczegółowy raport dla wybranego projektu '*6},'edits':[]})
+                    def visible_inside(widget):
+                        self.assertTrue(widget.isVisible(),widget.objectName() or type(widget).__name__)
+                        box=QC.QRect(widget.mapToGlobal(QC.QPoint(0,0)),widget.size())
+                        self.assertTrue(dialog.rect().contains(QC.QRect(widget.mapTo(dialog,QC.QPoint(0,0)),widget.size())),f'Widget outside dialog: {box}')
+                        self.assertTrue(available.contains(box),f'Widget outside work area: {box}; available={available}')
+                    with mock.patch.object(dialog,'available_work_area',return_value=available):
+                        dialog.fit_to_screen(available);QTest.qWait(25);app.processEvents()
+                        self.assertTrue(available.contains(dialog.frameGeometry()),f'{dialog.frameGeometry()} outside {available}')
+                        self.assertEqual(dialog.open_button.text(),'Uruchom sesję Excela');visible_inside(dialog.open_button);visible_inside(dialog.close_button)
+                        dialog.start_session();self.wait(lambda:not dialog._scan_pending)
+                        controller=instances[0];controller.snapshot.update(last_result=self.native_excel_payload(),error='Nie zastosowano części zmian. Sprawdź chronione komórki i oczekiwane wartości. '*12);dialog.poll()
+                        dialog.fit_to_screen(available);QTest.qWait(25);app.processEvents();baseline=dialog.frameGeometry().size()
+                        self.assertTrue(available.contains(dialog.frameGeometry()))
+                        for widget in (dialog.native_controls,dialog.native_macro,dialog.native_reveal,dialog.close_button):visible_inside(widget)
+                        for tab in (0,1,2):
+                            dialog.body_tabs.setCurrentIndex(tab);app.processEvents()
+                            for widget in (dialog.native_controls,dialog.native_macro,dialog.native_reveal,dialog.close_button):visible_inside(widget)
+                        for iteration in range(3):
+                            prompt=self.excel_prompt_fixture();prompt.update(fingerprint='resized-'+str(iteration),text='Wiersz szczegółowego komunikatu z Excela.\n'*35)
+                            dialog.render_prompts([prompt]);controller.snapshot.update(state='busy',operation='run_control_macro',error='');dialog.poll();dialog.fit_to_screen(available);app.processEvents()
+                            self.assertEqual(dialog.frameGeometry().size(),baseline);self.assertTrue(available.contains(dialog.frameGeometry()))
+                            for widget in (dialog.native_controls,dialog.native_macro,dialog.native_reveal,dialog.close_button):visible_inside(widget)
+                            dialog.render_prompts([]);controller.snapshot.update(state='ready',error='Błąd z długim wyjaśnieniem. '*30);dialog.poll();dialog.fit_to_screen(available);app.processEvents()
+                            self.assertEqual(dialog.frameGeometry().size(),baseline);self.assertTrue(available.contains(dialog.frameGeometry()));visible_inside(dialog.close_button)
+                    dialog.dispose();dialog.close();app.processEvents()
+        def test_office_default_fit_uses_selected_work_area_and_keeps_options_scrollable(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();dialog._timer.stop();available=QC.QRect(-1200,-20,683,364)
+            with mock.patch.object(dialog,'available_work_area',return_value=available) as area:
+                dialog.fit_to_screen();QTest.qWait(25);app.processEvents();self.assertTrue(area.called);self.assertTrue(available.contains(dialog.frameGeometry()))
+                self.assertEqual(dialog.body_tabs.count(),3);self.assertIs(dialog.body_tabs.widget(2),dialog.options_scroll);dialog.body_tabs.setCurrentIndex(2);app.processEvents()
+                for widget in (dialog.file,dialog.open_events,dialog.companion_button):
+                    dialog.options_scroll.ensureWidgetVisible(widget,4,4);app.processEvents()
+                    self.assertTrue(dialog.options_scroll.viewport().rect().contains(widget.mapTo(dialog.options_scroll.viewport(),widget.rect().center())))
+                for widget in (dialog.open_button,dialog.close_button):
+                    self.assertTrue(widget.isVisible());self.assertTrue(available.contains(QC.QRect(widget.mapToGlobal(QC.QPoint(0,0)),widget.size())))
+        def test_office_fixed_primary_run_requires_ready_recognized_control_and_one_explicit_click(self):
+            dialog,instances,scan,action=self.excel_session_fixture();dialog._timer.stop();dialog.configure_office_context({'source_path':dialog.file.text(),'control':{'name':'Button 1','caption':'Generuj raport'},'edits':[]})
+            self.assertEqual(dialog.open_button.text(),'Uruchom sesję Excela');self.assertTrue(dialog.open_button.isVisible());self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(instances)
+            QTest.mouseClick(dialog.open_button,Qt.MouseButton.LeftButton);controller=instances[0];self.assertFalse(dialog.native_macro.isEnabled())
+            controller.snapshot['last_result']=self.native_excel_payload();dialog.poll();self.wait(lambda:any(call[0]=='reveal_control' for call in controller.calls));self.wait(lambda:not dialog._command_pending)
+            self.assertFalse(any(call[0] in ('run_macro','run_control_macro') for call in controller.calls))
+            controller.snapshot.update(state='ready',operation='',error='');dialog.poll();app.processEvents()
+            self.assertEqual(dialog.native_macro.text(),'Uruchom');self.assertEqual(dialog.native_reveal.text(),'Pokaż w Excelu');self.assertTrue(dialog.native_macro.isEnabled())
+            for tab in (0,1,2):
+                dialog.body_tabs.setCurrentIndex(tab);app.processEvents();self.assertTrue(dialog.native_macro.isVisible());self.assertTrue(dialog.native_controls.isVisible());self.assertTrue(dialog.close_button.isVisible())
+            QTest.mouseClick(dialog.native_macro,Qt.MouseButton.LeftButton);QTest.mouseClick(dialog.native_macro,Qt.MouseButton.LeftButton);self.wait(lambda:not dialog._command_pending)
+            runs=[call for call in controller.calls if call[0]=='run_control_macro'];self.assertEqual(runs,[('run_control_macro',{'workbook_id':'native-book','sheet_id':'sheet-1','control_id':'native-control'})]);self.assertFalse(dialog.native_macro.isEnabled())
+            unsupported=self.native_excel_payload();unsupported['snapshot']['controls'][0]['macro_supported']=False;controller.snapshot.update(state='ready',last_result=unsupported,error='');dialog.poll();app.processEvents()
+            self.assertFalse(dialog.native_macro.isEnabled());self.assertTrue(dialog.native_reveal.isEnabled());dialog.native_macro.click();self.assertEqual(len([call for call in controller.calls if call[0]=='run_control_macro']),1)
+        def test_office_work_area_follows_native_window_screen_and_parent_before_show(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();dialog._timer.stop()
+            parent_area=QC.QRect(0,0,1366,728);native_area=QC.QRect(-1530,70,910,485)
+            parent_screen=mock.Mock();parent_screen.availableGeometry.return_value=parent_area
+            native_screen=mock.Mock();native_screen.availableGeometry.return_value=native_area
+            native_handle=mock.Mock();native_handle.screen.return_value=native_screen
+            with mock.patch.object(dialog,'windowHandle',return_value=native_handle),mock.patch.object(self.window,'screen',return_value=parent_screen):
+                self.assertTrue(dialog.isVisible());self.assertEqual(dialog.available_work_area(),native_area);native_handle.screen.assert_called_once()
+                dialog.hide();native_handle.screen.reset_mock();self.assertEqual(dialog.available_work_area(),parent_area);native_handle.screen.assert_not_called();parent_screen.availableGeometry.assert_called_once()
+            dialog.show();app.processEvents()
+        def test_office_real_yes_no_actions_remain_reachable_on_small_screen_and_send_once(self):
+            from unittest import mock
+            for caption,button_hwnd in (('Tak',704),('Nie',705)):
+                with self.subTest(answer=caption):
+                    prompt=self.excel_prompt_fixture();prompt['text']='Szczegóły sprawdzania dokumentu.\n'*40+'Czy przerwać sprawdzanie?'
+                    dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);dialog._timer.stop();available=QC.QRect(0,0,683,364)
+                    with mock.patch.object(dialog,'available_work_area',return_value=available):
+                        dialog.start_session();self.wait(lambda:not dialog._scan_pending);dialog.fit_to_screen(available);dialog.body_tabs.setCurrentIndex(1);app.processEvents()
+                        self.assertEqual(dialog._last_prompts,[prompt]);button=self.excel_button(dialog,caption);dialog.prompt_scroll.ensureWidgetVisible(button,4,4);app.processEvents()
+                        self.assertTrue(dialog.prompt_scroll.viewport().rect().contains(QC.QRect(button.mapTo(dialog.prompt_scroll.viewport(),QC.QPoint(0,0)),button.size())))
+                        self.assertTrue(available.contains(dialog.frameGeometry()));self.assertTrue(dialog.close_button.isVisible());QTest.mouseClick(button,Qt.MouseButton.LeftButton)
+                        self.wait(lambda:not dialog._action_pending and not dialog._scan_pending);action.assert_called_once_with(701,702,prompt,button_hwnd)
+                        disabled=self.excel_button(dialog,caption);self.assertFalse(disabled.isEnabled());QTest.mouseClick(disabled,Qt.MouseButton.LeftButton);app.processEvents();self.assertEqual(action.call_count,1)
+                    dialog.dispose();dialog.close();app.processEvents()
+        def native_session(self,payload=None):
+            dialog,instances,scan,action=self.excel_session_fixture();dialog._timer.stop();dialog.start_session();controller=instances[0]
+            controller.snapshot['last_result']=payload or self.native_excel_payload();dialog.poll();app.processEvents();return dialog,controller
+        def test_office_run_clicked_during_automatic_read_is_queued_and_sent_once(self):
+            dialog,controller=self.native_session();self.assertTrue(dialog.native_macro.isEnabled())
+            self.assertTrue(dialog.refresh_native(background=True));self.wait(lambda:not dialog._command_pending);self.assertEqual(controller.calls[-1][0],'read_range');self.assertTrue(dialog.background_read_active())
+            self.assertTrue(dialog.native_macro.isEnabled());self.assertIn('odświeżam',dialog.state_note.text())
+            QTest.mouseClick(dialog.native_macro,Qt.MouseButton.LeftButton);QTest.mouseClick(dialog.native_macro,Qt.MouseButton.LeftButton)
+            self.assertEqual(controller.calls[-1][0],'read_range');self.assertFalse(dialog.native_macro.isEnabled());self.assertIn('odczyt',dialog.message.text())
+            controller.snapshot.update(state='ready',operation='',last_operation='read_range');dialog.poll();self.wait(lambda:not dialog._command_pending)
+            runs=[call for call in controller.calls if call[0]=='run_control_macro'];self.assertEqual(runs,[('run_control_macro',{'workbook_id':'native-book','sheet_id':'sheet-1','control_id':'native-control'})])
+            self.assertFalse(dialog._queued);self.assertEqual(dialog.body_tabs.currentIndex(),1)
+        def test_office_pdf_requested_during_automatic_read_waits_for_it(self):
+            from unittest import mock
+            dialog,controller=self.native_session();dialog.refresh_native(background=True);self.wait(lambda:not dialog._command_pending);target=str(self.root/'during-read.pdf')
+            self.assertTrue(dialog.pdf_button.isEnabled())
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(target,'')):dialog.pdf_button.click()
+            self.assertEqual(controller.calls[-1][0],'read_range');controller.snapshot.update(state='ready',operation='');dialog.poll();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual(controller.calls[-1],('export_pdf',{'destination':target}))
+        def test_office_queued_run_is_dropped_when_its_control_disappears(self):
+            dialog,controller=self.native_session();dialog.refresh_native(background=True);self.wait(lambda:not dialog._command_pending);dialog.run_control_macro();self.assertTrue(dialog._queued)
+            changed=self.native_excel_payload();changed['snapshot']['controls'][0]['id']='replaced-control';controller.snapshot.update(state='ready',operation='',last_result=changed);dialog.poll();app.processEvents()
+            self.assertFalse(any(call[0]=='run_control_macro' for call in controller.calls));self.assertIn('zmienił się',dialog.message.text());self.assertIsNone(dialog._queued)
+        def test_office_failed_macro_or_busy_excel_keeps_run_available_but_partial_handoff_blocks(self):
+            dialog,controller=self.native_session();busy=excel_session_error_text('Exception from HRESULT: 0x800AC472')
+            for operation in ('run_control_macro','read_range','apply_edits'):
+                controller.snapshot.update(state='ready',error=busy,error_operation=operation);dialog.poll();app.processEvents()
+                self.assertIn('Excel jest zajęty',dialog.message.text());self.assertTrue(dialog.native_macro.isEnabled(),operation);self.assertTrue(dialog.native_model.editable)
+            QTest.mouseClick(dialog.native_macro,Qt.MouseButton.LeftButton);self.wait(lambda:not dialog._command_pending);self.assertEqual(controller.calls[-1][0],'run_control_macro')
+            controller.snapshot.update(state='ready',error='Zastosowano 1 zmianę; kolejna komórka jest chroniona.',error_operation='open');dialog.poll();app.processEvents()
+            self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(dialog.native_model.editable);before=len(controller.calls);dialog.run_control_macro();self.assertEqual(len(controller.calls),before)
+        def test_office_background_read_failure_stays_under_the_sheet(self):
+            dialog,controller=self.native_session();dialog.message.setText('');dialog.refresh_native(background=True);self.wait(lambda:not dialog._command_pending)
+            controller.snapshot.update(state='ready',operation='',error=excel_session_error_text('(Exception from HRESULT: 0x8001010A (RPC_E_SERVERCALL_RETRYLATER))'),error_operation='read_range');dialog.poll();app.processEvents()
+            self.assertIn('Nie odświeżono podglądu',dialog.native_note.text());self.assertEqual(dialog.message.text(),'');self.assertTrue(dialog.native_macro.isEnabled());self.assertFalse(dialog.notice_button.isVisible())
+            dialog.refresh_native();self.wait(lambda:not dialog._command_pending);controller.snapshot.update(state='ready',operation='',error='Explicit failure',error_operation='read_range');dialog.poll();self.assertEqual(dialog.message.text(),'Explicit failure')
+        def test_office_several_controls_need_explicit_choice_and_vanished_choice_is_not_replaced(self):
+            payload=self.native_excel_payload();payload['snapshot']['controls'].append(dict(payload['snapshot']['controls'][0],id='second-control',name='Button 2',caption='Zapisz do bazy'))
+            dialog,controller=self.native_session(payload);self.assertEqual(dialog.native_controls.currentIndex(),-1);self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(dialog.native_reveal.isEnabled())
+            dialog.native_controls.setCurrentIndex(1);self.assertTrue(dialog.native_macro.isEnabled());self.assertIn('Zapisz do bazy',dialog.native_macro.toolTip())
+            only_first=self.native_excel_payload();controller.snapshot.update(state='ready',last_result=only_first);dialog.poll();app.processEvents()
+            self.assertEqual(dialog.native_controls.count(),1);self.assertEqual(dialog.native_controls.currentIndex(),-1);self.assertFalse(dialog.native_macro.isEnabled())
+        def test_office_status_line_shows_the_latest_message_on_one_line(self):
+            dialog,controller=self.native_session();long='Nie zastosowano zmiany & sprawdź komórkę. '*20
+            controller.snapshot.update(state='ready',error=long,error_operation='run_control_macro');dialog.poll();app.processEvents()
+            self.assertTrue(dialog.notice_button.isVisible());self.assertEqual(dialog.notice_button.toolTip(),long);self.assertLess(dialog.notice_button.height(),60);self.assertTrue(dialog.notice_button.text().endswith(('…','...')));self.assertIn(' & ',dialog.notice_button.text())
+            QTest.mouseClick(dialog.notice_button,Qt.MouseButton.LeftButton);self.assertIs(dialog.body_tabs.currentWidget(),dialog.options_scroll);self.assertFalse(dialog.notice_button.isVisible());self.assertTrue(dialog.message.isVisible())
         def excel_prompt_fixture(self):
             return {'pid':701,'main_hwnd':702,'hwnd':703,'title':'Microsoft Excel','text':'Znaleziono błąd: Nieprawidłowy numer projektu. Dopuszczalne: Pxxxx KIT-xxxxx KIT-xxxxx Czy przerwać sprawdzanie?',
                 'buttons':[{'hwnd':704,'text':'Tak','id':6,'enabled':True},{'hwnd':705,'text':'Nie','id':7,'enabled':True}],'fingerprint':'prompt-one','complete':True,'enabled':True}
