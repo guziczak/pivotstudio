@@ -2804,6 +2804,132 @@ def database_object_details(adapter,args):
     return result
 
 
+def catalog_cache_merge_metadata(full,structure):
+    """Use structural successes without claiming that deferred definitions loaded."""
+    if full is None:return clone(structure) if structure is not None else None
+    result=clone(full);obj=result['object'];sections=result.get('sections',{})
+    coverage=dict(result.get('coverage') or {'columns':bool(result.get('complete') or sections.get('Kolumny')=='complete'),
+        'relations':bool(result.get('complete') or sections.get('Klucze i ograniczenia')=='complete' or sections.get('Relacje')=='complete'),
+        'definition':bool(result.get('complete'))})
+    if structure:
+        incoming=structure.get('coverage',{});stamps=result.setdefault('section_read_at',{})
+        for section,field in (('columns','columns'),('relations','keys')):
+            if not coverage.get(section) and incoming.get(section):
+                obj[field]=clone(structure['object'].get(field,[]));coverage[section]=True
+                stamps[section]=structure.get('section_read_at',{}).get(section,structure.get('read_at'))
+        related={o['id']:o for o in result.get('related_objects',[])}
+        for other in structure.get('related_objects',[]):related.setdefault(other['id'],clone(other))
+        result['related_objects']=list(related.values())
+        result['structure_read_at']=structure.get('read_at')
+    obj.update(coverage=coverage,structure_loaded=bool(coverage.get('columns') and coverage.get('relations')));result['coverage']=coverage
+    result['relations']=database_catalog_relations([obj,*result.get('related_objects',[])],'oracle')
+    return result
+
+
+def database_cache_hydrate_batch(adapter,args):
+    """Read structural metadata for <=20 exact identities on one connection.
+
+    Definitions, defaults, check expressions, indexes and user rows stay lazy.
+    Each SQL section is bounded and scoped to the requested owner/name pairs.
+    """
+    raw=args.get('objects') if isinstance(args,dict) else None
+    if adapter.kind!='oracle' or not isinstance(raw,list) or not 1<=len(raw)<=20:raise UserError('Nieprawidłowa partia odczytu struktury.')
+    objects={};by_name=collections.defaultdict(list);errors={};warnings={'columns':[],'relations':[]}
+    for item in raw:
+        if not isinstance(item,dict):raise UserError('Nieprawidłowa tożsamość obiektu.')
+        owner,name,kind=item.get('schema'),item.get('name'),item.get('kind')
+        if any(not isinstance(v,str) or not v or len(v)>512 or any(ord(c)<32 for c in v) for v in (owner,name,kind)) or kind not in DATABASE_RELATIONS:
+            raise UserError('Partia zawiera nieobsługiwany obiekt.')
+        oid=database_object_id(owner,kind,name)
+        if item.get('id')!=oid or oid in objects:raise UserError('Niejednoznaczna tożsamość obiektu.')
+        obj={'id':oid,'schema':owner,'name':name,'kind':kind,'parent':'','system':owner in ('SYS','SYSTEM'),'columns':[],'keys':[],'indexes':[],
+             'definition':'','definition_kind':'unavailable','properties':{},'problems':[],'details_loaded':False,'structure_loaded':False}
+        objects[oid]=obj;by_name[(owner,name)].append(obj)
+    def bound(alias='',object_names=False,identities=False):
+        params=[];terms=[];prefix=alias+'.' if alias else ''
+        rows=[(o['schema'],o['name'],o['kind'].upper()) for o in objects.values()] if identities else [(owner,name) for owner,name in by_name]
+        for row in rows:
+            names=('OWNER','OBJECT_NAME','OBJECT_TYPE') if identities else ('OWNER','OBJECT_NAME' if object_names else 'TABLE_NAME')
+            terms.append('('+' AND '.join(prefix+n+'='+adapter.bind(len(params)+i+1) for i,n in enumerate(names))+')');params.extend(row)
+        return '('+' OR '.join(terms)+')',params
+    def read(sql,params,limit=50000):return adapter.fetch(sql,params,limit=limit)
+    def section(name,fn):
+        try:return fn()
+        except Cancelled:raise
+        except Exception as exc:
+            adapter.check_cancel();error=exc.args[0] if exc.args else exc;code=getattr(error,'code',None)
+            if not isinstance(exc,UserError) and code not in (904,942,1031):raise
+            warnings[name].append(safe_error(exc));return None
+    where,params=bound(identities=True)
+    live=read('SELECT OWNER,OBJECT_NAME,OBJECT_TYPE,OBJECT_ID,STATUS FROM ALL_OBJECTS WHERE SUBOBJECT_NAME IS NULL AND '+where,params,20)
+    versions={database_object_id(sc,kind.lower(),name):(str(rid),status) for sc,name,kind,rid,status in live}
+    for item in raw:
+        oid=item['id'];known=versions.get(oid);expected=item.get('cache_version',{}).get('object_id')
+        if known is None:errors[oid]='Obiekt zniknął albo nie jest już dostępny.'
+        elif expected is not None and str(expected)!=known[0]:errors[oid]='Obiekt zastąpiono od czasu odczytu listy. Odśwież katalog.'
+        else:objects[oid]['properties']['Stan']=known[1]
+    where,params=bound()
+    cols=section('columns',lambda:read('SELECT OWNER,TABLE_NAME,COLUMN_NAME,DATA_TYPE,COLUMN_ID,NULLABLE,DATA_PRECISION,DATA_SCALE FROM ALL_TAB_COLUMNS WHERE '+where+' ORDER BY OWNER,TABLE_NAME,COLUMN_ID',params))
+    if cols is not None:
+        for sc,tn,name,typ,pos,nullable,precision,scale in cols:
+            for obj in by_name.get((sc,tn),[]):
+                obj['columns'].append({'name':str(name),'type':str(typ)+('('+str(precision)+(','+str(scale) if scale is not None else '')+')' if precision is not None else ''),
+                                      'position':int(pos or 0),'nullable':nullable=='Y','default':'','default_loaded':False,'pk_position':0,'hidden':False,'generated':False})
+    def keys():
+        where,params=bound('c');usage=collections.defaultdict(list)
+        for sc,n,col,pos in read('SELECT u.OWNER,u.CONSTRAINT_NAME,u.COLUMN_NAME,u.POSITION FROM ALL_CONS_COLUMNS u JOIN ALL_CONSTRAINTS c ON c.OWNER=u.OWNER AND c.CONSTRAINT_NAME=u.CONSTRAINT_NAME WHERE '+where+" AND c.CONSTRAINT_TYPE IN ('P','U','R') ORDER BY u.OWNER,u.CONSTRAINT_NAME,u.POSITION",params):usage[(sc,n)].append(str(col))
+        where,params=bound()
+        constraints=read("SELECT OWNER,CONSTRAINT_NAME,CONSTRAINT_TYPE,TABLE_NAME,R_OWNER,R_CONSTRAINT_NAME,DELETE_RULE,STATUS,VALIDATED FROM ALL_CONSTRAINTS WHERE "+where+" AND CONSTRAINT_TYPE IN ('P','U','R')",params)
+        where,params=bound('f');lookup={};targets={};target_usage=collections.defaultdict(list)
+        for sc,n,tn,col,pos in read("SELECT DISTINCT p.OWNER,p.CONSTRAINT_NAME,p.TABLE_NAME,c.COLUMN_NAME,c.POSITION FROM ALL_CONSTRAINTS f JOIN ALL_CONSTRAINTS p ON p.OWNER=f.R_OWNER AND p.CONSTRAINT_NAME=f.R_CONSTRAINT_NAME LEFT JOIN ALL_CONS_COLUMNS c ON c.OWNER=p.OWNER AND c.CONSTRAINT_NAME=p.CONSTRAINT_NAME WHERE "+where+" AND f.CONSTRAINT_TYPE='R' ORDER BY p.OWNER,p.CONSTRAINT_NAME,c.POSITION",params):
+            lookup[(sc,n)]=str(tn)
+            if col is not None:target_usage[(sc,n)].append(str(col))
+        for sc,n,kind,tn,rsc,rn,dr,status,validated in constraints:
+            for obj in by_name.get((sc,tn),[]):
+                key={'name':str(n),'kind':{'P':'PRIMARY KEY','U':'UNIQUE','R':'FOREIGN KEY'}[kind],'columns':usage[(sc,n)],'enforced':status=='ENABLED','validated':validated}
+                if kind=='R':
+                    target_name=lookup.get((rsc,rn),'');key.update(target_schema=rsc or '',target_table=target_name,target_columns=target_usage[(rsc,rn)],on_delete=dr,on_update='NO ACTION')
+                    if target_name:
+                        tid=database_object_id(rsc,'table',target_name)
+                        if tid not in objects:targets[tid]={'id':tid,'schema':rsc,'kind':'table','name':target_name,'parent':'','system':rsc in ('SYS','SYSTEM'),'columns':[],'keys':[],'indexes':[],'definition':'','definition_kind':'unavailable','properties':{},'problems':[],'details_loaded':False}
+                    else:obj['problems'].append('Nie odczytano celu klucza obcego '+str(n)+'.')
+                obj['keys'].append(key)
+        return targets
+    targets=section('relations',keys);relations_ok=targets is not None;targets=targets or {}
+    observed=utcnow();results=[]
+    for oid,obj in objects.items():
+        if oid in errors:results.append({'object':{k:obj[k] for k in ('id','schema','name','kind')},'error':errors[oid]});continue
+        columns_ok=cols is not None and bool(obj['columns']);notes=warnings['columns']+warnings['relations']+obj['problems']
+        if cols is not None and not obj['columns']:notes.append('Nie odczytano kolumn tego obiektu.')
+        if not relations_ok:obj['keys']=[]
+        coverage={'columns':columns_ok,'relations':relations_ok,'definition':False};obj.update(coverage=coverage,structure_loaded=columns_ok and relations_ok)
+        target_ids={database_object_id(k['target_schema'],'table',k['target_table']) for k in obj['keys'] if k['kind']=='FOREIGN KEY' and k.get('target_table')}
+        related=[]
+        for tid in target_ids:
+            if tid==oid or (tid not in objects and tid not in targets):continue
+            target=objects.get(tid) or targets[tid]
+            # Batch peers have their own result. Copying their full columns for
+            # every FK would make a dense batch grow quadratically in memory.
+            related.append({'id':tid,'schema':target['schema'],'name':target['name'],'kind':target['kind'],'parent':'','system':target['system'],
+                            'columns':[],'keys':[],'indexes':[],'definition':'','definition_kind':'unavailable','properties':{},'problems':[],'details_loaded':False})
+        edges=database_catalog_relations([obj,*related],'oracle')
+        results.append({'source_id':adapter.source['id'],'backend':'oracle','object':obj,'related_objects':related,'relations':edges,'coverage':coverage,
+                        'sections':{'Kolumny':'complete' if columns_ok else 'error','Relacje':'complete' if relations_ok else 'error','Definicje':'deferred'},
+                        'section_read_at':{'columns':observed if columns_ok else None,'relations':observed if relations_ok else None},
+                        'complete':columns_ok and relations_ok,'warnings':list(dict.fromkeys(notes)),'read_at':observed})
+    context=oracle_catalog_context(adapter)
+    remaining=DATABASE_MAX_METADATA_BYTES-65536
+    for index,result in enumerate(results):
+        size=len(dumps(result).encode('utf-8'))
+        if size>remaining and not result.get('error'):
+            result={'object':{k:result['object'][k] for k in ('id','schema','name','kind')},'error':'Metadane obiektu nie mieszczą się w tej partii. Ponów odczyt w mniejszej partii lub otwórz obiekt osobno.'}
+            results[index]=result;size=len(dumps(result).encode('utf-8'))
+        remaining-=size
+    batch={'results':results,'cache_identity':catalog_cache_identity(adapter.source,context) if context is not None else None,'read_at':observed}
+    if len(dumps(batch).encode('utf-8'))>DATABASE_MAX_METADATA_BYTES:raise UserError('Partia struktury przekracza limit 24 MB. Wybierz mniejszą partię.')
+    return batch
+
+
 CATALOG_CACHE_VERSION = 1
 CATALOG_CACHE_APP_ID = 0x50534331
 CATALOG_STAGE_APP_ID = 0x50535331
@@ -2931,6 +3057,14 @@ class CatalogCache:
                 raise CatalogCacheFormatError('Nieobsługiwana lub uszkodzona lokalna pamięć katalogu.')
             pagesize=conn.execute('PRAGMA page_size').fetchone()[0]
             conn.execute('PRAGMA max_page_count='+str(max(16,self.max_bytes//pagesize)))
+            if not conn.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='structures'").fetchone():
+                conn.execute('BEGIN IMMEDIATE')
+                conn.execute('CREATE TABLE IF NOT EXISTS structures(generation TEXT NOT NULL REFERENCES generations(id) ON DELETE CASCADE,id TEXT NOT NULL,document TEXT,columns_complete INTEGER NOT NULL DEFAULT 0,relations_complete INTEGER NOT NULL DEFAULT 0,observed_at TEXT,state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_retry REAL NOT NULL DEFAULT 0,claim TEXT,claim_until REAL NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT \'\',PRIMARY KEY(generation,id))')
+                conn.execute('CREATE INDEX IF NOT EXISTS structures_pending ON structures(generation,state,next_retry)')
+                conn.execute('CREATE TABLE IF NOT EXISTS edges(generation TEXT NOT NULL REFERENCES generations(id) ON DELETE CASCADE,source TEXT NOT NULL,name TEXT NOT NULL,target_schema TEXT NOT NULL,target_name TEXT NOT NULL,PRIMARY KEY(generation,source,name))')
+                conn.execute('CREATE INDEX IF NOT EXISTS edges_target ON edges(generation,target_schema,target_name)')
+                conn.execute('CREATE TABLE IF NOT EXISTS hydration_revisions(generation TEXT PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,revision INTEGER NOT NULL)')
+                conn.commit()
             return conn
         except Exception:conn.close();raise
     @staticmethod
@@ -3046,6 +3180,13 @@ class CatalogCache:
             values=c.execute('SELECT id,owner,kind,name,status,remote_id,created,ddl FROM objects WHERE '+clause+' ORDER BY owner,kind,name,remote_id LIMIT ? OFFSET ?',params+[page_size,offset]).fetchall()
             schemas=[{'name':o,'objects':n} for o,n in c.execute('SELECT owner,COUNT(*) FROM objects WHERE generation=? GROUP BY owner ORDER BY owner LIMIT ?',(row[0],CATALOG_CACHE_SCHEMA_CHOICES+1))]
             schemas_complete=len(schemas)<=CATALOG_CACHE_SCHEMA_CHOICES;schemas=schemas[:CATALOG_CACHE_SCHEMA_CHOICES]
+            structures={};structure_bytes=0
+            if values:
+                ids=[v[0] for v in values]
+                for oid,document in c.execute('SELECT id,json_extract(document,\'$.object\') FROM structures WHERE generation=? AND id IN ('+','.join('?' for _ in ids)+') AND document IS NOT NULL',[row[0],*ids]):
+                    size=len(document.encode('utf-8'))
+                    if structure_bytes+size>DATABASE_MAX_METADATA_BYTES//2:continue
+                    structures[oid]=json.loads(document);structure_bytes+=size
             c.commit()
         # Do not upgrade a read snapshot to a write lock: another reader may
         # be waiting to publish. Recency is best-effort, not query correctness.
@@ -3054,28 +3195,195 @@ class CatalogCache:
         objects=[{'id':oid,'schema':owner,'kind':typ,'name':name,'system':owner in ('SYS','SYSTEM'),'parent':'','columns':[],'keys':[],'indexes':[],
                   'definition':'','definition_kind':'unavailable','properties':{'Stan':status},'problems':[],'details_loaded':False,
                   'cache_version':{'object_id':rid,'created':created,'last_ddl_time':ddl}} for oid,owner,typ,name,status,rid,created,ddl in values]
+        for obj in objects:
+            stored=structures.get(obj['id'])
+            if stored:
+                version=obj['cache_version'];obj.update(stored);obj['cache_version']=version
         cache={'generation':row[0],'read_at':row[4],'complete':True,'inventory_complete':True,'stale':time.time()-row[5]>CATALOG_CACHE_TTL_SECONDS,'scope':sc,'identity':json.loads(row[1])}
         result={'version':DATABASE_CATALOG_FORMAT,'source_id':'','backend':'oracle','objects':objects,'relations':[],'counts':dict(collections.Counter(o['kind'] for o in objects)),
                 'scope':['Lokalna migawka nazw obiektów Oracle. Szczegóły mają niezależny czas odczytu.'],'sections':{'Obiekty':'snapshot','Szczegóły':'deferred'},
                 'warnings':[],'complete':False,'metadata_only':True,'integrity_checked':False,'read_at':row[4],'elapsed':0,'cache':cache,
                 'oracle_scope':{'schema':sc['schema'],'schemas':schemas,'limit':DATABASE_MAX_OBJECTS,'schemas_complete':schemas_complete,'schemas_limit':CATALOG_CACHE_SCHEMA_CHOICES},
                 'oracle_inventory':{'offset':offset,'limit':page_size,'total':total,'has_more':offset+len(objects)<total,'query':query,'kind':kind,'include_system':include_system}}
+        result['relations']=database_catalog_relations(objects,'oracle')
         if not schemas_complete:result['scope'].append('Lista podpowiedzi schematów jest ograniczona do '+str(CATALOG_CACHE_SCHEMA_CHOICES)+' nazw. Możesz wpisać nazwę schematu; wyszukiwanie obiektów obejmuje cały zapisany zakres.')
         result['fingerprint']=digest({'generation':row[0],'offset':offset,'query':query,'kind':kind,'include_system':include_system})
         if len(dumps(result).encode('utf-8'))>DATABASE_MAX_METADATA_BYTES:raise UserError('Strona lokalnego katalogu przekracza limit 24 MB.')
         return result
+    @staticmethod
+    def _structure_revision(c,generation):
+        c.execute('INSERT INTO hydration_revisions VALUES(?,1) ON CONFLICT(generation) DO UPDATE SET revision=revision+1',(generation,))
+    @staticmethod
+    def _structure_edges(c,generation,obj):
+        c.execute('DELETE FROM edges WHERE generation=? AND source=?',(generation,obj['id']))
+        c.executemany('INSERT INTO edges VALUES(?,?,?,?,?)',[(generation,obj['id'],k['name'],k.get('target_schema',''),k['target_table']) for k in obj.get('keys',[]) if k.get('kind')=='FOREIGN KEY' and k.get('target_table')])
+    def _hydration_status(self,c,identity,scope,generation=None):
+        row=self._generation(c,identity,scope,generation)
+        empty={'generation':generation,'total':0,'completed':0,'partial':0,'failed':0,'pending':0,'running':0,'complete':False,'revision':0,'next_retry':None}
+        if not row:return empty
+        now=time.time();records=c.execute("SELECT COUNT(*),COALESCE(SUM(s.columns_complete=1 AND s.relations_complete=1),0),COALESCE(SUM(s.document IS NOT NULL AND (s.columns_complete=0 OR s.relations_complete=0)),0),COALESCE(SUM(s.state='running' AND s.claim_until>?),0),COALESCE(SUM(s.state='failed' AND (s.attempts>=3 OR s.next_retry>?)),0),MIN(CASE WHEN s.state='failed' AND s.attempts<3 AND s.next_retry>? THEN s.next_retry END) FROM objects o LEFT JOIN structures s ON s.generation=o.generation AND s.id=o.id WHERE o.generation=? AND o.kind IN ('table','view','materialized view')",(now,now,now,row[0])).fetchone()
+        total,completed,partial,running,failed,retry=records
+        revision=c.execute('SELECT revision FROM hydration_revisions WHERE generation=?',(row[0],)).fetchone()
+        return {'generation':row[0],'total':total,'completed':completed,'partial':partial,'failed':failed,'pending':max(0,total-completed-running-failed),
+                'running':running,'complete':completed==total,'revision':revision[0] if revision else 0,'next_retry':retry}
+    def hydration_status(self,identity,scope,generation=None):
+        with contextlib.closing(self._connect()) as c:return self._hydration_status(c,identity,scope,generation)
+    def hydration_batch(self,identity,scope,generation,limit=20,retry=False):
+        if type(limit) is not int or not 1<=limit<=20 or type(retry) is not bool:raise UserError('Nieprawidłowy rozmiar partii struktury.')
+        with contextlib.closing(self._connect()) as c,c:
+            c.execute('BEGIN IMMEDIATE');active=self._generation(c,identity,scope)
+            if not active or active[0]!=generation:raise Cancelled('Lista obiektów została zastąpiona. Wznów odczyt bieżącego katalogu.')
+            now=time.time()
+            if retry:c.execute("UPDATE structures SET state='pending',attempts=0,next_retry=0,claim=NULL,claim_until=0 WHERE generation=? AND state='failed'",(generation,))
+            rows=c.execute("SELECT o.id,o.owner,o.kind,o.name,o.remote_id,o.created,o.ddl FROM objects o LEFT JOIN structures s ON s.generation=o.generation AND s.id=o.id WHERE o.generation=? AND o.kind IN ('table','view','materialized view') AND (s.id IS NULL OR s.state='pending' OR (s.state='running' AND s.claim_until<=?) OR (s.state='failed' AND s.attempts<3 AND s.next_retry<=?)) ORDER BY o.owner,o.kind,o.name LIMIT ?",(generation,now,now,limit)).fetchall()
+            claim=uid() if rows else None
+            for oid,*_ in rows:
+                c.execute("INSERT INTO structures(generation,id,state,attempts,claim,claim_until) VALUES(?,?,'running',1,?,?) ON CONFLICT(generation,id) DO UPDATE SET state='running',attempts=attempts+1,claim=excluded.claim,claim_until=excluded.claim_until",(generation,oid,claim,now+900))
+            status=self._hydration_status(c,identity,scope,generation)
+        objects=[{'id':oid,'schema':owner,'kind':kind,'name':name,'cache_version':{'object_id':rid,'created':created,'last_ddl_time':ddl}} for oid,owner,kind,name,rid,created,ddl in rows]
+        return dict(status,objects=objects,claim=claim)
+    def release_hydration_claim(self,identity,scope,generation,claim):
+        if not claim:return
+        with contextlib.closing(self._connect()) as c,c:
+            if not self._generation(c,identity,scope,generation):return
+            c.execute("UPDATE structures SET state='pending',attempts=MAX(0,attempts-1),claim=NULL,claim_until=0,next_retry=0 WHERE generation=? AND state='running' AND claim=?",(generation,claim))
+    def put_hydration_results(self,identity,batch,scope,observed_generation,claim=None,guard=None,guard_lock=None):
+        results=batch.get('results') if isinstance(batch,dict) else None
+        if not isinstance(results,list) or len(results)>20 or len(dumps(batch).encode('utf-8'))>DATABASE_MAX_METADATA_BYTES:raise UserError('Nieprawidłowa partia zapisu struktury.')
+        # Confirmed worker identity is mandatory for background publication.
+        if not isinstance(identity,dict) or not identity.get('context'):raise UserError('Nie potwierdzono tożsamości bazy dla odczytanej struktury.')
+        with contextlib.closing(self._connect()) as c,c:
+            c.execute('BEGIN IMMEDIATE');active=self._generation(c,identity,scope)
+            if not active or active[0]!=observed_generation:raise Cancelled('Zmieniono tożsamość bazy lub generację katalogu.')
+            claimed={row[0]:row[1:] for row in c.execute("SELECT id,attempts,document,columns_complete,relations_complete FROM structures WHERE generation=? AND claim=? AND state='running' AND claim_until>?",(observed_generation,claim,time.time()))}
+            seen=set()
+            for result in results:
+                obj=result.get('object',{});oid=obj.get('id')
+                if oid not in claimed:
+                    # A foreground full read may finish while the remote batch
+                    # is in flight. Its completed structure wins for that object.
+                    ready=c.execute("SELECT 1 FROM structures WHERE generation=? AND id=? AND state='complete' AND columns_complete=1 AND relations_complete=1",(observed_generation,oid)).fetchone()
+                    if ready and oid==database_object_id(obj.get('schema',''),obj.get('kind',''),obj.get('name','')):continue
+                if oid not in claimed or oid in seen or oid!=database_object_id(obj.get('schema',''),obj.get('kind',''),obj.get('name','')):raise UserError('Wynik struktury nie pasuje do zarezerwowanej partii.')
+                seen.add(oid);attempts,previous,old_columns,old_relations=claimed[oid];prior=json.loads(previous) if previous else None
+                coverage=result.get('coverage',{});columns=coverage.get('columns') is True;relations=coverage.get('relations') is True
+                error=str(result.get('error') or '; '.join(result.get('warnings',[])))[:4000]
+                if result.get('error'):
+                    document=previous;columns,relations=bool(old_columns),bool(old_relations);observed=prior.get('read_at') if prior else None
+                else:
+                    value=clone(result);value.pop('cache',None);main=value['object'];main.update(details_loaded=False)
+                    if prior:
+                        stamps=value.setdefault('section_read_at',{})
+                        if not columns and old_columns:main['columns']=clone(prior['object']['columns']);columns=True;stamps['columns']=prior.get('section_read_at',{}).get('columns',prior.get('read_at'))
+                        if not relations and old_relations:main['keys']=clone(prior['object']['keys']);relations=True;stamps['relations']=prior.get('section_read_at',{}).get('relations',prior.get('read_at'))
+                    merged={'columns':columns,'relations':relations,'definition':False};main.update(coverage=merged,structure_loaded=columns and relations);value.update(coverage=merged,complete=columns and relations)
+                    observed=str(result.get('read_at') or utcnow());document=dumps(value)
+                    if len(document.encode('utf-8'))>DATABASE_MAX_METADATA_BYTES:raise UserError('Szczegóły struktury przekraczają limit pamięci.')
+                    if coverage.get('relations') is True:self._structure_edges(c,observed_generation,main)
+                succeeded=columns and relations and not result.get('error');delay=(60,300,3600)[min(2,max(0,attempts-1))]
+                c.execute('UPDATE structures SET document=?,columns_complete=?,relations_complete=?,observed_at=?,state=?,next_retry=?,claim=NULL,claim_until=0,error=? WHERE generation=? AND id=?',
+                          (document,int(columns),int(relations),observed,'complete' if succeeded else 'failed',0 if succeeded else time.time()+delay,error,observed_generation,oid))
+            for oid in claimed.keys()-seen:
+                c.execute("UPDATE structures SET state='failed',next_retry=?,claim=NULL,claim_until=0,error='Niepełna odpowiedź partii.' WHERE generation=? AND id=?",(time.time()+60,observed_generation,oid))
+            self._structure_revision(c,observed_generation)
+            with guard_lock if guard_lock is not None else contextlib.nullcontext():
+                if guard is not None and not guard():c.rollback();raise Cancelled('Anulowano zapis odczytanej struktury.')
+                c.commit()
+            return self._hydration_status(c,identity,scope,observed_generation)
     def get_details(self,identity,obj,scope=None,generation=None):
         scope=scope or {'schema':obj.get('schema',''),'include_system':False};oid=database_object_id(obj['schema'],obj['kind'],obj['name'])
         with contextlib.closing(self._connect()) as c:
             row=self._generation(c,identity,scope,generation)
             if not row:return None
             found=c.execute('SELECT document,observed_at FROM details WHERE generation=? AND id=?',(row[0],oid)).fetchone()
-            if not found:return None
+            structure=c.execute('SELECT document,observed_at FROM structures WHERE generation=? AND id=? AND document IS NOT NULL',(row[0],oid)).fetchone()
+            if not found and not structure:return None
+            result=catalog_cache_merge_metadata(json.loads(found[0]) if found else None,json.loads(structure[0]) if structure else None)
+            stamp=found[1] if found else structure[1]
         with contextlib.suppress(sqlite3.Error),contextlib.closing(self._connect()) as c,c:
             c.execute('UPDATE details SET used=? WHERE generation=? AND id=?',(time.time(),row[0],oid))
         observed=row[5]
-        with contextlib.suppress(ValueError,TypeError):observed=dt.datetime.fromisoformat(found[1].replace('Z','+00:00')).replace(tzinfo=dt.timezone.utc).timestamp()
-        result=json.loads(found[0]);result['cache']={'generation':row[0],'read_at':found[1],'observed_at':found[1],'complete':bool(result.get('complete')),'stale':time.time()-observed>CATALOG_CACHE_TTL_SECONDS,'scope':catalog_cache_scope(scope)}
+        with contextlib.suppress(ValueError,TypeError):observed=dt.datetime.fromisoformat(stamp.replace('Z','+00:00')).replace(tzinfo=dt.timezone.utc).timestamp()
+        result['cache']={'generation':row[0],'read_at':stamp,'observed_at':stamp,'complete':bool(result.get('complete')),'stale':time.time()-observed>CATALOG_CACHE_TTL_SECONDS,'scope':catalog_cache_scope(scope)}
+        if len(dumps(result).encode('utf-8'))>DATABASE_MAX_METADATA_BYTES:raise UserError('Połączone szczegóły katalogu przekraczają limit 24 MB.')
+        return result
+    def graph(self,identity,scope,ids=(),focus='',generation=None,limit=120,focus_object=None):
+        """Bounded local FK neighbourhood, independent of the inventory page.
+
+        The edge index provides incoming links without scanning cached JSON.
+        All objects and edges belong to one SQLite read snapshot.
+        """
+        valid=lambda value:isinstance(value,str) and re.fullmatch(r'[0-9a-f]{32}',value)
+        if (not isinstance(ids,(tuple,list)) or len(ids)>120 or any(not valid(oid) for oid in ids)
+                or (focus and not valid(focus)) or type(limit) is not int or not 1<=limit<=120):
+            raise UserError('Nieprawidłowy zakres mapy relacji.')
+        seeds=list(dict.fromkeys([focus] if focus else ids))[:limit];objects=[];related=[];seen=set();truncated=False;size=0
+        def stub(owner,kind,name):
+            return {'id':database_object_id(owner,kind,name),'schema':owner,'kind':kind,'name':name,'system':owner in ('SYS','SYSTEM'),
+                    'parent':'','columns':[],'keys':[],'indexes':[],'definition':'','definition_kind':'unavailable','properties':{},'problems':[],'details_loaded':False}
+        fallback_focus=None
+        if focus_object is not None:
+            if (not focus or not isinstance(focus_object,dict) or focus_object.get('kind') not in DATABASE_RELATIONS
+                    or any(not isinstance(focus_object.get(key),str) or not focus_object[key] or len(focus_object[key])>512 for key in ('schema','name'))
+                    or focus_object.get('id')!=focus or database_object_id(focus_object['schema'],focus_object['kind'],focus_object['name'])!=focus):
+                raise UserError('Nieprawidłowa tożsamość tabeli na mapie.')
+            fallback_focus=stub(focus_object['schema'],focus_object['kind'],focus_object['name'])
+        with contextlib.closing(self._connect()) as c:
+            c.execute('BEGIN');row=self._generation(c,identity,scope,generation)
+            if not row:return None
+            gen=row[0]
+            def read_object(oid,fallback=None):
+                nonlocal size,truncated
+                if oid in seen:return None
+                # Inspect lengths before fetching documents to bound memory even
+                # when one database object has unusually large metadata.
+                documents=[];document_bytes=0
+                for table in ('details','structures'):
+                    length=c.execute('SELECT length(CAST(document AS BLOB)) FROM '+table+' WHERE generation=? AND id=?',(gen,oid)).fetchone()
+                    if length and length[0]:
+                        document_bytes+=length[0]
+                        if size+document_bytes>DATABASE_MAX_METADATA_BYTES-65536:truncated=True;return None
+                        documents.append(json.loads(c.execute('SELECT document FROM '+table+' WHERE generation=? AND id=?',(gen,oid)).fetchone()[0]))
+                    else:documents.append(None)
+                merged=catalog_cache_merge_metadata(*documents)
+                if merged:obj=merged.get('object')
+                else:
+                    value=c.execute('SELECT owner,kind,name,status,remote_id,created,ddl FROM objects WHERE generation=? AND id=?',(gen,oid)).fetchone()
+                    if value:
+                        owner,kind,name,status,rid,created,ddl=value;obj=stub(owner,kind,name);obj['properties']['Stan']=status
+                        obj['cache_version']={'object_id':rid,'created':created,'last_ddl_time':ddl}
+                    else:obj=fallback
+                if not obj or obj.get('kind') not in DATABASE_RELATIONS:return None
+                cost=len(dumps(obj).encode('utf-8'))
+                if size+cost>DATABASE_MAX_METADATA_BYTES-65536:truncated=True;return None
+                size+=cost;seen.add(oid);return obj
+            for oid in seeds:
+                obj=read_object(oid,fallback_focus if oid==focus else None)
+                if obj:objects.append(obj)
+            capacity=max(0,limit-len(objects)) if focus else limit
+            if objects:
+                seed_ids=[obj['id'] for obj in objects];marks=','.join('?' for _ in seed_ids)
+                outgoing=c.execute('SELECT DISTINCT target_schema,target_name FROM edges WHERE generation=? AND source IN ('+marks+') ORDER BY target_schema,target_name LIMIT ?',
+                                   [gen,*seed_ids,capacity+len(objects)+1]).fetchall()
+                candidates=[]
+                for owner,name in outgoing:
+                    target=c.execute("SELECT id,kind FROM objects WHERE generation=? AND owner=? AND name=? AND kind IN ('table','view','materialized view') ORDER BY CASE kind WHEN 'table' THEN 0 WHEN 'view' THEN 1 ELSE 2 END LIMIT 1",(gen,owner,name)).fetchone()
+                    kind=target[1] if target else 'table';oid=target[0] if target else database_object_id(owner,kind,name)
+                    candidates.append((oid,stub(owner,kind,name)))
+                for obj in objects:
+                    incoming=c.execute('SELECT DISTINCT source FROM edges WHERE generation=? AND target_schema=? AND target_name=? ORDER BY source LIMIT ?',
+                                       (gen,obj['schema'],obj['name'],capacity+len(objects)+1)).fetchall()
+                    candidates.extend((oid,None) for oid, in incoming)
+                for oid,fallback in candidates:
+                    if oid in seen:continue
+                    if len(related)>=capacity:truncated=True;break
+                    obj=read_object(oid,fallback)
+                    if obj:related.append(obj)
+            revision=c.execute('SELECT revision FROM hydration_revisions WHERE generation=?',(gen,)).fetchone();c.commit()
+        relations=database_catalog_relations(objects+related,'oracle')
+        result={'objects':objects,'related_objects':related,'relations':relations,'revision':revision[0] if revision else 0,'truncated':truncated,
+                'cache':{'generation':gen,'read_at':row[4],'complete':True,'inventory_complete':True,'stale':time.time()-row[5]>CATALOG_CACHE_TTL_SECONDS,'scope':json.loads(row[2])}}
+        if len(dumps(result).encode('utf-8'))>DATABASE_MAX_METADATA_BYTES:raise UserError('Mapa relacji przekracza limit 24 MB. Zawęź zakres mapy.')
         return result
     def put_details(self,identity,result,scope,observed_generation=None):
         raw=clone(result);raw.pop('cache',None);obj=raw.get('object',{});oid=database_object_id(obj.get('schema',''),obj.get('kind',''),obj.get('name',''))
@@ -3097,6 +3405,17 @@ class CatalogCache:
             if len(document.encode('utf-8'))>DATABASE_MAX_METADATA_BYTES:return False
             c.execute('INSERT INTO details VALUES(?,?,?,?,?) ON CONFLICT(generation,id) DO UPDATE SET document=excluded.document,observed_at=excluded.observed_at,used=excluded.used',
                       (row[0],oid,document,observed,time.time()))
+            if obj.get('kind') in DATABASE_RELATIONS:
+                sections=raw.get('sections',{});columns=bool(raw.get('complete') or sections.get('Kolumny')=='complete')
+                relations=bool(raw.get('complete') or sections.get('Klucze i ograniczenia')=='complete' or sections.get('Relacje')=='complete')
+                if relations:self._structure_edges(c,row[0],obj)
+                if columns and relations:
+                    structure=clone(raw);coverage={'columns':True,'relations':True,'definition':False}
+                    structure.update(coverage=coverage,complete=True,section_read_at={'columns':observed,'relations':observed})
+                    structure['object'].update(coverage=coverage,structure_loaded=True,details_loaded=False)
+                    structure['object']['definition']='';structure['object']['definition_kind']='unavailable'
+                    c.execute("INSERT INTO structures(generation,id,document,columns_complete,relations_complete,observed_at,state) VALUES(?,?,?,1,1,?,'complete') ON CONFLICT(generation,id) DO UPDATE SET document=excluded.document,columns_complete=1,relations_complete=1,observed_at=excluded.observed_at,state='complete',claim=NULL,claim_until=0,error=''",(row[0],oid,dumps(structure),observed))
+                if columns or relations:self._structure_revision(c,row[0])
         return True
     def clear(self,identity=None,scope=None):
         # Input errors are not evidence of a corrupt database. Validate before
@@ -3628,7 +3947,7 @@ def database_saved_join(raw):
     return {'id':sid,'name':name,'plan':plan}
 
 
-def database_graph_layout(objects,relations,sizes,available_width=1200):
+def database_graph_layout(objects,relations,sizes,available_width=1200,compact=False):
     """Deterministic component-first layout using real node dimensions.
 
     Linked nodes sit in adjacent breadth-first layers. Disconnected components
@@ -3647,6 +3966,20 @@ def database_graph_layout(objects,relations,sizes,available_width=1200):
             for other in sorted(neighbors[q.popleft()] & todo,key=key):todo.remove(other);found.add(other);q.append(other)
         components.append(found)
     components.sort(key=lambda c:(-len(c),min(key(k) for k in c)))
+    if compact:
+        ordered=[]
+        for component in components:
+            remaining=set(component);root=min(component,key=lambda k:(-len(neighbors[k]),key(k)));q=collections.deque([root]);remaining.remove(root)
+            while q:
+                oid=q.popleft();ordered.append(oid)
+                for other in sorted(neighbors[oid]&remaining,key=key):remaining.remove(other);q.append(other)
+        cell_width=max((sizes[k][0] for k in ordered),default=230);columns=max(1,int((max(240,float(available_width))-24+18)//(cell_width+18)))
+        result={};y=12
+        for offset in range(0,len(ordered),columns):
+            row=ordered[offset:offset+columns]
+            for column,oid in enumerate(row):result[oid]=(12+column*(cell_width+18),y)
+            y+=max(sizes[oid][1] for oid in row)+24
+        return result
     blocks=[]
     for component in components:
         roots=[k for k in component if not incoming[k]]
@@ -3664,11 +3997,12 @@ def database_graph_layout(objects,relations,sizes,available_width=1200):
             for k in sorted(items,key=key):positions[k]=(x,y);y+=sizes[k][1]+30
             maxh=max(maxh,y-30);x+=w+92
         blocks.append((positions,max(0,x-92),maxh))
-    x=y=24;shelf=0;result={};width=max(660,float(available_width)-48)
+    margin=12 if compact else 24;gap=18 if compact else 36
+    x=y=margin;shelf=0;result={};width=max(240 if compact else 660,float(available_width)-(margin if compact else 48))
     for positions,w,h in blocks:
-        if x>24 and x+w>width:x=24;y+=shelf+40;shelf=0
+        if x>margin and x+w>width:x=margin;y+=shelf+(24 if compact else 40);shelf=0
         for k,(px,py) in positions.items():result[k]=(x+px,y+py)
-        x+=w+36;shelf=max(shelf,h)
+        x+=w+gap;shelf=max(shelf,h)
     return result
 
 
@@ -3681,19 +4015,27 @@ def worker_main():
         with output_lock:
             sys.stdout.write(dumps(value)+'\n'); sys.stdout.flush()
     def runner():
+        retained=None;retained_key=None
         while True:
             request=inbox.get()
-            if request is None: return
+            if request is None:
+                if retained:
+                    with contextlib.suppress(Exception):retained.close()
+                return
             jid=request['id']; event=threading.Event(); adapter=None
             with lock:
                 state.update(id=jid,adapter=None,cancel=event)
                 if jid in cancelled_ids: event.set(); cancelled_ids.discard(jid)
             progress=lambda text:send({'id':jid,'event':'progress','text':text})
-            watchdog=None;connected=False
+            watchdog=None;connected=False;keep_adapter=False
             try:
                 if event.is_set(): raise Cancelled('Zadanie anulowano przed uruchomieniem.')
                 operation=request['operation']; args=request.get('args',{})
-                if operation=='workbook_stage':value=workbook_stage(args['path'],args['directory'],event,args.get('previous'))
+                if operation=='database_cache_release':
+                    if retained:
+                        with contextlib.suppress(Exception):retained.close()
+                    retained=None;retained_key=None;value={'released':True}
+                elif operation=='workbook_stage':value=workbook_stage(args['path'],args['directory'],event,args.get('previous'))
                 elif operation=='workbook_prepare':value=workbook_prepare_bundle(args['source'],args['selections'],args['directory'],event,progress,args.get('compatible',False))
                 elif operation=='workbook_sample':value=workbook_sample(args['source'],args['sheet_id'],args.get('options',{}),request['output'],event)
                 elif operation=='inspect_file': value=inspect_local_file(args['path'],event)
@@ -3703,7 +4045,14 @@ def worker_main():
                 elif operation=='export': value=export_result(args['result_path'],args['destination'],args['format'],event)
                 else:
                     source=validate_source(request['source']); progress('Łączenie ze źródłem w trybie analitycznym')
-                    adapter=ADAPTERS[source['kind']](source,request.get('password',''),request.get('runtime',{}),event,request.get('timeout',60))
+                    reuse=operation=='database_cache_hydrate_batch' and source['kind']=='oracle'
+                    profile=digest({'source':source,'runtime':request.get('runtime',{})})
+                    if retained and (not reuse or retained_key!=profile):
+                        with contextlib.suppress(Exception):retained.close()
+                        retained=None;retained_key=None
+                    adapter=retained if retained is not None else ADAPTERS[source['kind']](source,request.get('password',''),request.get('runtime',{}),event,request.get('timeout',60))
+                    borrowed=adapter is retained;retained=None;retained_key=None
+                    adapter.cancelled=event;adapter.timeout=max(5,min(int(request.get('timeout',60)),600))
                     if source['kind']=='xlsx': adapter.bind_dataset(args.get('dataset') or args.get('analysis',{}).get('dataset',{}))
                     with lock: state['adapter']=adapter
                     def expired():
@@ -3711,7 +4060,14 @@ def worker_main():
                         with contextlib.suppress(Exception): adapter.cancel()
                         progress('Przekroczono limit czasu. Wysłano żądanie anulowania; oczekiwanie na sterownik.')
                     watchdog=threading.Timer(request.get('timeout',60),expired); watchdog.daemon=True; watchdog.start()
-                    adapter.connect();connected=True;adapter.check_cancel()
+                    if borrowed:
+                        adapter.conn.call_timeout=adapter.timeout*1000;adapter.conn.rollback()
+                        cursor=adapter.conn.cursor()
+                        try:cursor.execute('SET TRANSACTION READ ONLY')
+                        finally:cursor.close()
+                    else:adapter.connect()
+                    connected=True;adapter.check_cancel()
+                    if reuse:adapter.password=''
                     if operation=='database_catalog':
                         value=DatabaseInspector(adapter,progress,schema=args.get('schema'),offset=args.get('offset',0),
                             query=args.get('query',''),kind=args.get('kind',''),page_size=args.get('page_size',1000),
@@ -3719,6 +4075,7 @@ def worker_main():
                     elif operation=='database_object_details':value=database_object_details(adapter,args)
                     elif operation=='database_cache_sync':
                         value=oracle_catalog_sync(adapter,args,request['output'],event,progress)
+                    elif operation=='database_cache_hydrate_batch':value=database_cache_hydrate_batch(adapter,args)
                     elif operation=='database_page': value=database_page(adapter,args)
                     elif operation=='database_join_page': value=database_join_page(adapter,args)
                     elif operation=='tables': value=adapter.tables()
@@ -3737,6 +4094,7 @@ def worker_main():
                             value=[query_metadata(*qb.query(rn,cn)) for rn,cn in grouping_levels(analysis)]
                     else: raise UserError('Nieznany typ zadania.')
                     adapter.check_cancel()
+                    keep_adapter=reuse
                 # import_file already checks cancellation before its atomic
                 # publication. A later request cannot undo a completed import.
                 if event.is_set() and operation not in ('import','workbook_stage','workbook_prepare'): raise Cancelled('Anulowano. Wynik nie został przyjęty jako aktualny.')
@@ -3751,7 +4109,13 @@ def worker_main():
             finally:
                 if watchdog: watchdog.cancel()
                 if adapter:
-                    with contextlib.suppress(Exception): adapter.close()
+                    if keep_adapter and not event.is_set():
+                        try:
+                            adapter.conn.rollback();retained=adapter;retained_key=profile
+                        except Exception:
+                            with contextlib.suppress(Exception):adapter.close()
+                    else:
+                        with contextlib.suppress(Exception): adapter.close()
                 # Never retain passwords in idle workers.
                 request.clear()
                 with lock: state.update(id=None,adapter=None,cancel=None)
@@ -3810,9 +4174,11 @@ class WorkerClient:
                     if message.get('event')=='progress': job['stage']=message.get('text','')
                     elif message.get('event')=='done':
                         job.update(status='done',value=message['value'],ended=utcnow()); self.busy=None
+                        if job.get('lane')=='foreground':self.hub.foreground_activity=time.monotonic()
                     elif message.get('event')=='error':
                         job.update(status='cancelled' if message.get('cancelled') else 'error',
                                    error=message.get('message','Błąd sterownika'),ended=utcnow()); self.busy=None
+                        if job.get('lane')=='foreground':self.hub.foreground_activity=time.monotonic()
                         if isinstance(message.get('dependency'),dict):job['dependency']=message['dependency']
                         if isinstance(message.get('catalog_scope'),dict):job['catalog_scope']=message['catalog_scope']
                         job['connected']=message.get('connected') is True
@@ -3820,20 +4186,26 @@ class WorkerClient:
             with self.hub.lock:
                 if self.busy and self.busy in self.hub.jobs:
                     self.hub.jobs[self.busy].update(status='error',error='Proces sterownika nieoczekiwanie się zakończył. Nie przyjęto częściowego wyniku.')
+                    if self.hub.jobs[self.busy].get('lane')=='foreground':self.hub.foreground_activity=time.monotonic()
                 self.busy=None
     def close(self):
         with contextlib.suppress(Exception): self.send({'operation':'shutdown'})
         with contextlib.suppress(Exception): self.process.stdin.close()
 
 
+class CatalogBackgroundBusy(UserError):pass
+
+
 class WorkerHub:
-    def __init__(self): self.lock=threading.RLock(); self.workers={}; self.jobs={}
+    def __init__(self): self.lock=threading.RLock(); self.workers={}; self.jobs={};self.foreground_activity=0
     def submit(self,operation,args,source=None,password='',runtime=None,output='',timeout=60):
         # H2 JVM / Oracle Thick profiles are isolated. At most four active processes.
         key=digest({'source':source,'runtime':runtime}) if source else ('workbook-io' if operation in ('workbook_stage','workbook_prepare') else 'local-files')
-        lane='catalog-sync' if operation=='database_cache_sync' else 'foreground'
+        lane='catalog-sync' if operation in ('database_cache_sync','database_cache_hydrate_batch') else 'foreground'
         if lane=='catalog-sync':key=digest({'profile':key,'lane':lane})
         with self.lock:
+            if operation=='database_cache_hydrate_batch' and self.foreground_busy():
+                raise CatalogBackgroundBusy('Oczekiwanie na zakończenie bieżącego odczytu danych.')
             if lane=='catalog-sync' and any(j['status']=='running' and j.get('lane')==lane for j in self.jobs.values()):
                 raise UserError('Synchronizacja katalogu już trwa. Poczekaj na jej zakończenie albo ją anuluj.')
             if lane=='catalog-sync' and sum(bool(w.busy) for w in self.workers.values())>=3:
@@ -3851,6 +4223,7 @@ class WorkerHub:
             jid=uid(); self.jobs[jid]={'id':jid,'operation':operation,'status':'running','stage':'Przygotowanie zadania',
                                      'created':utcnow(),'output':output,'worker':worker,'args':args,'source_id':source['id'] if source else '', 'lane':lane}
             worker.busy=jid
+            if lane=='foreground':self.foreground_activity=time.monotonic()
             try:
                 worker.send({'id':jid,'operation':operation,'args':args,'source':source,'password':password,
                              'runtime':runtime or {},'output':output,'timeout':timeout})
@@ -3871,6 +4244,14 @@ class WorkerHub:
         return {'ok':True}
     def running(self):
         with self.lock: return [j['id'] for j in self.jobs.values() if j['status']=='running']
+    def foreground_busy(self):
+        with self.lock:
+            return time.monotonic()-self.foreground_activity<.25 or any(j['status']=='running' and j.get('lane','foreground')=='foreground' for j in self.jobs.values())
+    def release_background(self,jid):
+        with self.lock:
+            job=self.jobs.get(jid);worker=job.get('worker') if job else None
+            if worker and worker.busy is None:
+                with contextlib.suppress(Exception):worker.send({'id':uid(),'operation':'database_cache_release'})
     def close(self):
         for jid in self.running(): self.cancel(jid)
         with self.lock:
@@ -4444,11 +4825,12 @@ class CatalogCacheCoordinator:
     callback. One import batch runs between queued reads, keeping pages responsive.
     """
     ACTIONS=frozenset(('database_cache_page','database_cache_details','database_cache_status',
-                       'database_cache_sync','database_cache_clear'))
+                       'database_cache_sync','database_cache_clear','database_cache_hydrate','database_cache_graph'))
+    BACKGROUND=frozenset(('database_cache_sync','database_cache_hydrate'))
     MAX_COMPLETED=64;MAX_RESULT_BYTES=32*1024*1024
     def __init__(self,service):
         self.service=service;self.cache=CatalogCache(service.root/'cache'/'metadata-v1.sqlite')
-        self.jobs={};self.requests={};self.syncs={};self.lock=threading.RLock()
+        self.jobs={};self.requests={};self.syncs={};self.hydrations={};self.lock=threading.RLock()
         self.result_bytes={};self.delivered=set();self.pending_details={}
         self.queue=queue.Queue();self.stopping=threading.Event();self.thread=None
     def submit(self,operation,args,source):
@@ -4458,8 +4840,12 @@ class CatalogCacheCoordinator:
         with self.lock:
             if sum(j['status']=='running' for j in self.jobs.values())>=64:
                 raise UserError('Trwa zbyt wiele odczytów katalogu. Poczekaj na ich zakończenie.')
-            if operation=='database_cache_sync' and any(j['status']=='running' and j['operation']==operation for j in self.jobs.values()):
-                raise UserError('Synchronizacja katalogu już trwa. Poczekaj albo ją anuluj.')
+            if operation in self.BACKGROUND:
+                for old_id,job in self.jobs.items():
+                    if job['status']!='running' or job['operation'] not in self.BACKGROUND:continue
+                    previous=self.requests[old_id]
+                    if operation=='database_cache_sync' and job['operation']=='database_cache_hydrate':previous['cancel'].set()
+                    if not previous['cancel'].is_set():raise UserError('Odczyt katalogu w tle już trwa. Poczekaj albo go wstrzymaj.')
             self.requests[jid]=request
             self.jobs[jid]={'id':jid,'operation':operation,'status':'running','stage':'Odczyt lokalnego katalogu',
                             'created':utcnow(),'source_id':source['id'],'lane':'catalog-cache'}
@@ -4515,29 +4901,32 @@ class CatalogCacheCoordinator:
         args=request['args'];identity=catalog_cache_identity(request['source']);scope=self._scope(request)
         operation=self.jobs[jid]['operation']
         if operation=='database_cache_sync':
-            lease=self.cache.begin_refresh(identity,scope,owner=self.service.session.name,supersede=args.get('force',False) is True)
-            if lease is None:
-                status=self.cache.status(identity,scope)
-                self._finish(jid,dict(status,cache=status,synced=False));return
-            state={'lease':lease,'identity':identity,'scope':scope,'worker_id':None,'phase':'remote',
-                   'path':self.service.session/('catalog-'+jid+'.sqlite')}
-            self.syncs[jid]=state
-            if not self._live(request):raise Cancelled()
-            source=request['source']
-            worker_id=self.service.hub.submit('database_cache_sync',scope,source,self.service.secrets.get(source),
-                self.service.settings,str(state['path']),int(self.service.settings.get('timeout',60)))
-            state['worker_id']=worker_id
-            with self.service.hub.lock:
-                self.service.hub.jobs[worker_id].update(generation=request['generation'],source_fingerprint=request['fingerprint'])
+            self.syncs[jid]={'lease':None,'identity':identity,'scope':scope,'worker_id':None,'phase':'queued',
+                            'path':self.service.session/('catalog-'+jid+'.sqlite')}
+            return
+        if operation=='database_cache_hydrate':
+            current=self.cache.status(identity,scope);generation=args.get('generation') or current.get('generation')
+            if not generation or current.get('generation')!=generation:raise Cancelled('Migawka katalogu została zmieniona. Otwórz aktualną wersję.')
+            status=self.cache.hydration_status(identity,scope,generation=generation)
+            self.hydrations[jid]={'identity':identity,'scope':scope,'generation':generation,'worker_id':None,
+                                  'last_worker_id':None,'claim':None,'retry':args.get('retry_failed') is True}
+            self._hydration_progress(jid,status)
             return
         if operation=='database_cache_page':
             value=self.cache.page(identity,scope,offset=args.get('offset',0),query=args.get('query',''),kind=args.get('kind',''),
                                   page_size=args.get('page_size',1000),include_system=scope['include_system'],generation=args.get('generation'))
-            if value is not None:value['source_id']=request['source']['id']
+            if value is not None:
+                value['source_id']=request['source']['id']
+                value['hydration']=self.cache.hydration_status(identity,scope,generation=value['cache']['generation'])
         elif operation=='database_cache_details':
             value=self.cache.get_details(identity,args.get('object',{}),scope=scope,generation=args.get('generation'))
             if value is not None:value['source_id']=request['source']['id']
-        elif operation=='database_cache_status':value=self.cache.status(identity,scope)
+        elif operation=='database_cache_status':
+            value=self.cache.status(identity,scope)
+            if value.get('generation'):value['hydration']=self.cache.hydration_status(identity,scope,generation=value['generation'])
+        elif operation=='database_cache_graph':
+            value=self.cache.graph(identity,scope,ids=args.get('ids',()),focus=args.get('focus',''),focus_object=args.get('focus_object'),generation=args.get('generation'),limit=args.get('limit',120))
+            if value is not None:value['source_id']=request['source']['id']
         elif operation=='database_cache_clear':
             value=dict(self.cache.clear(identity,scope) or {},cleared=True)
         else:raise UserError('Nieznana operacja lokalnego katalogu.')
@@ -4545,7 +4934,8 @@ class CatalogCacheCoordinator:
     def _cleanup_sync(self,jid):
         state=self.syncs.pop(jid,None)
         if state is None:return
-        with contextlib.suppress(Exception):self.cache.abort(state['lease'])
+        if state.get('lease'):
+            with contextlib.suppress(Exception):self.cache.abort(state['lease'])
         worker_id=state.get('worker_id')
         if worker_id and self.service.hub.poll(worker_id)['status']=='running':return
         with contextlib.suppress(OSError):state['path'].unlink()
@@ -4557,6 +4947,24 @@ class CatalogCacheCoordinator:
                     self.service.hub.cancel(worker_id);state['cancel_sent']=True
                 return
             raise Cancelled()
+        if state['phase']=='queued':
+            if self.hydrations or any(key!=jid for key in self.syncs):return
+            with self.service.hub.lock:
+                if sum(j['status']=='running' for j in self.service.hub.jobs.values())>=3:return
+            lease=self.cache.begin_refresh(state['identity'],state['scope'],owner=self.service.session.name,
+                                            supersede=request['args'].get('force',False) is True)
+            if lease is None:
+                status=self.cache.status(state['identity'],state['scope'])
+                self._cleanup_sync(jid);self._finish(jid,dict(status,cache=status,synced=False));return
+            state['lease']=lease
+            if not self._live(request):raise Cancelled()
+            source=request['source']
+            worker_id=self.service.hub.submit('database_cache_sync',state['scope'],source,self.service.secrets.get(source),
+                self.service.settings,str(state['path']),int(self.service.settings.get('timeout',60)))
+            state.update(worker_id=worker_id,phase='remote')
+            with self.service.hub.lock:
+                self.service.hub.jobs[worker_id].update(generation=request['generation'],source_fingerprint=request['fingerprint'])
+            return
         if state['phase']=='remote':
             remote=self.service.hub.poll(worker_id)
             if remote['status']=='running':
@@ -4576,8 +4984,79 @@ class CatalogCacheCoordinator:
         if not self.cache.commit_publish(state['lease'],guard=lambda:self._live(request),guard_lock=self.service.lock):
             raise Cancelled('Nowsza synchronizacja zastąpiła ten odczyt.')
         status=self.cache.status(state['identity'],state['scope'])
-        self._finish(jid,dict(status,cache=status,synced=True),published=True);self._cleanup_sync(jid)
+        self._cleanup_sync(jid);self._finish(jid,dict(status,cache=status,synced=True),published=True)
         with contextlib.suppress(Exception):self.cache.gc()
+    def _hydration_progress(self,jid,status,paused=False,changed_ids=None):
+        value=dict(status,paused=bool(paused),changed_ids=list(status.get('changed_ids',()) if changed_ids is None else changed_ids))
+        with self.lock:
+            self.jobs[jid]['hydration']=value
+            self.jobs[jid]['stage']=('Oczekiwanie na bieżący odczyt danych' if paused else
+                'Odczyt kolumn i relacji · '+str(status.get('completed',0))+' / '+str(status.get('total',0))+
+                ' · częściowe: '+str(status.get('partial',0))+' · błędy: '+str(status.get('failed',0)))
+    def _cleanup_hydration(self,jid):
+        state=self.hydrations.pop(jid,None)
+        if state is None:return
+        if state.get('claim'):
+            with contextlib.suppress(Exception):self.cache.release_hydration_claim(state['identity'],state['scope'],state['generation'],state['claim'])
+        if state.get('last_worker_id'):
+            with contextlib.suppress(Exception):self.service.hub.release_background(state['last_worker_id'])
+            with self.service.hub.lock:
+                remote=self.service.hub.jobs.get(state['last_worker_id'])
+                if remote and remote['status']!='running':self.service.hub.jobs.pop(state['last_worker_id'],None)
+    def _step_hydration(self,jid):
+        request=self.requests[jid];state=self.hydrations[jid];worker_id=state.get('worker_id')
+        if not self._live(request):
+            if worker_id and self.service.hub.poll(worker_id)['status']=='running':
+                if not state.get('cancel_sent'):
+                    self.service.hub.cancel(worker_id);state['cancel_sent']=True
+                return
+            raise Cancelled()
+        if worker_id:
+            remote=self.service.hub.poll(worker_id)
+            if remote['status']=='running':return
+            if remote['status']!='done':
+                with self.lock:
+                    for key in ('dependency','connected','catalog_scope'):
+                        if key in remote:self.jobs[jid][key]=remote[key]
+                raise Cancelled() if remote['status']=='cancelled' else UserError(remote.get('error','Nie ukończono odczytu kolumn i relacji.'))
+            batch=remote['value'];identity=batch.get('cache_identity')
+            if not isinstance(identity,dict) or not identity.get('context') or identity.get('source_key')!=state['identity']['source_key']:
+                raise UserError('Nie potwierdzono tożsamości bazy. Odczyt kolumn i relacji wstrzymano.')
+            status=self.cache.put_hydration_results(identity,batch,state['scope'],observed_generation=state['generation'],claim=state['claim'],
+                                                     guard=lambda:self._live(request),guard_lock=self.service.lock)
+            if not status:raise Cancelled('Migawka lub źródło zostały zmienione. Zatrzymano odczyt struktury.')
+            changed=[r.get('object',{}).get('id') for r in batch.get('results',[]) if r.get('object',{}).get('id')]
+            state.update(worker_id=None,claim=None)
+            self._hydration_progress(jid,status,changed_ids=changed)
+            # Bulk payloads belong to the cache, not an ever-growing hub log.
+            with self.service.hub.lock:self.service.hub.jobs[worker_id]['value']={'stored':True}
+            return
+        if self.syncs or any(key!=jid for key in self.hydrations) or self.service.hub.foreground_busy():
+            with self.lock:status=self.jobs[jid].get('hydration',{})
+            self._hydration_progress(jid,status,paused=True);return
+        current=self.cache.status(state['identity'],state['scope'])
+        if current.get('generation')!=state['generation']:raise Cancelled('Opublikowano nowszy katalog. Zatrzymano poprzedni odczyt struktury.')
+        batch=self.cache.hydration_batch(state['identity'],state['scope'],state['generation'],limit=20,retry=state.pop('retry',False))
+        status={k:v for k,v in batch.items() if k not in ('objects','claim')};objects=batch.get('objects',[])
+        if not objects:
+            self._hydration_progress(jid,status)
+            self._cleanup_hydration(jid);self._finish(jid,{'hydration':status,'hydrated':True,'generation':state['generation']});return
+        state['claim']=batch['claim'];source=request['source']
+        if not self._live(request):raise Cancelled()
+        try:
+            worker_id=self.service.hub.submit('database_cache_hydrate_batch',{'objects':objects,'cache_generation':state['generation'],'cache_scope':state['scope']},
+                source,self.service.secrets.get(source),self.service.settings,'',int(self.service.settings.get('timeout',60)))
+        except CatalogBackgroundBusy:
+            self.cache.release_hydration_claim(state['identity'],state['scope'],state['generation'],state['claim']);state['claim']=None
+            self._hydration_progress(jid,status,paused=True);return
+        if state.get('last_worker_id'):
+            with self.service.hub.lock:
+                previous=self.service.hub.jobs.get(state['last_worker_id'],{})
+                if previous.get('worker') is not self.service.hub.jobs[worker_id].get('worker'):
+                    self.service.hub.release_background(state['last_worker_id'])
+                self.service.hub.jobs.pop(state['last_worker_id'],None)
+        state.update(worker_id=worker_id,last_worker_id=worker_id)
+        self._hydration_progress(jid,status)
     def remember_details(self,job):
         args=job.get('args',{})
         if self.stopping.is_set() or args.get('cache_generation') is None:return
@@ -4652,7 +5131,7 @@ class CatalogCacheCoordinator:
                 except queue.Empty:kind=None
                 if kind=='job':
                     try:self._execute(value)
-                    except Exception as exc:self._finish(value,error=exc);self._cleanup_sync(value)
+                    except Exception as exc:self._cleanup_sync(value);self._cleanup_hydration(value);self._finish(value,error=exc)
                 elif kind=='details':
                     with self.lock:pending=self.pending_details.pop(value,None)
                     if pending is not None:request,details,args=pending
@@ -4663,8 +5142,16 @@ class CatalogCacheCoordinator:
                                                    observed_generation=args.get('cache_generation'))
                 for jid in list(self.syncs):
                     try:self._step_sync(jid)
-                    except Exception as exc:self._finish(jid,error=exc);self._cleanup_sync(jid)
+                    except Exception as exc:self._cleanup_sync(jid);self._finish(jid,error=exc)
+                for jid in list(self.hydrations):
+                    try:self._step_hydration(jid)
+                    except Exception as exc:self._cleanup_hydration(jid);self._finish(jid,error=exc)
         finally:
+            for jid in list(self.hydrations):
+                state=self.hydrations[jid]
+                if state.get('worker_id'):
+                    with contextlib.suppress(Exception):self.service.hub.cancel(state['worker_id'])
+                with contextlib.suppress(Exception):self._cleanup_hydration(jid)
             for jid in list(self.syncs):
                 state=self.syncs[jid]
                 if state.get('worker_id'):
@@ -4814,7 +5301,7 @@ class ApplicationService:
             if action in CatalogCacheCoordinator.ACTIONS:
                 source=self.source(args['source_id'])
                 if source['kind']!='oracle':raise UserError('Lokalny katalog dotyczy źródeł Oracle.')
-                if action=='database_cache_sync':self.authorize(source)
+                if action in CatalogCacheCoordinator.BACKGROUND:self.authorize(source)
                 return self.catalog_cache.submit(action,{k:v for k,v in args.items() if k!='source_id'},source)
             if action.startswith('workbook_'):return self.workbooks.handle(action,args)
             if action=='state':
@@ -11114,12 +11601,13 @@ def native_ui_types():
             required=graph._key_fields.get(obj['id'],set())
             cols=obj['columns'];important=[c for c in cols if c.get('pk_position') or c['name'] in required]
             shown=important+[c for c in cols if c not in important][:max(0,9-len(important))]
-            self._shown=shown;self._title_font=QG.QFont();self._title_font.setPixelSize(15);self._title_font.setBold(True)
-            self._field_font=QG.QFont();self._field_font.setPixelSize(13)
+            self._shown=shown;self._title_font=QG.QFont();self._title_font.setPixelSize(13);self._title_font.setBold(True)
+            self._field_font=QG.QFont();self._field_font.setPixelSize(12)
             fm=QG.QFontMetrics(self._field_font);tfm=QG.QFontMetrics(self._title_font)
-            width=max(300,min(430,max([tfm.horizontalAdvance(database_label(obj))+38]+[fm.horizontalAdvance(c['name'])+fm.horizontalAdvance(str(c['type']))+86 for c in shown])))
-            self._row_h=max(27,fm.height()+10);self._header_h=max(44,tfm.height()+22)
-            self._extra=len(cols)-len(shown);height=self._header_h+self._row_h*max(1,len(shown))+12+(25 if self._extra else 0)
+            available=max(1,graph.viewport().width());card_limit=max(230,min(250,(available-24-3*18)/4))
+            width=max(230,min(card_limit,max([tfm.horizontalAdvance(database_label(obj))+28]+[fm.horizontalAdvance(c['name'])+fm.horizontalAdvance(str(c['type']))+66 for c in shown])))
+            self._row_h=max(23,fm.height()+6);self._header_h=max(34,tfm.height()+14)
+            self._extra=len(cols)-len(shown);height=self._header_h+self._row_h*max(1,len(shown))+8+(21 if self._extra else 0)
             super().__init__(0,0,width,height)
             self._row_anchors={c['name']:self._header_h+i*self._row_h+self._row_h/2 for i,c in enumerate(shown)}
             self.setFlags(QW.QGraphicsItem.GraphicsItemFlag.ItemIsMovable|QW.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable|QW.QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -11147,21 +11635,23 @@ def native_ui_types():
                     if c['name'] in highlighted:painter.fillRect(row,ui_color('selection'))
                     mark='PK' if c.get('pk_position') else 'FK' if c['name'] in fk else ''
                     painter.setPen(ui_color('accent' if mark else 'muted'));painter.drawText(row.adjusted(11,0,-11,0),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,mark)
-                    type_width=min(116,max(55,fm.horizontalAdvance(str(c['type']))+8))
-                    painter.setPen(ui_color('text'));painter.drawText(row.adjusted(41,0,-type_width-20,0),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,
-                        fm.elidedText(c['name'],Qt.TextElideMode.ElideRight,int(row.width()-type_width-62)))
+                    type_width=min(80,max(44,fm.horizontalAdvance(str(c['type']))+6))
+                    painter.setPen(ui_color('text'));painter.drawText(row.adjusted(32,0,-type_width-13,0),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,
+                        fm.elidedText(c['name'],Qt.TextElideMode.ElideRight,int(row.width()-type_width-46)))
                     painter.setPen(ui_color('muted'));painter.drawText(row.adjusted(row.width()-type_width-14,0,-14,0),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignRight,
                         fm.elidedText(str(c['type']),Qt.TextElideMode.ElideRight,type_width))
                 if not self._shown:
-                    painter.setPen(ui_color('muted'));painter.drawText(self.rect().adjusted(14,self._header_h,-14,-5),Qt.AlignmentFlag.AlignTop,'Kolumny nieodczytane')
+                    painter.setPen(ui_color('muted'));painter.drawText(self.rect().adjusted(12,self._header_h,-12,-5),Qt.AlignmentFlag.AlignTop,'Brak kolumn' if self._object.get('coverage',{}).get('columns') else 'Kolumny w kolejce odczytu')
                 if self._extra:
                     painter.setPen(ui_color('muted'));painter.drawText(QC.QRectF(14,self.rect().height()-29,self.rect().width()-28,24),Qt.AlignmentFlag.AlignVCenter,
-                        '+ '+str(self._extra)+' kolumn · szczegóły po kliknięciu')
+                        '+ '+str(self._extra)+' kolumn')
             finally:painter.restore()
         def itemChange(self,change,value):
             result=super().itemChange(change,value)
             if getattr(self,'_node_ready',False):
-                if change==QW.QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:self._graph.schedule_edges();self._graph.schedule_save()
+                if change==QW.QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+                    if not self._graph._building and not self._graph._restoring:self._graph._manual_positions.add(self._object['id'])
+                    self._graph.schedule_edges();self._graph.schedule_save()
                 elif change==QW.QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:self.update()
             return result
         def mousePressEvent(self,event):
@@ -11222,7 +11712,7 @@ def native_ui_types():
             super().__init__(parent);self._scene=QW.QGraphicsScene(self);self.setScene(self._scene)
             self._nodes={};self._edges=[];self._links=[];self._building=False;self._plan_key='';self._source_key='';self._view_key=''
             self._plan=None;self._key_fields={};self._foreign_fields={};self._highlight_fields={};self._selected_relation=''
-            self._states={};self._space=False;self._pan_point=None;self._restoring=False;self._initial_view=False
+            self._states={};self._manual_positions=set();self._space=False;self._pan_point=None;self._restoring=False;self._initial_view=False
             self._edge_timer=QC.QTimer(self);self._edge_timer.setSingleShot(True);self._edge_timer.setInterval(0);self._edge_timer.timeout.connect(self.redraw_edges)
             self._save_timer=QC.QTimer(self);self._save_timer.setSingleShot(True);self._save_timer.setInterval(180);self._save_timer.timeout.connect(self.save_state)
             self.setFrameShape(QW.QFrame.Shape.NoFrame)
@@ -11279,6 +11769,8 @@ def native_ui_types():
             state=self._state();positions=state.setdefault('positions',{})
             if not isinstance(positions,dict):positions={};state['positions']=positions
             for oid,node in self._nodes.items():positions[oid]=[round(node.pos().x(),2),round(node.pos().y(),2)]
+            raw_manual=state.get('manual',[]);manual={oid for oid in raw_manual if isinstance(oid,str)} if isinstance(raw_manual,list) else set()
+            state['manual']=list((manual-set(self._nodes))|self._manual_positions)[:3000]
             if len(positions)>3000:state['positions']={oid:positions[oid] for oid in list(positions)[-3000:]}
             center=self.mapToScene(self.viewport().rect().center());views=state.setdefault('views',{})
             if not isinstance(views,dict):views={};state['views']=views
@@ -11292,6 +11784,8 @@ def native_ui_types():
             topology=digest({'objects':plan['objects'],'relations':plan['relations'],'theme':ui_theme()})
             source_key=source_key or 'session';view_key=view_key or 'all'
             if (topology,source_key,view_key)==(self._plan_key,self._source_key,self._view_key):return
+            if (source_key,view_key)==(self._source_key,self._view_key) and self._plan is not None and not self._initial_view:
+                self.update_plan(plan,topology);return
             self.save_state();self._save_timer.stop();self._edge_timer.stop();self._building=True
             self._source_key=source_key;self._view_key=view_key;self._plan_key=topology;self._plan=plan
             try:
@@ -11310,6 +11804,52 @@ def native_ui_types():
             finally:self._building=False
             self._initial_view=True
             if self.isVisible():QC.QTimer.singleShot(0,self._initialize_view)
+        def update_plan(self,plan,topology):
+            """Publish progressive metadata without replacing the current view."""
+            center=self.mapToScene(self.viewport().rect().center());scene_rect=self._scene.sceneRect().united(self.mapToScene(self.viewport().rect()).boundingRect().adjusted(-2,-2,2,2));selected=set(self.selected_ids());old_keys=self._key_fields
+            self._building=True;self._edge_timer.stop();self._plan=plan;self._plan_key=topology;self._links=plan['relations'];self._key_fields={};self._foreign_fields={}
+            try:
+                for item in list(self._scene.items()):
+                    if isinstance(item,QW.QGraphicsSimpleTextItem):self._scene.removeItem(item)
+                for edge in self._links:
+                    self._key_fields.setdefault(edge['source'],set()).update(edge['source_columns']);self._key_fields.setdefault(edge['target'],set()).update(edge['target_columns'])
+                    self._foreign_fields.setdefault(edge['source'],set()).update(edge['source_columns'])
+                for edge in self._edges:self._scene.removeItem(edge)
+                self._edges=[];wanted={obj['id'] for obj in plan['objects']}
+                for oid in list(self._nodes):
+                    if oid not in wanted:self._scene.removeItem(self._nodes.pop(oid))
+                added=[]
+                for obj in plan['objects']:
+                    oid=obj['id'];old=self._nodes.get(oid)
+                    if old is not None and digest(old._object)==digest(obj) and old_keys.get(oid,set())==self._key_fields.get(oid,set()):continue
+                    node=DatabaseNode(obj,self)
+                    if old is not None:node.setPos(old.pos());self._scene.removeItem(old)
+                    else:added.append(oid)
+                    self._nodes[oid]=node;self._scene.addItem(node);node.setSelected(oid in selected)
+                sizes={oid:(node.rect().width(),node.rect().height()) for oid,node in self._nodes.items()}
+                positions=database_graph_layout(plan['objects'],self._links,sizes,self.viewport().width(),compact=True)
+                placed={oid for oid in self._nodes if oid not in added}
+                for oid in added:
+                    node=self._nodes[oid];point=QC.QPointF(*positions[oid]);neighbor=next((self._nodes[e['target'] if e['source']==oid else e['source']] for e in self._links if oid in (e['source'],e['target']) and (e['target'] if e['source']==oid else e['source']) in placed),None)
+                    if neighbor is not None:point=neighbor.pos()+QC.QPointF(neighbor.rect().width()+24,0)
+                    while any(QC.QRectF(point,node.rect().size()).adjusted(-8,-8,8,8).intersects(self._nodes[key].sceneBoundingRect()) for key in placed):point+=QC.QPointF(0,node.rect().height()+24)
+                    node.setPos(point);placed.add(oid)
+                # Metadata makes cards taller. Move only automatically placed cards;
+                # coordinates explicitly set by the user remain pinned.
+                placed=set(self._manual_positions)&set(self._nodes)
+                for oid in sorted(set(self._nodes)-placed,key=lambda key:(self._nodes[key].pos().y(),self._nodes[key].pos().x())):
+                    node=self._nodes[oid]
+                    while True:
+                        overlaps=[self._nodes[key].sceneBoundingRect() for key in placed if node.sceneBoundingRect().adjusted(-8,-8,8,8).intersects(self._nodes[key].sceneBoundingRect())]
+                        if not overlaps:break
+                        node.setY(max(rect.bottom() for rect in overlaps)+24)
+                    placed.add(oid)
+                for edge in self._links:
+                    for pair in zip(edge['source_columns'],edge['target_columns']):
+                        item=DatabaseEdge(edge,pair,self);self._scene.addItem(item);self._edges.append(item)
+                self._scene.setSceneRect(scene_rect.united(self._scene.itemsBoundingRect().adjusted(-42,-42,42,42)));self.centerOn(center)
+            finally:self._building=False
+            self.setBackgroundBrush(ui_color('bg'));self._selection_changed();self._edge_timer.stop();self.save_state()
         def _initialize_view(self):
             if not self._initial_view or not self.isVisible() or self.viewport().width()<20:return
             self._initial_view=False;self._restoring=True
@@ -11335,8 +11875,10 @@ def native_ui_types():
             self._building=True
             try:
                 sizes={oid:(n.rect().width(),n.rect().height()) for oid,n in self._nodes.items()}
-                positions=database_graph_layout(self._plan['objects'],self._links,sizes,self.viewport().width())
+                positions=database_graph_layout(self._plan['objects'],self._links,sizes,self.viewport().width(),compact=True)
                 stored=self._state().get('positions',{}) if preserve else {}
+                raw_manual=self._state().get('manual',[]) if preserve else []
+                self._manual_positions={oid for oid in raw_manual if isinstance(oid,str) and oid in self._nodes} if isinstance(raw_manual,list) else set()
                 if not isinstance(stored,dict):stored={}
                 for oid,node in self._nodes.items():
                     pos=stored.get(oid,positions[oid])
@@ -11625,9 +12167,12 @@ def native_ui_types():
             super().__init__(window);self._host_window=window;self.source=None;self.catalog=None;self._cache={};self._objects={};self._wanted=None;self._epoch=0;self._selected='';self._graph_focus='';self._busy_catalog=False;self._data_pages={};self._tree_items={}
             self._oracle_schema_override=None;self._oracle_scope_info=None;self._inventory_offset=0;self._inventory_lazy=False;self._inventory_requested=None;self._detail_requests={};self._detail_errors={};self._detail_warning_oid=''
             self._cache_generation=None;self._cache_scope_key=None;self._sync_job='';self._sync_epoch=0;self._sync_message='';self._auto_sync_attempts=set();self._cache_cleared=False;self._detail_force=set();self._restore_selected=''
+            self._hydrate_job='';self._hydrate_epoch=0;self._hydration={};self._hydrate_paused=False;self._hydrate_attempts=set();self._graph_payload=None;self._graph_request_key=None
+            self._structure_job='';self._structure_epoch=0;self._structure_dirty=False
+            self._structure_timer=QC.QTimer(self);self._structure_timer.setSingleShot(True);self._structure_timer.setInterval(500);self._structure_timer.timeout.connect(self.refresh_cached_structure)
             self.queue=DatabaseTaskQueue(window);self.setObjectName('databaseExplorer')
-            outer=QW.QVBoxLayout(self);outer.setContentsMargins(22,14,22,12);outer.setSpacing(10);outer.setAlignment(Qt.AlignmentFlag.AlignTop)
-            top=QW.QHBoxLayout();self.title=label('Baza danych');self.title.setObjectName('sectionTitle');self.title.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);top.addWidget(self.title,1)
+            outer=QW.QVBoxLayout(self);outer.setContentsMargins(16,10,16,10);outer.setSpacing(7);outer.setAlignment(Qt.AlignmentFlag.AlignTop)
+            top=QW.QHBoxLayout();self.title=label('Baza danych');self.title.setObjectName('databaseTitle');title_font=self.title.font();title_font.setPixelSize(15);title_font.setBold(True);self.title.setFont(title_font);self.title.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);top.addWidget(self.title,1)
             back=button('Arkusz',window.return_to_sheet);back.setObjectName('quietButton');top.addWidget(back)
             top.addWidget(icon_button('refresh','Odśwież wybrany zakres struktury',lambda:self.reload(True)));top.addWidget(icon_button('stop','Anuluj odczyt struktury',self.cancel_catalog))
             self.more=QW.QToolButton();self.more.setText('Baza');self.more.setPopupMode(QW.QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -11636,7 +12181,11 @@ def native_ui_types():
             menu.addAction('Edytuj połączenie…',lambda:window.guard(lambda:window.add_source(self.source)));self.more.setMenu(menu);top.addWidget(self.more);outer.addLayout(top)
             self.clear_cache_action=menu.addAction('Usuń zapisany katalog tego zakresu',lambda:window.guard(self.clear_persistent_catalog));self.clear_cache_action.setVisible(False)
             self.status=label('Otwórz bazę, aby zobaczyć wszystkie jej obiekty.',True,True);self.status.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);outer.addWidget(self.status)
-            self.cache_note=label('',True,True);self.cache_note.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);self.cache_note.hide();outer.addWidget(self.cache_note)
+            self.cache_bar=QW.QWidget();cache_row=QW.QHBoxLayout(self.cache_bar);cache_row.setContentsMargins(0,0,0,0);cache_row.setSpacing(8)
+            self.cache_note=label('',True);self.cache_note.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);cache_row.addWidget(self.cache_note,1)
+            self.hydrate_progress=QW.QProgressBar();self.hydrate_progress.setRange(0,100);self.hydrate_progress.setFixedSize(75,4);self.hydrate_progress.setTextVisible(False);cache_row.addWidget(self.hydrate_progress)
+            self.hydrate_button=QW.QToolButton();self.hydrate_button.setText('Pobierz kolumny i relacje');self.hydrate_button.clicked.connect(self.toggle_hydration);cache_row.addWidget(self.hydrate_button)
+            self.cache_note.hide();self.cache_bar.hide();self.hydrate_progress.hide();self.hydrate_button.hide();outer.addWidget(self.cache_bar)
             self.oracle_scope_bar=QW.QWidget();scope_row=QW.QHBoxLayout(self.oracle_scope_bar);scope_row.setContentsMargins(0,0,0,0);scope_row.setSpacing(8)
             scope_row.addWidget(label('Zakres Oracle',True));self.oracle_schema=QW.QComboBox();self.oracle_schema.setEditable(True);self.oracle_schema.setInsertPolicy(QW.QComboBox.InsertPolicy.NoInsert)
             self.oracle_schema.setMinimumContentsLength(16);self.oracle_schema.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);self.oracle_schema.setSizePolicy(QW.QSizePolicy.Policy.Expanding,QW.QSizePolicy.Policy.Fixed)
@@ -11668,7 +12217,7 @@ def native_ui_types():
             self.columns_view,self.columns_model=database_table(self);self.keys_view,self.keys_model=database_table(self);self.indexes_view,self.indexes_model=database_table(self)
             self.details.addTab(self.columns_view,'Kolumny');self.details.addTab(self.keys_view,'Klucze');self.details.addTab(self.indexes_view,'Indeksy')
             self.definition=QW.QPlainTextEdit();self.definition.setReadOnly(True);self.definition.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.NoWrap);self.definition.setFont(QG.QFontDatabase.systemFont(QG.QFontDatabase.SystemFont.FixedFont));self.details.addTab(self.definition,'Definicja / źródło')
-            self.properties=QW.QPlainTextEdit();self.properties.setReadOnly(True);self.details.addTab(self.properties,'Informacje')
+            self.properties=QW.QPlainTextEdit();self.properties.setReadOnly(True);self.details.addTab(self.properties,'Informacje');self.details.currentChanged.connect(self.detail_tab_changed)
             self.splitter.addWidget(right);self.splitter.setStretchFactor(0,0);self.splitter.setStretchFactor(1,1);self.splitter.setSizes([275,740]);self.tabs.addTab(structure,ui_icon('database'),'Struktura')
             graphpage=QW.QWidget();gl=QW.QVBoxLayout(graphpage);gl.setContentsMargins(0,8,0,0);gl.setSpacing(6)
             gt=QW.QHBoxLayout();gt.setSpacing(8)
@@ -11742,7 +12291,7 @@ def native_ui_types():
             self.search.setPlaceholderText('Szukaj nazwy obiektu we wszystkich stronach…' if inventory else 'Szukaj tabeli, kolumny, indeksu…')
             if not inventory:return
             offset=inventory['offset'];count=len(self._inventory_page_ids);total=inventory['total']
-            self.inventory_note.setText((f'Obiekty {offset+1}–{min(offset+count,total)} z {total}' if count else f'Brak obiektów · {total} wyników')+' · szczegóły po wybraniu obiektu')
+            self.inventory_note.setText(f'Obiekty {offset+1}–{min(offset+count,total)} z {total}' if count else f'Brak obiektów · {total} wyników')
             self.inventory_previous.setEnabled(not self._busy_catalog and offset>0);self.inventory_next.setEnabled(not self._busy_catalog and bool(inventory['has_more']))
             self.inventory_note.setToolTip('Wszystkie wyniki są dostępne na kolejnych stronach. Wyszukiwanie nazwy i filtr obiektów systemowych działają '+('w zapisanym katalogu' if self.catalog.get('cache') else 'w bazie')+' przed stronicowaniem.')
         def turn_inventory(self,step):
@@ -11775,18 +12324,134 @@ def native_ui_types():
                 return False
             if digest(self.source) not in self._host_window.service.trusted:
                 if not interactive or not self._host_window.authorize(self.source):return False
-            self.driver_card.set_issue(None);return True
+            self.driver_card.set_issue(None)
+            if interactive and (self.catalog or {}).get('cache',{}).get('generation'):QC.QTimer.singleShot(0,self,lambda:self.start_hydration())
+            return True
         def update_cache_note(self):
             cached=(self.catalog or {}).get('cache',{})
             parts=[]
             if cached:
                 parts.append('Widok z pamięci sesji; zapis lokalny usunięty.' if cached.get('cleared') else 'Zapisany katalog')
-                parts.append('pełna lista obiektów w zakresie' if cached.get('complete') else 'lista częściowa')
+                parts.append('pełna lista obiektów' if cached.get('complete') else 'lista częściowa')
                 stamp=cached.get('read_at') or (self.catalog or {}).get('read_at')
-                if stamp:parts.append('odczyt: '+str(stamp))
+                if stamp:parts.append('odczyt: '+str(stamp).replace('T',' ')[:16])
                 if cached.get('stale'):parts.append('wymaga odświeżenia')
             if self._sync_message:parts.append(self._sync_message)
-            self.cache_note.setText(' · '.join(parts));self.cache_note.setVisible(bool(parts))
+            coverage=self._hydration;total=coverage.get('total',0);done=coverage.get('completed',coverage.get('done',0));problems=coverage.get('partial',0)+coverage.get('failed',0)
+            if coverage:
+                parts.append('Kolumny i relacje: '+str(done)+'/'+str(total))
+                if self._hydrate_paused:parts.append('wstrzymano')
+                elif coverage.get('paused') and self._hydrate_job:parts.append('oczekiwanie')
+                if coverage.get('partial'):parts.append('częściowe: '+str(coverage['partial']))
+                if coverage.get('failed'):parts.append('błędy: '+str(coverage['failed']))
+            self.cache_note.setText(' · '.join(parts));self.cache_note.setToolTip(' · '.join(parts));self.cache_note.setVisible(bool(parts));self.cache_bar.setVisible(bool(parts) or bool(cached))
+            self.hydrate_progress.setVisible(bool(self._hydrate_job));self.hydrate_progress.setRange(0,max(1,total));self.hydrate_progress.setValue(min(done,total))
+            can=bool(cached and cached.get('generation') and not cached.get('cleared'))
+            self.hydrate_button.setVisible(can and not bool(coverage.get('complete')))
+            self.hydrate_button.setText('Wstrzymaj' if self._hydrate_job else 'Wznów' if self._hydrate_paused else 'Ponów' if problems else 'Pobierz kolumny i relacje')
+            self.hydrate_button.setEnabled(not bool(self._sync_job));self.hydrate_button.setToolTip('Pobierz kolumny i klucze wszystkich tabel oraz widoków w wybranym zakresie. Definicje są odczytywane oddzielnie.')
+        @staticmethod
+        def structure_ready(obj):
+            coverage=(obj or {}).get('coverage',{})
+            if 'columns' in coverage or 'relations' in coverage:return bool(coverage.get('columns') and coverage.get('relations'))
+            return bool(obj and (obj.get('details_loaded') is not False or (coverage.get('columns') and coverage.get('relations'))))
+        @staticmethod
+        def merge_metadata_object(previous,fresh):
+            if not previous:return fresh
+            if previous.get('details_loaded') is not False and fresh.get('details_loaded') is False:
+                return catalog_cache_merge_metadata({'object':previous,'complete':previous.get('details_complete',True),'coverage':previous.get('coverage')},{'object':fresh,'coverage':fresh.get('coverage',{}),'read_at':fresh.get('structure_read_at')})['object']
+            if fresh.get('details_loaded') is False or fresh.get('details_complete') is False:
+                fresh=clone(fresh);coverage=dict(fresh.get('coverage',{}))
+                for section,field in (('columns','columns'),('relations','keys')):
+                    if previous.get('coverage',{}).get(section) and not coverage.get(section):
+                        fresh[field]=clone(previous[field]);coverage[section]=True
+                        if previous.get('structure_read_at'):fresh['structure_read_at']=previous['structure_read_at']
+                fresh.update(coverage=coverage,structure_loaded=bool(coverage.get('columns') and coverage.get('relations')))
+            return fresh
+        def pause_hydration(self,remember=True):
+            self._hydrate_epoch+=1
+            if self._hydrate_job:self._host_window.watcher.cancel(self._hydrate_job);self._hydrate_job=''
+            self._hydrate_paused=remember;self.update_cache_note()
+        def toggle_hydration(self):
+            if self._hydrate_job:self.pause_hydration()
+            else:self.start_hydration(manual=True)
+        def start_hydration(self,manual=False):
+            if not self.source or self.source['kind']!='oracle' or self._sync_job or self._hydrate_job:return False
+            cached=(self.catalog or {}).get('cache',{})
+            if not cached.get('generation') or cached.get('cleared') or (self._hydrate_paused and not manual):return False
+            if not self.require_live(interactive=manual):return False
+            args=self.visible_cache_args();source_key=digest(self.source);project=self._host_window.service.generation;key=digest([source_key,args])
+            if self._hydration.get('generation')!=args['generation']:self._hydration={}
+            if self._hydration.get('complete') and not manual:return False
+            if not manual and key in self._hydrate_attempts:return False
+            self._hydrate_attempts.add(key);self._hydrate_paused=False;self._hydrate_epoch+=1;epoch=self._hydrate_epoch
+            try:response=self._host_window.service.call('database_cache_hydrate',dict(args,source_id=self.source['id'],retry_failed=manual))
+            except Exception as exc:self._sync_message='Nie rozpoczęto odczytu kolumn i relacji: '+safe_error(exc);self.update_cache_note();return False
+            self._hydrate_job=response['job_id'];self._hydration=dict(self._hydration,running=True);self.update_cache_note()
+            def live():return epoch==self._hydrate_epoch and self.source is not None and source_key==digest(self.source) and project==self._host_window.service.generation and args==self.visible_cache_args()
+            def progress(job):
+                if not live():return
+                self._hydration=clone(job.get('hydration') or self._hydration);self.update_cache_note();self.schedule_structure_refresh()
+            def done(value):
+                if not live():return
+                self._hydrate_job='';self._hydration=clone(value.get('hydration',{}));self.update_cache_note();self.schedule_structure_refresh()
+            def failed(error):
+                if not live():return
+                self._hydrate_job='';self._hydrate_paused=True;self._sync_message='Odczyt kolumn i relacji wstrzymany: '+str(error);self.update_cache_note();self.schedule_structure_refresh()
+            self._host_window.watcher.watch(response,done,failed,progress,title='Kolumny i relacje bazy');return True
+        def schedule_structure_refresh(self):
+            self._structure_dirty=True
+            if not self._structure_timer.isActive():self._structure_timer.start()
+        def cancel_structure_refresh(self):
+            self._structure_epoch+=1;self._structure_timer.stop();self._structure_dirty=False;self._graph_request_key=None
+            if self._structure_job:self._host_window.watcher.cancel(self._structure_job);self._structure_job=''
+        def refresh_cached_structure(self):
+            self._structure_timer.stop()
+            if self._structure_job:return
+            if not self.source or not (self.catalog or {}).get('cache') or self._cache_cleared:return
+            self._structure_dirty=False;scope=self.visible_cache_args()
+            ids=list(self.graph._nodes) if self.tabs.currentIndex()==1 and self.graph._nodes else [oid for oid in self._inventory_page_ids if self._objects[oid]['kind'] in DATABASE_RELATIONS][:120]
+            if self._selected in self._objects:ids=list(dict.fromkeys([self._selected,*ids]))[:120]
+            args=dict(scope,ids=ids,focus=self._graph_focus if self.tabs.currentIndex()==1 else '')
+            if args['focus'] in self._objects:args['focus_object']={k:self._objects[args['focus']][k] for k in ('id','schema','name','kind')}
+            source_key=digest(self.source);epoch=self._epoch;revision=self._structure_epoch;project=self._host_window.service.generation
+            def live():return epoch==self._epoch and revision==self._structure_epoch and self.source is not None and source_key==digest(self.source) and project==self._host_window.service.generation and scope==self.visible_cache_args()
+            try:response=self._host_window.service.call('database_cache_graph',dict(args,source_id=self.source['id']))
+            except Exception:return
+            self._structure_job=response['job_id']
+            def finished():
+                self._structure_job=''
+                if self._structure_dirty:self.schedule_structure_refresh()
+            def loaded(value):
+                if not live():return
+                finished()
+                if value.get('cache_miss'):return
+                key=(value.get('revision'),args.get('focus'),tuple(ids))
+                if key==self._graph_request_key:return
+                self._graph_request_key=key;self.merge_cached_structure(value,args.get('focus',''))
+            def failed(error):
+                if live():finished()
+            self._host_window.watcher.watch(response,loaded,failed,title='Aktualizacja mapy z zapisanego katalogu')
+        def merge_cached_structure(self,value,focus=''):
+            incoming=clone(value.get('objects',[])+value.get('related_objects',[]));changed=[]
+            candidate=dict(self._objects)
+            for obj in incoming:
+                previous=candidate.get(obj['id'])
+                obj=self.merge_metadata_object(previous,obj)
+                if previous!=obj:candidate[obj['id']]=obj;changed.append(obj['id'])
+            staged=dict(self.catalog,objects=clone(list(candidate.values())))
+            staged['relations']=database_catalog_relations(staged['objects'],staged['backend'])
+            if len(dumps(staged).encode('utf-8'))>DATABASE_MAX_METADATA_BYTES:return
+            self.catalog=staged;self._objects={obj['id']:obj for obj in staged['objects']};self._graph_payload={'value':clone(value),'focus':focus,'generation':self.visible_cache_args().get('generation')}
+            for oid in changed:
+                item=self._tree_items.get(oid)
+                if item is None:continue
+                expanded=self.tree.isExpanded(item.index());item.setData(False,ROLE+1);item.removeRows(0,item.rowCount())
+                obj=self._objects[oid]
+                if obj['columns'] or not self.structure_ready(obj):item.appendRow(QG.QStandardItem('Kolumny…'))
+                if expanded and obj.get('coverage',{}).get('columns'):self.expand_columns(item.index())
+            if self._selected in changed:self.select_object(self._selected,load_details=False)
+            if self.tabs.currentIndex()==1:self._render_graph()
         def cancel_catalog_sync(self):
             self._sync_epoch+=1
             if self._sync_job:
@@ -11800,6 +12465,7 @@ def native_ui_types():
             source_key=digest(self.source);generation=self._host_window.service.generation;scope=self.cache_scope_args();scope_key=digest(scope)
             attempt=(source_key,scope_key,self._cache_generation)
             if not manual and attempt in self._auto_sync_attempts:return False
+            self.pause_hydration(remember=False)
             self._auto_sync_attempts.add(attempt);self._cache_cleared=False;self._sync_epoch+=1;epoch=self._sync_epoch
             try:response=self._host_window.service.call('database_cache_sync',dict(scope,source_id=self.source['id'],force=manual))
             except Exception as exc:
@@ -11848,7 +12514,7 @@ def native_ui_types():
             found=bool(self.catalog and any(o['name']==obj['name'] and o['schema']==target and o['kind'] in DATABASE_RELATIONS for o in self.catalog['objects']))
             if found:
                 if self.oracle_schema_scope()!=loaded_scope:
-                    self.cancel_catalog_sync();self.cancel_details()
+                    self.pause_hydration(remember=False);self.cancel_structure_refresh();self.cancel_catalog_sync();self.cancel_details()
                     if self._busy_catalog:self._epoch+=1;self.queue.cancel_owner(self);self._busy_catalog=False
                     self.more.setEnabled(True);self.warning.hide();self._oracle_schema_override=loaded_scope
                     self._cache_generation=self.catalog.get('cache',{}).get('generation');self._cache_scope_key=digest([self.source,self.cache_scope_args()])
@@ -11865,10 +12531,10 @@ def native_ui_types():
             if not self.source:return
             scope=self.cache_scope_args();scope_key=digest([self.source,scope])
             if scope_key!=self._cache_scope_key:
-                self.cancel_catalog_sync();self._cache_generation=None;self._cache_scope_key=scope_key
+                self.cancel_catalog_sync();self.pause_hydration(remember=False);self._hydration={};self._cache_generation=None;self._cache_scope_key=scope_key
             if force and self.catalog:
                 self.start_catalog_sync(manual=True);return
-            self.cancel_details();self._epoch+=1;epoch=self._epoch;source_key=digest(self.source);generation=self._host_window.service.generation
+            self.cancel_structure_refresh();self.cancel_details();self._epoch+=1;epoch=self._epoch;source_key=digest(self.source);generation=self._host_window.service.generation
             self._busy_catalog=True;self.update_oracle_scope();self.update_inventory_controls();self.more.setEnabled(False)
             self._inventory_requested=(self.search.text().strip(),self.system.isChecked())
             args=dict(scope,generation=self._cache_generation,offset=self._inventory_offset,query=self.search.text().strip(),page_size=1000)
@@ -11878,7 +12544,7 @@ def native_ui_types():
                 self._busy_catalog=False;self.more.setEnabled(True)
                 if value.get('cache_miss'):
                     if self._cache_generation is not None:
-                        self._cache_generation=None;self.reload_cached(force);return
+                        self.pause_hydration(remember=False);self._hydration={};self._cache_generation=None;self.reload_cached(force);return
                     self.reload_live(force);return
                 cached=value.get('cache',{});self._cache_generation=cached.get('generation');self._inventory_lazy=True
                 inventory=value.get('oracle_inventory',{})
@@ -11891,6 +12557,8 @@ def native_ui_types():
                 if issue['state']!='ready':self.driver_card.set_issue(issue,self.source)
                 if force:self.start_catalog_sync(manual=True)
                 elif cached.get('stale'):self.start_catalog_sync(manual=False)
+                if not self._sync_job:self.start_hydration(manual=False)
+                self.schedule_structure_refresh()
             def failed(error):
                 if not live():return
                 self._busy_catalog=False;self.more.setEnabled(True);self.update_oracle_scope();self.update_inventory_controls()
@@ -11914,7 +12582,7 @@ def native_ui_types():
                 if self._inventory_lazy:args.update(lazy=True,offset=self._inventory_offset,query=self.search.text().strip(),include_system=self.system.isChecked(),page_size=1000)
                 key=digest({'source':self.source,'schema':self.oracle_schema_scope(),'inventory':{k:v for k,v in args.items() if k!='schema'}})
                 self._inventory_requested=(args.get('query',''),args.get('include_system',False))
-            self.cancel_details();self._epoch+=1;epoch=self._epoch;self._busy_catalog=True;self.update_oracle_scope();self.update_inventory_controls();self.warning.hide();self.status.setText('Odczytuję strukturę. Zawartość tabel nie jest pobierana.'+(' Widoczny katalog: '+self.catalog_scope_label()+'.' if self.catalog else ''))
+            self.cancel_structure_refresh();self.cancel_details();self._epoch+=1;epoch=self._epoch;self._busy_catalog=True;self.update_oracle_scope();self.update_inventory_controls();self.warning.hide();self.status.show();self.status.setText('Odczytuję strukturę…'+(' Widoczny katalog: '+self.catalog_scope_label()+'.' if self.catalog else ''))
             if not force and key in self._cache:self._busy_catalog=False;self.more.setEnabled(True);self.accept_catalog(self._cache[key]);return
             self.more.setEnabled(False)
             def loaded(value):
@@ -11933,16 +12601,18 @@ def native_ui_types():
                 self.warning.setText(str(text));self.warning.show();self.tabs.setVisible(bool(self.catalog));self._unconnected_space.setVisible(not self.catalog)
                 status='Połączenie działa; nie ukończono odczytu struktury.' if getattr(text,'connected',False) else 'Nie ukończono odczytu struktury.' if self.catalog else 'Nie połączono z bazą. Sprawdź szczegóły błędu i spróbuj ponownie.'
                 if self.catalog:status+=' Widoczny jest poprzedni katalog: '+self.catalog_scope_label()+'.'
-                self.status.setText(status);self.status.setToolTip(status)
+                self.status.setText(status);self.status.setToolTip(status);self.status.show()
             def progress(job):
                 if epoch==self._epoch:self.status.setText(job.get('stage','Odczyt struktury…'))
             self.queue.submit(self,'database_catalog',self.source,args,loaded,failed,progress)
         def cancel_catalog(self):
-            self.cancel_catalog_sync()
+            self.pause_hydration();self.cancel_structure_refresh();self.cancel_catalog_sync()
             self.cancel_details();self._epoch+=1;self._busy_catalog=False;self.queue.cancel_owner(self);self.more.setEnabled(True)
             self.update_oracle_scope();self.update_inventory_controls();self.status.setText('Anulowano odczyt struktury.'+(' Zachowano wcześniejszy katalog: '+self.catalog_scope_label()+'.' if self.catalog else ''))
         def accept_catalog(self,catalog):
             catalog=clone(catalog);inventory=catalog.get('oracle_inventory')
+            self._graph_payload=None;self._graph_request_key=None
+            if catalog.get('hydration'):self._hydration=clone(catalog['hydration'])
             self.driver_card.set_issue(None);self.tabs.show();self._unconnected_space.hide()
             fresh_objects={o['id']:o for o in catalog['objects']}
             for oid,page in self._data_pages.items():
@@ -11973,9 +12643,10 @@ def native_ui_types():
             self.update_inventory_controls()
             self.update_cache_note()
             counts=catalog['counts'];self.status.setText(f'{len(catalog["objects"])} obiektów · {counts.get("table",0)} tabel · {counts.get("view",0)} widoków · {len(catalog["relations"])} kluczy obcych · tylko odczyt')
-            if inventory:self.status.setText(f'{inventory["total"]} obiektów w wyniku · katalog stronicowany · kolumny i relacje odczytywane po wybraniu obiektu · tylko odczyt')
+            if inventory:self.status.setText(f'{inventory["total"]} obiektów · tylko odczyt')
             if self.source and self.source['kind']=='oracle':self.status.setText(self.catalog_scope_label()+' · '+self.status.text())
             self.status.setToolTip('\n'.join(catalog['scope'])+'\nOdczyt: '+catalog['read_at'])
+            self.status.setVisible(not bool(catalog.get('cache')))
             if catalog['warnings']:
                 self.warning.setText('Katalog częściowy · '+str(len(catalog['warnings']))+' problemów odczytu. Szczegóły w Informacjach.');self.warning.setToolTip('\n'.join(catalog['warnings']));self.warning.show()
             self._build_tree();self.select_object('');self._open_wanted()
@@ -12021,7 +12692,7 @@ def native_ui_types():
         def expand_columns(self,index):
             oid=index.data(ROLE);item=self.tree_model.itemFromIndex(index)
             if not oid or oid not in self._objects or item.data(ROLE+1):return
-            if self._objects[oid].get('details_loaded') is False:
+            if self._objects[oid].get('details_loaded') is False and not self._objects[oid].get('coverage',{}).get('columns'):
                 self.ensure_details(oid,lambda:self.expand_columns(self._tree_items[oid].index()) if oid in self._tree_items else None);return
             item.setData(True,ROLE+1);item.removeRows(0,item.rowCount())
             for col in self._objects[oid]['columns']:
@@ -12032,17 +12703,18 @@ def native_ui_types():
             for request in self._detail_requests.values():
                 self.queue.cancel_owner(request['owner']);request['owner'].deleteLater()
             self._detail_requests.clear();self._detail_errors.clear()
-        def ensure_details(self,oid,done=None):
+        def ensure_details(self,oid,done=None,full=False):
             obj=self._objects.get(oid)
             if not obj:return False
-            if obj.get('details_loaded') is not False and oid not in self._detail_force:
+            if ((full and obj.get('details_loaded') is not False) or (not full and self.structure_ready(obj))) and oid not in self._detail_force:
                 if done:done()
                 return True
             if oid in self._detail_requests:
+                if full:self._detail_requests[oid]['full']=True
                 if done:self._detail_requests[oid]['callbacks'].append(done)
                 return False
             epoch=self._epoch;source_key=digest(self.source);owner=QC.QObject(self)
-            request={'owner':owner,'callbacks':[done] if done else []};self._detail_requests[oid]=request;self._detail_errors.pop(oid,None)
+            request={'owner':owner,'callbacks':[done] if done else [],'full':full};self._detail_requests[oid]=request;self._detail_errors.pop(oid,None)
             def live():return epoch==self._epoch and self.source is not None and source_key==digest(self.source) and self._detail_requests.get(oid) is request
             def finish():
                 self._detail_requests.pop(oid,None);owner.deleteLater()
@@ -12050,17 +12722,18 @@ def native_ui_types():
                 if not live():return
                 complete=bool(value.get('complete',True));prior=self._objects.get(oid,{})
                 retained=not complete and prior.get('details_loaded') is not False and bool(prior) and (prior.get('details_complete') is not False or prior.get('retained_previous'))
-                main=clone(prior) if retained else clone(value['object']);main['details_loaded']=True;main['details_complete']=complete;main['retained_previous']=retained or bool(value.get('retained_previous'))
+                main=clone(prior) if retained else clone(value['object']);main.setdefault('details_loaded',True);main['details_complete']=complete;main['retained_previous']=retained or bool(value.get('retained_previous'))
                 if not retained:
                     main['details_cache']=clone(value.get('cache',{}));main['details_read_at']=value.get('read_at') or value.get('cache',{}).get('read_at') or utcnow()
                 self._detail_force.discard(oid)
-                # Preserve fully loaded neighbours when a new FK only supplies
-                # their identity. Targets may live outside the inventory page.
+                # FK identities cannot replace existing full or structural data.
+                # Targets may live outside the inventory page.
                 incoming=[*value.get('related_objects',[]),main];candidate=dict(self._objects)
                 for fresh in incoming:
                     previous=candidate.get(fresh['id'])
-                    if previous and previous.get('details_loaded') is not False and fresh.get('details_loaded') is False:continue
                     if fresh['id']!=oid and not complete and previous and previous.get('details_loaded') is not False:continue
+                    fresh=self.merge_metadata_object(previous,fresh)
+                    if fresh['id']==oid:main=fresh
                     candidate[fresh['id']]=fresh
                 if value.get('warnings'):main['problems']=list(dict.fromkeys(main.get('problems',[])+value['warnings']))
                 def staged_catalog(objects):
@@ -12080,7 +12753,7 @@ def native_ui_types():
                     expanded=self.tree.isExpanded(item.index());item.setData(False,ROLE+1);item.removeRows(0,item.rowCount())
                     if fresh.get('details_loaded') is False or fresh['columns']:
                         placeholder=QG.QStandardItem('Kolumny…');placeholder.setEditable(False);item.appendRow(placeholder)
-                    if expanded and fresh.get('details_loaded') is not False:self.expand_columns(item.index())
+                    if expanded and (fresh.get('details_loaded') is not False or fresh.get('coverage',{}).get('columns')):self.expand_columns(item.index())
                 if self._detail_warning_oid==oid:self.warning.hide();self._detail_warning_oid=''
                 page=self._data_pages.get(oid)
                 if page:
@@ -12090,7 +12763,7 @@ def native_ui_types():
                 callbacks=list(request['callbacks']);finish()
                 if self._selected==oid:self.select_object(oid)
                 if self.tabs.currentIndex()==1:self._render_graph()
-                if complete:
+                if (complete if request['full'] else self.structure_ready(main) and (complete or (main.get('coverage',{}).get('columns') and main.get('coverage',{}).get('relations')))):
                     for callback in callbacks:self._host_window.guard(callback)
             def failed(error):
                 if not live():return
@@ -12108,7 +12781,7 @@ def native_ui_types():
                 self.queue.submit(owner,'database_object_details',self.source,args,loaded,failed)
             def cached(value):
                 if not live():return
-                if value.get('cache_miss'):remote()
+                if value.get('cache_miss') or (request['full'] and value.get('object',{}).get('details_loaded') is False):remote()
                 else:loaded(value)
             if self.source['kind']=='oracle' and oid not in self._detail_force:
                 self.queue.submit(owner,'database_cache_details',self.source,dict(self.visible_cache_args(),object=identity),cached,lambda error:remote())
@@ -12118,8 +12791,11 @@ def native_ui_types():
             if not self.require_live():return
             self._detail_errors.pop(self._selected,None)
             if self._selected in self._objects:
-                self._detail_force.add(self._selected);self.ensure_details(self._selected)
+                self._detail_force.add(self._selected);self.ensure_details(self._selected,full=True)
             self.select_object(self._selected,load_details=False)
+        def detail_tab_changed(self,index):
+            obj=self._objects.get(self._selected)
+            if index in (2,3) and obj and obj.get('details_loaded') is False and self.require_live():self.ensure_details(self._selected,full=True)
         def _apply_filter(self):
             text=self.search.text().casefold();sc=self.schemas.currentData() or '';system=self.system.isChecked()
             visible=0
@@ -12140,15 +12816,16 @@ def native_ui_types():
             oid=index.data(ROLE) or ''
             if oid and self._objects[oid]['kind'] in DATABASE_RELATIONS:self._host_window.guard(lambda:self.open_data(oid))
         def select_object(self,oid,load_details=True):
-            self._selected=oid;obj=self._objects.get(oid);can=bool(obj and obj['kind'] in DATABASE_RELATIONS)
+            changed=oid!=self._selected;self._selected=oid;obj=self._objects.get(oid);can=bool(obj and obj['kind'] in DATABASE_RELATIONS)
             self.data_button.setEnabled(can);self.pivot_button.setEnabled(can);self.related_button.setEnabled(can)
             self.object_title.setText(database_label(obj) if obj else self.catalog_scope_label())
-            unloaded=bool(obj and obj.get('details_loaded') is False)
-            if unloaded and load_details and oid not in self._detail_errors:self.ensure_details(oid)
+            unloaded=bool(obj and not self.structure_ready(obj));deferred=bool(obj and obj.get('details_loaded') is False and not unloaded)
+            if unloaded and load_details and oid not in self._detail_errors and obj.get('details_complete') is not False:self.ensure_details(oid)
             error=self._detail_errors.get(oid);partial=bool(obj and obj.get('details_complete') is False);cached=(obj or {}).get('details_cache',{});pending=oid in self._detail_requests
-            stamp=(obj or {}).get('details_read_at');self.detail_note.setVisible(unloaded or partial or bool(error) or bool(cached) or pending or bool(stamp));self.detail_retry.setVisible(bool(error) or partial or bool(cached))
+            stamp=(obj or {}).get('details_read_at') or (obj or {}).get('structure_read_at');self.detail_note.setVisible(unloaded or partial or deferred or bool(error) or bool(cached) or pending or bool(stamp));self.detail_retry.setVisible(bool(error) or partial or deferred or bool(cached))
             self.detail_retry.setEnabled(not pending);self.detail_retry.setText('Odczytaj z bazy' if cached and not error else 'Ponów odczyt')
-            note=('Nie odczytano szczegółów. '+error) if error else 'Odczytuję kolumny, klucze, indeksy i definicję obiektu…' if unloaded or pending else 'Szczegóły częściowe. '+ '; '.join(obj.get('problems',[])) if partial else ''
+            note=('Nie odczytano szczegółów. '+error) if error else 'Odczytuję kolumny, klucze, indeksy i definicję obiektu…' if pending else 'Szczegóły częściowe. '+ '; '.join(obj.get('problems',[])) if partial else 'Kolumny i relacje nie zostały jeszcze odczytane.' if unloaded else ''
+            if deferred:note+=('\n' if note else '')+'Kolumny i relacje odczytane. Indeksy i definicja po otwarciu odpowiedniej karty.'
             if (obj or {}).get('retained_previous'):note+=' Zachowano poprzednie szczegóły.'
             if cached:note+=('\n' if note else '')+'Zapisane szczegóły · odczyt: '+str(cached.get('read_at','—'))+(' · wymagają odświeżenia' if cached.get('stale') else '')
             elif stamp:note+=('\n' if note else '')+'Odczyt szczegółów: '+str(stamp)
@@ -12163,7 +12840,7 @@ def native_ui_types():
             self.indexes_model.set_records(['Indeks','Kolumny / wyrażenia','Właściwości'],[(i['name'],', '.join(str(c.get('name') or '<wyrażenie/rowid>')+' '+str(c.get('direction','')) for c in i.get('index_columns',[]) if c.get('key',True)),dumps(i['properties'])) for i in indexes])
             if obj:
                 kind=obj['definition_kind'];text=obj['definition']
-                if unloaded:text='Definicja nie została jeszcze odczytana.'
+                if obj.get('details_loaded') is False:text='Definicja nie została jeszcze odczytana.'
                 elif not text:text='Definicja tekstowa nie jest udostępniona w tym katalogu.'+('\nObiekt utworzony niejawnie przez silnik.' if kind=='implicit' else '')
                 elif kind!='original':text='-- Zakres: '+kind+'; to nie musi być pełne DDL obiektu.\n'+text
                 self.definition.setPlainText(text)
@@ -12172,20 +12849,21 @@ def native_ui_types():
                 if children:info+='\n\nPowiązane obiekty:\n'+'\n'.join(children)
                 if obj['problems']:info+='\n\nProblemy odczytu:\n'+'\n'.join(obj['problems'])
                 self.properties.setPlainText(('Odczytano nazwę i rodzaj obiektu. Szczegóły nie zostały jeszcze odczytane.'+('\n'+error if error else '')) if unloaded else info or 'Metadane odczytano z katalogu bazy.')
-                self.details.setCurrentIndex(0 if columns else 3 if obj['definition'] else 4)
+                if changed:
+                    blocker=QC.QSignalBlocker(self.details);self.details.setCurrentIndex(0 if columns or can else 3 if obj['definition'] else 4);del blocker
             else:
                 self.definition.setPlainText('Wybierz dowolny obiekt, aby zobaczyć jego definicję. Nic nie zostanie wykonane.')
                 cat=self.catalog or {};summary=('Odczytany zakres: '+self.catalog_scope_label()+'.' if self.catalog else 'Katalog nie został jeszcze odczytany.')+'\n\n'+ '\n'.join(cat.get('scope',[]))
                 summary+='\n\n'+ '\n'.join(DATABASE_KINDS.get(k,k)+': '+str(v) for k,v in cat.get('counts',{}).items())
                 summary+='\n\nStruktura nie jest kopią wszystkich rekordów. Tabele otwierasz dwuklikiem; zapytania są tylko do odczytu.'
                 if cat.get('warnings'):summary+='\n\nProblemy odczytu:\n'+'\n'.join(cat['warnings'])
-                self.properties.setPlainText(summary);self.details.setCurrentIndex(4)
+                self.properties.setPlainText(summary);blocker=QC.QSignalBlocker(self.details);self.details.setCurrentIndex(4);del blocker
         def graph_selected(self,oid):
             self.select_object(oid)
         def graph_selection_changed(self,ids):
             self.graph_open.setEnabled(bool(ids) and not self._busy_catalog)
             self.graph_open.setText('Otwórz połączone dane ↵' if len(ids)>1 else 'Otwórz dane ↵')
-            pending=[oid for oid in ids if self._objects.get(oid,{}).get('details_loaded') is False]
+            pending=[oid for oid in ids if not self.structure_ready(self._objects.get(oid))]
             if len(ids)>1 and pending:
                 self.graph_note.setText(f'{len(ids)} tabel · szczegóły i relacje zostaną odczytane przed połączeniem')
             elif len(ids)>1 and self.catalog:
@@ -12205,7 +12883,7 @@ def native_ui_types():
             if not ids:raise UserError('Zaznacz tabelę albo kilka połączonych tabel na mapie.')
             if len(ids)==1:self.open_data(ids[0]);return
             if len(ids)>DATABASE_JOIN_MAX_TABLES:raise UserError('Jedno połączenie obejmuje do 8 tabel. Zawęź zaznaczenie.')
-            pending=next((oid for oid in ids if self._objects.get(oid,{}).get('details_loaded') is False or self._objects.get(oid,{}).get('details_cache',{}).get('stale')),None)
+            pending=next((oid for oid in ids if not self.structure_ready(self._objects.get(oid)) or self._objects.get(oid,{}).get('details_cache',{}).get('stale')),None)
             if pending:
                 if self._objects[pending].get('details_cache',{}).get('stale'):self._detail_force.add(pending)
                 self.ensure_details(pending,lambda:self.open_graph_selection(ids));return
@@ -12242,14 +12920,24 @@ def native_ui_types():
                 self.relation_view.setFixedHeight(h)
         def focus_relations(self):
             if not self._selected:return
-            self._graph_focus=self._selected;self.tabs.setCurrentIndex(1);self._render_graph()
+            self._graph_focus=self._selected;self.tabs.setCurrentIndex(1);self._render_graph();self.schedule_structure_refresh()
         def all_relations(self):
-            self._graph_focus='';self.search.clear();self.schemas.setCurrentIndex(0);self._render_graph()
+            self._graph_focus='';self.search.clear();self.schemas.setCurrentIndex(0);self._render_graph();self.schedule_structure_refresh()
         def tab_changed(self,index):
-            if index==1:self._render_graph()
+            if index==1:self._render_graph();self.schedule_structure_refresh()
         def _render_graph(self):
             if not self.catalog:return
-            plan=database_graph_subset(self.catalog,'' if self.catalog.get('oracle_inventory') else self.search.text(),self.schemas.currentData() or '',self.system.isChecked(),self._graph_focus)
+            graph_catalog=self.catalog;payload=self._graph_payload
+            if payload and payload['focus']==self._graph_focus and payload['generation']==self.visible_cache_args().get('generation'):
+                value=payload['value'];objects={o['id']:self._objects.get(o['id'],o) for o in value.get('objects',[])+value.get('related_objects',[])};ordered=[]
+                links=database_catalog_relations(list(objects.values()),self.catalog['backend'])
+                # Bring a seed and its known neighbours together before the map limit.
+                for obj in value.get('objects',[]):
+                    ordered.append(obj['id'])
+                    ordered.extend(e['target'] if e['source']==obj['id'] else e['source'] for e in links if obj['id'] in (e['source'],e['target']))
+                ordered=list(dict.fromkeys([*ordered,*objects]))
+                graph_catalog=dict(self.catalog,objects=[objects[oid] for oid in ordered if oid in objects],relations=links)
+            plan=database_graph_subset(graph_catalog,'' if self.catalog.get('oracle_inventory') else self.search.text(),self.schemas.currentData() or '',self.system.isChecked(),self._graph_focus)
             source_key=digest(self.source);view=[self.search.text(),self.schemas.currentData(),self.system.isChecked(),self._graph_focus]
             if self.source['kind']=='oracle':
                 view.append(self.catalog.get('oracle_scope',{}).get('schema',self.source['options'].get('schema','')))
@@ -12261,8 +12949,9 @@ def native_ui_types():
             hidden_system=sum(o['kind'] in DATABASE_RELATIONS and o['system'] for o in self.catalog['objects']) if not self.system.isChecked() else 0
             note=f'{plan["visible"]} z {total} tabel / widoków · {len(plan["relations"])} relacji'
             if self.catalog.get('oracle_inventory'):
-                loaded=sum(o.get('details_loaded') is not False for o in plan['objects'])
-                note=f'{plan["visible"]} tabel / widoków z bieżącej strony i ich sąsiedzi · szczegóły: {loaded}/{plan["visible"]} · relacje tylko z odczytanych szczegółów'
+                loaded=sum(self.structure_ready(o) for o in plan['objects'])
+                note=f'{plan["visible"]} tabel / widoków · {len(plan["relations"])} relacji · struktura {loaded}/{plan["visible"]}'
+                self.graph.setToolTip('Mapa bieżącej strony i jej sąsiadów. Relacje tylko z odczytanych kolumn i kluczy; postęp całego zakresu jest widoczny nad mapą.')
             if hidden_system:note+=f' · ukryte systemowe: {hidden_system}'
             if plan['omitted']:note+=' · limit mapy 120'
             if self.search.text() or self.schemas.currentData() or self._graph_focus:note+=' · aktywny filtr'
@@ -12280,7 +12969,7 @@ def native_ui_types():
             if not obj or obj['kind'] not in DATABASE_RELATIONS:raise UserError('Wybierz tabelę lub widok w strukturze.')
             if not self.require_live():return
             if obj.get('details_cache',{}).get('stale'):self._detail_force.add(oid)
-            if obj.get('details_loaded') is False or oid in self._detail_force:
+            if not self.structure_ready(obj) or oid in self._detail_force:
                 self.ensure_details(oid,lambda:self.open_data(oid));return
             if oid not in self._data_pages:
                 if len(self._data_pages)>=12:raise UserError('Otwartych jest 12 kart danych. Zamknij jedną przed następną.')
@@ -12315,12 +13004,13 @@ def native_ui_types():
             self._host_window.statusBar().showMessage('Zapisano bieżącą stronę i odczytane szczegóły.' if paged else 'Zapisano katalog struktury.',9000)
         def reset(self):
             self.graph.clear_context();self.graph_open.setEnabled(False)
-            self.cancel_catalog_sync();self.cancel_details();self._epoch+=1;self.queue.clear()
+            self.pause_hydration(remember=False);self.cancel_structure_refresh();self.cancel_catalog_sync();self.cancel_details();self._epoch+=1;self.queue.clear()
             while self.data_tabs.count():self.close_data(0)
             self._busy_catalog=False;self.catalog=None;self.source=None;self._objects={};self._selected='';self._wanted=None;self._graph_focus=''
             self._oracle_schema_override=None;self._oracle_scope_info=None;self.oracle_schema.clear();self.oracle_scope_bar.hide()
             self._inventory_offset=0;self._inventory_lazy=False;self._inventory_requested=None;self._inventory_page_ids=[];self._inventory_base={};self._detail_warning_oid='';self.inventory_bar.hide();self.schemas.show()
             self._cache_generation=None;self._cache_scope_key=None;self._auto_sync_attempts.clear();self._cache_cleared=False;self._detail_force.clear();self._restore_selected='';self.cache_note.hide()
+            self._hydration={};self._hydrate_attempts.clear();self._graph_payload=None;self._graph_request_key=None;self.cache_bar.hide();self.hydrate_button.hide();self.status.show()
             for control,reset in ((self.search,self.search.clear),(self.system,lambda:self.system.setChecked(False))):
                 blocker=QC.QSignalBlocker(control);reset();del blocker
             self._filter_timer.stop()
@@ -12382,6 +13072,13 @@ def native_ui_types():
             if QW.QApplication.activeModalWidget() is not None:
                 self.statusBar().showMessage('Zapisz lub zamknij otwarte okno, a następnie wybierz „Zapisz i uruchom ponownie” na dole aplikacji.',15000);return False
             if self.dependencies.state!='restart':return False
+            if self.stop_catalog_background():
+                self.statusBar().showMessage('Wstrzymywanie odczytu struktury przed restartem…',5000)
+                if not getattr(self,'_catalog_restart_pending',False):
+                    self._catalog_restart_pending=True
+                    def retry_restart():self._catalog_restart_pending=False;self.restart_after_preparation()
+                    QC.QTimer.singleShot(150,self,retry_restart)
+                return False
             if self.service.hub.running() or self.tasks.pending or any(j['status']=='running' for j in self.service.local_jobs.values()):
                 self.statusBar().showMessage('Zakończ lub anuluj bieżące zadania przed ponownym uruchomieniem.',12000);return False
             if not self.sheet_workspace.commit_active_editor():return False
@@ -13413,6 +14110,10 @@ def native_ui_types():
                 'Podgląd: maks. 1000 rekordów. Pivot: pełna agregacja albo błąd limitu. Eksport XLSX: statyczny wynik. '+
                 'Lokalne arkusze: edycja, formuły, formaty, zakresy A1 i zakładki. Źródła baz pozostają tylko do odczytu. Brak pełnej zgodności z Excelem/makrami. Brak łączenia różnych baz w jednej analizie.\n\n'+THIRD_PARTY+'\n'+LICENSE)
             lay.addWidget(text,1); lay.addWidget(button('Zamknij',dialog.accept)); limited_dialog_size(dialog,780,630); dialog.exec()
+        def stop_catalog_background(self):
+            self.database_explorer.pause_hydration();self.database_explorer.cancel_structure_refresh();self.database_explorer.cancel_catalog_sync()
+            running=self.service.hub.running();jobs=self.service.hub.jobs
+            return bool(running) and all(jobs.get(jid,{}).get('lane')=='catalog-sync' for jid in running)
         def closeEvent(self,event):
             if self.closing:
                 if hasattr(self,'frame_controller'):self.frame_controller.detach()
@@ -13422,6 +14123,13 @@ def native_ui_types():
                 event.ignore(); return
             if self.dependencies.busy:
                 self.statusBar().showMessage('Zakończ lub anuluj przygotowanie w oknie instalatora przed zamknięciem aplikacji.',12000);event.ignore();return
+            if self.stop_catalog_background():
+                self.statusBar().showMessage('Wstrzymywanie odczytu struktury przed zamknięciem…',5000)
+                if not getattr(self,'close_pending',False):
+                    self.close_pending=True
+                    def retry_background_close():self.close_pending=False;self.close()
+                    QC.QTimer.singleShot(150,self,retry_background_close)
+                event.ignore();return
             if self.service.hub.running() or any(j['status']=='running' for j in self.service.local_jobs.values()):
                 alert(self,'Trwa zadanie','Anuluj lub zakończ zadania przed zamknięciem. Nie przerywamy siłowo operacji sterownika H2.'); event.ignore(); return
             if self.tasks.pending:
@@ -13430,7 +14138,7 @@ def native_ui_types():
                 if not getattr(self,'close_pending',False):
                     self.close_pending=True
                     def retry_close(): self.close_pending=False; self.close()
-                    QC.QTimer.singleShot(150,retry_close)
+                    QC.QTimer.singleShot(150,self,retry_close)
                 event.ignore(); return
             try:
                 if not self._restart_confirmed and not self.prompt_unsaved(): event.ignore(); return
@@ -14486,6 +15194,184 @@ def sheet_test_suite():
     return unittest.defaultTestLoader.loadTestsFromTestCase(SheetTests)
 
 
+def catalog_cache_graph_test_suite():
+    """Real SQLite graph traversal across pages, scopes and hydration states."""
+    import unittest
+    class CatalogGraphTests(unittest.TestCase):
+        def setUp(self):
+            self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+            self.cache=CatalogCache(Path(self.temp.name)/'graph.sqlite');self.scope={'schema':'App','include_system':False}
+            self.source={'kind':'oracle','options':{'host':'db','user':'App','service':'one'}}
+            self.identity=catalog_cache_identity(self.source,{'db_unique_name':'DB','con_name':'PDB','session_user':'App'})
+            self.generation=uid();source,scope,normalized=self.cache._keys(self.identity,self.scope)
+            with contextlib.closing(self.cache._connect()) as c,c:
+                c.execute('INSERT INTO generations VALUES(?,?,?,?,?,?,?,?,?,?)',(self.generation,source,scope,dumps(self.identity),dumps(normalized),'complete',0,utcnow(),time.time(),time.time()))
+                c.execute('INSERT INTO slots VALUES(?,?,?,?,NULL,0)',(source,scope,dumps(normalized),self.generation))
+        def obj(self,name,owner='App',kind='table',target=None,loaded=True):
+            obj={'id':database_object_id(owner,kind,name),'schema':owner,'kind':kind,'name':name,'columns':[{'name':'ID','position':1,'type':'NUMBER'}] if loaded else [],
+                 'keys':[],'indexes':[],'details_loaded':loaded,'definition':'','definition_kind':'unavailable','problems':[]}
+            if target:obj['keys']=[{'name':'FK_'+name,'kind':'FOREIGN KEY','columns':['ID'],'target_schema':target['schema'],'target_table':target['name'],'target_columns':['ID']}]
+            return obj
+        def store(self,obj,structure=False,inventory=True):
+            result={'object':obj,'backend':'oracle','source_id':'fixture','read_at':utcnow(),'complete':True,'related_objects':[],'relations':[],'sections':{'Kolumny':'complete','Klucze':'complete'}}
+            with contextlib.closing(self.cache._connect()) as c,c:
+                if inventory:c.execute('INSERT OR IGNORE INTO objects VALUES(?,?,?,?,?,?,?,?,?,?)',(self.generation,obj['id'],obj['schema'],obj['kind'],obj['name'],'VALID','1','','',obj['name'].casefold()))
+                if structure:
+                    obj.update(details_loaded=False,structure_loaded=True,coverage={'columns':True,'relations':True,'definition':False});result['coverage']=obj['coverage']
+                    c.execute("INSERT INTO structures(generation,id,document,columns_complete,relations_complete,observed_at,state) VALUES(?,?,?,1,1,?,'complete')",(self.generation,obj['id'],dumps(result),utcnow()))
+                    self.cache._structure_edges(c,self.generation,obj);self.cache._structure_revision(c,self.generation)
+            if not structure:self.assertTrue(self.cache.put_details(self.identity,result,self.scope,self.generation))
+            return obj
+        def graph(self,**kw):return self.cache.graph(self.identity,self.scope,**kw)
+        def test_focus_child_finds_parent_outside_page(self):
+            parent=self.store(self.obj('ZZ_PARENT'));child=self.store(self.obj('AA_CHILD',target=parent))
+            graph=self.graph(ids=[child['id']],focus=child['id'])
+            self.assertEqual([o['id'] for o in graph['objects']],[child['id']]);self.assertEqual([o['id'] for o in graph['related_objects']],[parent['id']])
+            self.assertTrue(graph['relations'][0]['resolved']);self.assertEqual(graph['cache']['generation'],self.generation)
+        def test_focus_parent_finds_incoming_child(self):
+            parent=self.store(self.obj('PARENT'));child=self.store(self.obj('CHILD',target=parent))
+            graph=self.graph(focus=parent['id']);self.assertEqual(graph['related_objects'][0]['id'],child['id']);self.assertTrue(graph['relations'][0]['resolved'])
+        def test_multiple_foreign_keys_do_not_consume_neighbour_limit(self):
+            parent=self.store(self.obj('PARENT'));children=[self.obj('CHILD'+str(i),target=parent) for i in range(2)]
+            children.sort(key=lambda obj:obj['id'])
+            children[0]['keys']=[dict(children[0]['keys'][0],name='FK'+str(i)) for i in range(5)]
+            for child in children:self.store(child)
+            graph=self.graph(focus=parent['id'],limit=3)
+            self.assertEqual({obj['id'] for obj in graph['related_objects']},{obj['id'] for obj in children});self.assertFalse(graph['truncated'])
+        def test_target_prefers_table_over_materialized_view(self):
+            parent=self.store(self.obj('PARENT'));self.store(self.obj('PARENT',kind='materialized view'));child=self.store(self.obj('CHILD',target=parent))
+            graph=self.graph(focus=child['id']);self.assertEqual(graph['relations'][0]['target'],parent['id'])
+        def test_structure_coverage_does_not_claim_definition_loaded(self):
+            parent=self.store(self.obj('PARENT'),structure=True);child=self.store(self.obj('CHILD',target=parent),structure=True)
+            graph=self.graph(focus=child['id'])
+            self.assertTrue(graph['relations'][0]['resolved']);self.assertGreater(graph['revision'],0)
+            for obj in graph['objects']+graph['related_objects']:
+                self.assertTrue(obj['coverage']['columns']);self.assertFalse(obj['coverage']['definition']);self.assertFalse(obj['details_loaded'])
+        def test_unavailable_external_target_is_truthful_stub(self):
+            parent=self.obj('PARENT',owner='External');child=self.store(self.obj('CHILD',target=parent))
+            graph=self.graph(focus=child['id']);self.assertEqual(graph['related_objects'][0]['id'],parent['id'])
+            self.assertEqual(graph['related_objects'][0]['columns'],[]);self.assertFalse(graph['relations'][0]['resolved'])
+        def test_focus_on_external_stub_keeps_incoming_links(self):
+            parent=self.obj('PARENT',owner='External',loaded=False);child=self.store(self.obj('CHILD',target=parent))
+            graph=self.graph(focus=parent['id'],focus_object=parent)
+            self.assertEqual(graph['objects'][0]['id'],parent['id']);self.assertEqual(graph['objects'][0]['columns'],[])
+            self.assertEqual(graph['related_objects'][0]['id'],child['id']);self.assertFalse(graph['relations'][0]['resolved'])
+            with self.assertRaises(UserError):self.graph(focus=parent['id'],focus_object=dict(parent,name='DIFFERENT'))
+        def test_full_details_outside_inventory_used_for_target(self):
+            parent=self.store(self.obj('PARENT',owner='External'),inventory=False);child=self.store(self.obj('CHILD',target=parent))
+            self.assertTrue(self.graph(focus=child['id'])['relations'][0]['resolved'])
+        def test_focus_limits_neighbours_and_ignores_unrelated_page(self):
+            parent=self.store(self.obj('PARENT'));unrelated=self.store(self.obj('UNRELATED'))
+            for i in range(5):self.store(self.obj('CHILD'+str(i),target=parent))
+            graph=self.graph(ids=[unrelated['id']],focus=parent['id'],limit=3)
+            self.assertEqual(len(graph['objects'])+len(graph['related_objects']),3);self.assertTrue(graph['truncated'])
+            self.assertNotIn(unrelated['id'],{o['id'] for o in graph['objects']+graph['related_objects']})
+        def test_missing_generation_or_different_database_not_mixed(self):
+            obj=self.store(self.obj('ONE'));self.assertIsNone(self.graph(ids=[obj['id']],generation=uid()))
+            changed=catalog_cache_identity(self.source,{'db_unique_name':'DB','con_name':'OTHER','session_user':'App'})
+            self.assertIsNone(self.cache.graph(changed,self.scope,ids=[obj['id']]))
+            self.assertIsNone(self.cache.graph(self.identity,{'schema':'Other'},ids=[obj['id']]))
+        def test_graph_rejects_unbounded_and_invalid_requests(self):
+            for kwargs in ({'ids':['invalid']},{'ids':['a'*32]*121},{'focus':'invalid'},{'limit':121},{'limit':True}):
+                with self.assertRaises(UserError):self.graph(**kwargs)
+    return unittest.defaultTestLoader.loadTestsFromTestCase(CatalogGraphTests)
+
+
+def catalog_hydration_test_suite():
+    """Bounded bulk Oracle metadata and durable, resumable structural coverage."""
+    import unittest
+    from unittest.mock import patch
+    class CatalogHydrationTests(unittest.TestCase):
+        def setUp(self):
+            self.fixture=oracle_catalog_test_suite()._tests[0];self.fixture.setUp();self.addCleanup(self.fixture.doCleanups)
+            self.adapter=self.fixture.adapter;self.db=self.adapter.conn
+            self.db.executescript("ALTER TABLE ALL_OBJECTS ADD CREATED TEXT DEFAULT '2026-01-01'; ALTER TABLE ALL_OBJECTS ADD LAST_DDL_TIME TEXT DEFAULT '2026-01-02'; CREATE TABLE DUAL(x); INSERT INTO DUAL VALUES(1);")
+            context={'DB_UNIQUE_NAME':'DB','CON_NAME':'PDB','SESSION_USER':'App','CURRENT_EDITION_NAME':'ED'}
+            self.db.create_function('SYS_CONTEXT',2,lambda ns,key:context.get(key))
+            self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name);self.cache=CatalogCache(self.root/'cache.sqlite')
+            self.identity=catalog_cache_identity(self.adapter.source);self.scope={'schema':'App','include_system':False}
+            stage=oracle_catalog_sync(self.adapter,self.scope,self.root/'stage.sqlite');lease=self.cache.begin_refresh(self.identity,self.scope);self.cache.prepare_import(stage,lease)
+            while not self.cache.import_batch(lease)['done']:pass
+            self.cache.commit_publish(lease);self.generation=lease['generation'];self.adapter.requests.clear()
+        def obj(self,name,owner='App',kind='table'):
+            return {'id':database_object_id(owner,kind,name),'schema':owner,'name':name,'kind':kind}
+        def bulk(self,objects):return database_cache_hydrate_batch(self.adapter,{'objects':objects})
+        def claimed(self,limit=20,retry=False):return self.cache.hydration_batch(self.identity,self.scope,self.generation,limit,retry)
+        def publish(self,claim,result=None):
+            result=result or self.bulk(claim['objects'])
+            return self.cache.put_hydration_results(result['cache_identity'],result,self.scope,self.generation,claim['claim'])
+        def test_bulk_reads_exact_bound_objects_columns_pk_composite_fk_without_definitions(self):
+            batch=self.bulk([self.obj('CHILD'),self.obj('PARENT')]);self.assertEqual(len(batch['results']),2)
+            child=batch['results'][0];self.assertTrue(child['complete']);self.assertFalse(child['object']['details_loaded']);self.assertTrue(child['object']['structure_loaded'])
+            self.assertEqual([c['name'] for c in child['object']['columns']],['ID','A','B','C','D','LID']);self.assertEqual(child['object']['columns'][0]['pk_position'],1)
+            fk=next(k for k in child['object']['keys'] if k['name']=='FK_EXTERNAL');self.assertEqual(fk['columns'],['A','B']);self.assertEqual(fk['target_columns'],['X','Y'])
+            self.assertEqual(fk['target_schema'],'Other');self.assertEqual(fk['target_table'],'EXTERNAL_PARENT')
+            self.assertTrue(all(not o['columns'] and not o['keys'] for o in child['related_objects']))
+            self.assertTrue(batch['results'][1]['object']['columns'])
+            sqls=[sql for sql,_ in self.adapter.requests];self.assertEqual(len(sqls),6)
+            for sql in sqls:
+                self.assertNotIn('ALL_VIEWS',sql);self.assertNotIn('ALL_TRIGGERS',sql);self.assertNotIn('DATA_DEFAULT',sql);self.assertNotIn('SEARCH_CONDITION',sql)
+            self.assertTrue(all('WHERE' in sql and ':p' in sql for sql in sqls if 'FROM DUAL' not in sql))
+        def test_claim_batch_covers_all_inventory_relations_and_resumes_after_reopen(self):
+            initial=self.cache.hydration_status(self.identity,self.scope,self.generation);self.assertEqual(initial['total'],3);self.assertEqual(initial['pending'],3)
+            first=self.claimed(1);self.assertEqual(first['objects'][0]['name'],'CHILD');self.publish(first)
+            self.cache=CatalogCache(self.cache.path);next_=self.claimed(1);self.assertEqual(next_['objects'][0]['name'],'PARENT');self.publish(next_)
+            status=self.cache.hydration_status(self.identity,self.scope,self.generation);self.assertEqual(status['completed'],2);self.assertEqual(status['pending'],1);self.assertGreaterEqual(status['revision'],2)
+        def test_structure_page_details_and_edges_are_available_offline(self):
+            claim=self.claimed();self.publish(claim);self.adapter.close()
+            page=self.cache.page(self.identity,self.scope,query='CHILD');child=next(o for o in page['objects'] if o['kind']=='table')
+            self.assertTrue(child['coverage']['columns']);self.assertTrue(child['coverage']['relations']);self.assertFalse(child['coverage']['definition']);self.assertTrue(child['columns'])
+            details=self.cache.get_details(self.identity,self.obj('CHILD'),self.scope,self.generation);self.assertFalse(details['object']['details_loaded']);self.assertTrue(details['complete'])
+            with contextlib.closing(self.cache._connect()) as c:
+                rows=c.execute('SELECT name,target_schema,target_name FROM edges WHERE generation=? AND source=? ORDER BY name',(self.generation,child['id'])).fetchall()
+            self.assertEqual(len(rows),3);self.assertIn(('FK_EXTERNAL','Other','EXTERNAL_PARENT'),rows)
+        def test_partial_sections_retry_backoff_and_release_do_not_loop_or_consume_attempts(self):
+            claim=self.claimed(1);self.adapter.fail_on='FROM ALL_CONS_COLUMNS';partial=self.bulk(claim['objects']);self.assertTrue(partial['results'][0]['coverage']['columns']);self.assertFalse(partial['results'][0]['coverage']['relations'])
+            status=self.publish(claim,partial);self.assertEqual(status['partial'],1);self.assertEqual(status['failed'],1);self.assertIsNotNone(status['next_retry'])
+            other=self.claimed(1);self.assertNotEqual(other['objects'][0]['name'],'CHILD');self.cache.release_hydration_claim(self.identity,self.scope,self.generation,other['claim'])
+            retry=self.claimed(1,retry=True);self.assertEqual(retry['objects'][0]['name'],'CHILD');self.adapter.fail_on='';self.publish(retry)
+            repaired=self.cache.get_details(self.identity,self.obj('CHILD'),self.scope,self.generation);self.assertTrue(repaired['coverage']['relations'])
+        def test_missing_or_replaced_objects_are_errors_not_empty_success(self):
+            child=self.obj('CHILD');child['cache_version']={'object_id':'wrong'};missing=self.obj('MISSING')
+            batch=self.bulk([child,missing]);self.assertTrue(all(r.get('error') for r in batch['results']))
+        def test_cancelled_publish_rolls_back_and_claim_can_resume(self):
+            claim=self.claimed(1);result=self.bulk(claim['objects'])
+            with self.assertRaises(Cancelled):self.cache.put_hydration_results(result['cache_identity'],result,self.scope,self.generation,claim['claim'],guard=lambda:False)
+            self.assertEqual(self.cache.hydration_status(self.identity,self.scope,self.generation)['completed'],0)
+            self.cache.release_hydration_claim(self.identity,self.scope,self.generation,claim['claim']);again=self.claimed(1);self.assertEqual(again['objects'],claim['objects']);self.publish(again)
+        def test_wrong_context_or_obsolete_generation_cannot_publish(self):
+            claim=self.claimed(1);batch=self.bulk(claim['objects']);wrong=catalog_cache_identity(self.adapter.source,{'db_unique_name':'WRONG','con_name':'PDB','session_user':'App'})
+            with self.assertRaises(Cancelled):self.cache.put_hydration_results(wrong,batch,self.scope,self.generation,claim['claim'])
+            self.cache.clear(self.identity,self.scope)
+            with self.assertRaises(Cancelled):self.publish(claim,batch)
+        def test_foreground_details_win_inflight_bulk_claim_and_index_relations(self):
+            claim=self.claimed(1);batch=self.bulk(claim['objects']);full=database_object_details(self.adapter,{'object':claim['objects'][0]})
+            self.cache.put_details(self.identity,full,self.scope,self.generation);status=self.publish(claim,batch)
+            self.assertEqual(status['completed'],1);loaded=self.cache.get_details(self.identity,self.obj('CHILD'),self.scope,self.generation);self.assertTrue(loaded['object']['details_loaded'])
+        def test_partial_full_details_do_not_hide_later_successful_structure(self):
+            self.adapter.fail_on='FROM ALL_TAB_COLUMNS';partial=database_object_details(self.adapter,{'object':self.obj('CHILD')});self.adapter.fail_on=''
+            self.cache.put_details(self.identity,partial,self.scope,self.generation);claim=self.claimed(1);self.publish(claim)
+            loaded=self.cache.get_details(self.identity,self.obj('CHILD'),self.scope,self.generation);self.assertTrue(loaded['object']['columns']);self.assertTrue(loaded['object']['structure_loaded']);self.assertTrue(loaded['coverage']['columns'])
+        def test_partials_cannot_erase_previously_indexed_relations(self):
+            claim=self.claimed(1);self.publish(claim)
+            with contextlib.closing(self.cache._connect()) as c,c:
+                before=c.execute('SELECT * FROM edges').fetchall();c.execute("UPDATE structures SET state='failed',next_retry=0,columns_complete=0 WHERE generation=?",(self.generation,))
+            retry=self.claimed(1);self.adapter.fail_on='FROM ALL_CONS_COLUMNS';self.publish(retry)
+            with contextlib.closing(self.cache._connect()) as c:self.assertEqual(c.execute('SELECT * FROM edges').fetchall(),before)
+        def test_bulk_caps_and_cancellation(self):
+            with self.assertRaises(UserError):self.bulk([self.obj('CHILD')]*21)
+            with patch.dict(globals(),DATABASE_MAX_METADATA_BYTES=100),self.assertRaises(UserError):self.bulk([self.obj('CHILD')])
+            self.adapter.cancelled.set()
+            with self.assertRaises(Cancelled):self.bulk([self.obj('CHILD')])
+        def test_batch_budget_yields_per_object_error_without_losing_other_results(self):
+            objects=[self.obj('CHILD'),self.obj('PARENT')];baseline=self.bulk(objects)
+            limit=65536+len(dumps(baseline['results'][0]).encode('utf-8'))+10
+            with patch.dict(globals(),DATABASE_MAX_METADATA_BYTES=limit):batch=self.bulk(objects)
+            self.assertTrue(batch['results'][0]['complete']);self.assertIn('error',batch['results'][1])
+            self.assertEqual(batch['results'][1]['object']['id'],objects[1]['id']);self.assertLessEqual(len(dumps(batch).encode('utf-8')),limit)
+    return unittest.defaultTestLoader.loadTestsFromTestCase(CatalogHydrationTests)
+
+
 def catalog_cache_test_suite():
     """Real SQLite dictionary streaming, durable cache and concurrent publication."""
     import unittest
@@ -14592,6 +15478,7 @@ def catalog_cache_test_suite():
             old=self.publish();self.cache.max_bytes=65536;lease=self.cache.begin_refresh(self.identity,self.scope)
             with self.assertRaises(UserError):self.cache.prepare_import(self.stage(),lease)
             self.cache.abort(lease);self.assertEqual(self.cache.status(self.identity,self.scope)['generation'],old['generation'])
+            self.cache.max_bytes=CATALOG_CACHE_MAX_BYTES
             self.cache.path.write_bytes(b'not sqlite')
             with self.assertRaises(sqlite3.DatabaseError):self.cache.status(self.identity,self.scope)
             repaired=self.cache.clear(self.identity,self.scope);self.assertTrue(repaired['repaired']);self.assertTrue(repaired['cleared_all']);self.assertFalse(self.cache.status(self.identity,self.scope)['available'])
@@ -14640,8 +15527,10 @@ def catalog_cache_test_suite():
                 self.assertTrue(self.cache.put_details(self.identity,full,self.scope,lease['generation']))
                 partial=self.detail(False);partial['object']['columns']=[]
                 self.assertFalse(self.cache.put_details(self.identity,partial,self.scope,lease['generation']))
-                stored=self.cache.get_details(self.identity,self.obj(),self.scope);stored.pop('cache')
-                self.assertEqual(stored,full);self.assertLessEqual(len(dumps(stored).encode('utf-8')),cap)
+                with contextlib.closing(self.cache._connect()) as c:document=c.execute('SELECT document FROM details').fetchone()[0]
+                self.assertEqual(json.loads(document),full);self.assertLessEqual(len(document.encode('utf-8')),cap)
+            stored=self.cache.get_details(self.identity,self.obj(),self.scope)
+            self.assertEqual(stored['object']['definition'],full['object']['definition']);self.assertEqual(stored['object']['columns'],full['object']['columns'])
         def test_concurrent_initialization_and_reads_use_rollback_journal(self):
             from concurrent.futures import ThreadPoolExecutor
             def read(_):return CatalogCache(self.cache.path).status(self.identity,self.scope)
@@ -16043,6 +16932,28 @@ def catalog_cache_service_test_suite():
                 def running(inner):return [jid for jid,j in inner.jobs.items() if j['status']=='running']
                 def close(inner):pass
             self.service.hub.close();self.service.hub=Hub();self.service.trusted.add(digest(self.source))
+        def fake_hydration_hub(self,context=None):
+            identity=catalog_cache_identity(self.source,context or {'db_unique_name':'TEST','con_name':'PDB1','session_user':'READER','edition':'ORA$BASE'})
+            class Hub:
+                def __init__(inner):inner.jobs={};inner.lock=threading.RLock();inner.calls=[];inner.foreground=False;inner.released=[]
+                def foreground_busy(inner):return inner.foreground
+                def submit(inner,operation,args,source,password,runtime,output,timeout):
+                    self.assertEqual(operation,'database_cache_hydrate_batch');inner.calls.append(clone(args));jid=uid();results=[]
+                    for exact in args['objects']:
+                        obj=dict(exact,columns=[{'name':'ID','type':'NUMBER','nullable':False,'position':1,'pk_position':1}],keys=[],indexes=[],
+                                 properties={},problems=[],definition='',definition_kind='unavailable',details_loaded=False,structure_loaded=True)
+                        coverage={'columns':True,'relations':True,'definition':False};obj['coverage']=coverage
+                        results.append({'backend':'oracle','source_id':source['id'],'object':obj,'related_objects':[],
+                                        'relations':[],'coverage':coverage,'warnings':[],'complete':True,'read_at':utcnow()})
+                    inner.jobs[jid]={'id':jid,'status':'done','operation':operation,'args':args,'value':{'results':results,'cache_identity':identity,'read_at':utcnow()}}
+                    return jid
+                def poll(inner,jid):return dict(inner.jobs[jid])
+                def cancel(inner,jid):
+                    if inner.jobs[jid]['status']=='running':inner.jobs[jid]['status']='cancelled'
+                def running(inner):return [jid for jid,j in inner.jobs.items() if j['status']=='running']
+                def release_background(inner,jid):inner.released.append(jid)
+                def close(inner):pass
+            self.service.hub.close();self.service.hub=Hub();self.service.trusted.add(digest(self.source));return self.service.hub
         def test_local_miss_needs_no_driver_password_or_network_trust(self):
             before=clone(self.service.document)
             with patch.object(self.service.hub,'submit',side_effect=AssertionError('No remote worker for cache reads')):
@@ -16050,6 +16961,7 @@ def catalog_cache_service_test_suite():
             self.assertEqual(job['status'],'done',job);self.assertTrue(job['value']['cache_miss'])
             self.assertEqual(self.service.document,before);self.assertFalse(self.service.trusted);self.assertFalse(self.service.local_jobs)
             with self.assertRaises(UserError):self.service.call('database_cache_sync',{'source_id':self.source['id']})
+            with self.assertRaises(UserError):self.service.call('database_cache_hydrate',{'source_id':self.source['id']})
         def test_snapshot_survives_session_close_and_new_source_uuid(self):
             generation=self.seed(1201);self.service.close();self.service=ApplicationService(self.root)
             source=clone(self.source);source['id']=uid();self.service.document['sources'].append(source)
@@ -16185,6 +17097,88 @@ def catalog_cache_service_test_suite():
                 other=WorkerHub()
                 for i in range(3):other.submit('database_catalog',{},dict(self.source,id=str(i)))
                 with self.assertRaises(UserError):other.submit('database_cache_sync',{},self.source)
+        def test_hydration_batches_resume_durable_progress_after_pause_and_restart(self):
+            generation=self.seed(45);hub=self.fake_hydration_hub();cache=self.service.catalog_cache.cache
+            stored=threading.Event();resume=threading.Event();original=cache.put_hydration_results
+            def put(*args,**kwargs):
+                status=original(*args,**kwargs);stored.set();resume.wait(5);return status
+            with patch.object(cache,'put_hydration_results',side_effect=put):
+                first=self.service.call('database_cache_hydrate',{'source_id':self.source['id'],'generation':generation})['job_id']
+                self.assertTrue(stored.wait(5));self.service.call('cancel',{'id':first});resume.set();paused=self.wait(first)
+            self.assertEqual(paused['status'],'cancelled',paused)
+            partial=cache.hydration_status(catalog_cache_identity(self.source),{'schema':'APP'},generation)
+            self.assertEqual(partial['completed'],20);self.assertEqual(partial['running'],0)
+            self.service.close();self.service=ApplicationService(self.root);self.service.document['sources'].append(self.source)
+            resumed_hub=self.fake_hydration_hub()
+            resumed=self.wait(self.service.call('database_cache_hydrate',{'source_id':self.source['id'],'generation':generation})['job_id'])
+            self.assertEqual(resumed['status'],'done',resumed);self.assertEqual(resumed['value']['hydration']['completed'],45)
+            calls=hub.calls+resumed_hub.calls
+            self.assertTrue(resumed['value']['hydration']['complete']);self.assertEqual([len(c['objects']) for c in calls],[20,20,5])
+            ids=[o['id'] for call in calls for o in call['objects']];self.assertEqual(len(set(ids)),45)
+            self.assertFalse(hub.jobs);self.assertFalse(resumed_hub.jobs);self.assertEqual(len(hub.released)+len(resumed_hub.released),2)
+        def test_hydration_waits_for_foreground_without_claiming_objects(self):
+            generation=self.seed(2);hub=self.fake_hydration_hub();hub.foreground=True
+            jid=self.service.call('database_cache_hydrate',{'source_id':self.source['id'],'generation':generation})['job_id']
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline:
+                job=self.service.call('job',{'id':jid})
+                if job.get('hydration',{}).get('paused'):break
+                time.sleep(.01)
+            self.assertTrue(job.get('hydration',{}).get('paused'),job);self.assertFalse(hub.calls)
+            status=self.service.catalog_cache.cache.hydration_status(catalog_cache_identity(self.source),{'schema':'APP'},generation)
+            self.assertEqual(status['running'],0);hub.foreground=False
+            done=self.wait(jid);self.assertEqual(done['status'],'done',done);self.assertEqual(done['value']['hydration']['completed'],2)
+        def test_hydration_rejects_changed_database_context(self):
+            generation=self.seed(1);self.fake_hydration_hub({'db_unique_name':'TEST','con_name':'OTHER','session_user':'READER','edition':'ORA$BASE'})
+            job=self.wait(self.service.call('database_cache_hydrate',{'source_id':self.source['id'],'generation':generation})['job_id'])
+            self.assertNotEqual(job['status'],'done',job)
+            status=self.service.catalog_cache.cache.hydration_status(catalog_cache_identity(self.source),{'schema':'APP'},generation)
+            self.assertEqual(status['completed'],0);self.assertEqual(status['running'],0)
+        def test_hydration_remote_error_releases_claim_for_immediate_resume(self):
+            generation=self.seed(2);hub=self.fake_hydration_hub();submit=hub.submit
+            def failed(*args,**kwargs):
+                jid=submit(*args,**kwargs);hub.jobs[jid].update(status='error',error='Connection lost',connected=True);return jid
+            with patch.object(hub,'submit',side_effect=failed):
+                job=self.wait(self.service.call('database_cache_hydrate',{'source_id':self.source['id'],'generation':generation})['job_id'])
+            self.assertEqual(job['status'],'error',job);self.assertTrue(job['connected']);self.assertFalse(hub.jobs)
+            status=self.service.catalog_cache.cache.hydration_status(catalog_cache_identity(self.source),{'schema':'APP'},generation)
+            self.assertEqual(status['running'],0);self.assertEqual(status['pending'],2)
+            done=self.wait(self.service.call('database_cache_hydrate',{'source_id':self.source['id'],'generation':generation})['job_id'])
+            self.assertEqual(done['status'],'done',done);self.assertEqual(done['value']['hydration']['completed'],2)
+        def test_hydration_source_change_cancels_inflight_batch(self):
+            generation=self.seed(2);hub=self.fake_hydration_hub();submit=hub.submit;started=threading.Event()
+            def running(*args,**kwargs):
+                jid=submit(*args,**kwargs);hub.jobs[jid]['status']='running';started.set();return jid
+            with patch.object(hub,'submit',side_effect=running):
+                jid=self.service.call('database_cache_hydrate',{'source_id':self.source['id'],'generation':generation})['job_id']
+                self.assertTrue(started.wait(5))
+                with self.service.lock:self.source['name']='Changed source'
+                job=self.wait(jid)
+            self.assertEqual(job['status'],'cancelled',job);self.assertFalse(hub.jobs)
+            status=self.service.catalog_cache.cache.hydration_status(catalog_cache_identity(self.source),{'schema':'APP'},generation)
+            self.assertEqual(status['completed'],0);self.assertEqual(status['running'],0)
+        def test_hydration_worker_reuses_connection_and_renews_read_only_transaction(self):
+            made=[];used=[];closed=[];statements=[]
+            class Cursor:
+                def execute(inner,sql):statements.append(sql)
+                def close(inner):pass
+            class Connection:
+                def rollback(inner):pass
+                def cursor(inner):return Cursor()
+                def close(inner):pass
+            class Fixture(Adapter):
+                kind='oracle'
+                def connect(inner):inner.conn=Connection();made.append(inner);return inner
+                def close(inner):closed.append(inner);super(Fixture,inner).close()
+            def batch(adapter,args):
+                self.assertEqual(adapter.password,'');used.append(adapter);return {'results':[]}
+            requests=[{'id':str(i),'operation':operation,'source':self.source,'password':'private','args':{}} for i,operation in enumerate(
+                ['database_cache_hydrate_batch','database_cache_hydrate_batch','database_cache_release','database_cache_hydrate_batch'])]
+            case=next(iter(database_worker_error_test_suite()))
+            with patch.dict(ADAPTERS,oracle=Fixture),patch(__name__+'.database_cache_hydrate_batch',side_effect=batch):jobs=case.roundtrip(requests)
+            self.assertTrue(all(j['status']=='done' for j in jobs),jobs)
+            self.assertEqual(len(made),2);self.assertIs(used[0],used[1]);self.assertIsNot(used[1],used[2]);self.assertEqual(len(closed),2)
+            self.assertEqual(statements,['SET TRANSACTION READ ONLY'])
     return unittest.defaultTestLoader.loadTestsFromTestCase(CatalogCacheServiceTests)
 
 
@@ -16611,6 +17605,8 @@ def self_test():
     suite.addTests(oracle_catalog_test_suite())
     suite.addTests(database_worker_error_test_suite())
     suite.addTests(catalog_cache_test_suite())
+    suite.addTests(catalog_cache_graph_test_suite())
+    suite.addTests(catalog_hydration_test_suite())
     suite.addTests(catalog_cache_service_test_suite())
     result=unittest.TextTestRunner(verbosity=2).run(suite)
     print('Testy rdzenia nie zastępują integracji z H2 / Firebird / Oracle. Testy Qt: --ui-test.',flush=True)
@@ -17094,16 +18090,19 @@ def ui_test():
             return path,self.window.database_explorer
         def dependency_fixture(self):
             return self.service.call('source_save',{'source':{'id':uid(),'name':'Oracle test','kind':'oracle','options':{'host':'example.invalid','port':1521,'service':'demo','user':'reader','mode':'thin'}},'password':''})['source']
-        def persistent_oracle_fixture(self,trusted=False,ready=True):
+        def persistent_oracle_fixture(self,trusted=False,ready=True,progressive=False):
             from unittest import mock
             source=self.dependency_fixture();ex=self.window.database_explorer;requests=[];events=[];jobs={};original=self.service.call
             if trusted:self.service.trusted.add(digest(source))
             dependency=mock.patch(__name__+'.dependency_status',return_value={'state':'ready' if ready else 'missing','profile':'oracle','title':'Oracle','message':'Brak sterownika','details':'oracledb'});dependency.start();self.addCleanup(dependency.stop)
+            if not progressive:
+                for method in ('start_hydration','schedule_structure_refresh'):
+                    patch=mock.patch.object(ex,method,return_value=False);patch.start();self.addCleanup(patch.stop)
             def submit(owner,operation,src,args,done,failed,progress=None):requests.append({'owner':owner,'operation':operation,'args':clone(args),'done':done,'failed':failed})
             queued=mock.patch.object(ex.queue,'submit',side_effect=submit);queued.start();self.addCleanup(queued.stop)
             def call(op,args=None):
                 args=args or {}
-                if op in ('database_cache_sync','database_cache_clear'):
+                if op in ('database_cache_sync','database_cache_clear','database_cache_hydrate','database_cache_graph'):
                     jid=uid();jobs[jid]={'operation':op,'args':clone(args)};return {'job_id':jid}
                 if op=='cancel' and args.get('id') in jobs:jobs[args['id']]['cancelled']=True;return {'ok':True}
                 return original(op,args)
@@ -17116,6 +18115,107 @@ def ui_test():
             result=self.oracle_inventory_catalog(source,objects,**options)
             result['cache']={'generation':generation,'read_at':'2026-10-01T10:00:00Z','complete':True,'inventory_complete':True,'stale':stale}
             return result
+        def progressive_structure(self,obj):
+            return dict(clone(obj),details_loaded=False,structure_loaded=True,coverage={'columns':True,'relations':True,'definition':False},structure_read_at='2026-10-06T12:00:00Z')
+        def progressive_graph_payload(self,objects,related=(),revision='r1'):
+            return {'objects':clone(list(objects)),'related_objects':clone(list(related)),'relations':database_catalog_relations([*objects,*related],'oracle'),'cache':{'generation':'g1','read_at':'2026-10-06T12:00:00Z'},'revision':revision}
+        def test_progressive_auto_requires_authorization_and_resumes_same_generation(self):
+            from unittest import mock
+            source,ex,requests,events=self.persistent_oracle_fixture(progressive=True);obj=self.oracle_scope_table('APP')
+            with mock.patch.object(self.window,'authorize') as authorize:
+                requests[-1]['done'](self.persistent_oracle_catalog(source,[obj]));self.assertFalse(events);authorize.assert_not_called()
+                self.service.trusted.add(digest(source));self.assertTrue(ex.start_hydration());authorize.assert_not_called()
+            first=events[-1];self.assertEqual(first['operation'],'database_cache_hydrate');self.assertEqual(first['args']['generation'],'g1');self.assertNotIn('query',first['args']);self.assertNotIn('offset',first['args'])
+            first['progress']({'hydration':{'generation':'g1','total':49295,'completed':20,'pending':49275,'revision':1}});self.assertIn('20/49295',ex.cache_note.text())
+            ex.toggle_hydration();self.assertTrue(first['cancelled']);self.assertIn('wstrzymano',ex.cache_note.text());before=clone(ex._hydration)
+            first['progress']({'hydration':{'completed':999}});first['done']({'hydration':{'complete':True}});self.assertEqual(ex._hydration,before)
+            ex.toggle_hydration();self.assertEqual(events[-1]['args']['generation'],'g1');self.assertTrue(events[-1]['args']['retry_failed']);self.assertEqual(ex.hydrate_button.text(),'Wstrzymaj')
+            late=events[-1];ex.reset();late['progress']({'hydration':{'completed':400}});late['done']({'hydration':{'complete':True}});self.assertFalse(ex._hydration);self.assertIsNone(ex.catalog)
+        def test_progressive_cached_complete_or_missing_driver_never_starts(self):
+            from unittest import mock
+            source,ex,requests,events=self.persistent_oracle_fixture(trusted=True,ready=False,progressive=True)
+            requests[-1]['done'](self.persistent_oracle_catalog(source,[self.oracle_scope_table('APP')]));self.assertFalse(events)
+            ex._hydration={'generation':'g1','complete':True}
+            with mock.patch(__name__+'.dependency_status',return_value={'state':'ready'}):self.assertFalse(ex.start_hydration())
+            self.assertFalse(events)
+        def test_progressive_batches_refresh_visible_columns_edges_without_click(self):
+            source,ex,requests,events=self.persistent_oracle_fixture(trusted=True,progressive=True);parent=self.oracle_scope_table('APP','PARENT');child=self.oracle_scope_table('APP','CHILD')
+            child['keys']=[{'name':'FK_PARENT','kind':'FOREIGN KEY','columns':['ID'],'target_schema':'APP','target_table':'PARENT','target_columns':['ID']}]
+            requests[-1]['done'](self.persistent_oracle_catalog(source,[parent,child]));job=events[-1];self.assertEqual(job['operation'],'database_cache_hydrate')
+            ex.tabs.setCurrentIndex(1);app.processEvents();self.wait(lambda:not ex.graph._initial_view);ex._structure_timer.stop()
+            oid=child['id'];ex.graph._nodes[oid].setPos(90,130);ex.graph._nodes[oid].setSelected(True);ex.graph.zoom_by(1.2);app.processEvents()
+            position=ex.graph._nodes[oid].pos();scale=ex.graph.transform().m11();center=ex.graph.mapToScene(ex.graph.viewport().rect().center());count=len(requests)
+            job['progress']({'hydration':{'generation':'g1','total':49295,'completed':2,'pending':49293,'revision':1,'changed_ids':[oid,parent['id']]}})
+            self.assertTrue(ex._structure_timer.isActive());ex.refresh_cached_structure();read=events[-1];self.assertEqual(read['operation'],'database_cache_graph')
+            read['done'](self.progressive_graph_payload([self.progressive_structure(parent),self.progressive_structure(child)]));app.processEvents()
+            self.assertEqual(len(requests),count);self.assertEqual(ex._objects[oid]['columns'],child['columns']);self.assertEqual(len(ex.graph._edges),1);self.assertEqual(ex.graph._nodes[oid].pos(),position)
+            self.assertEqual(ex.graph.selected_ids(),[oid]);self.assertAlmostEqual(ex.graph.transform().m11(),scale,places=4);self.assertLess((ex.graph.mapToScene(ex.graph.viewport().rect().center())-center).manhattanLength(),3)
+            self.assertIn('2/49295',ex.cache_note.text());self.assertEqual(ex._inventory_page_ids,[parent['id'],child['id']]);self.assertIn('struktura 2/2',ex._graph_scope_note)
+        def test_progressive_focus_brings_incoming_offpage_neighbor(self):
+            source,ex,requests,events=self.persistent_oracle_fixture(progressive=True);parent=self.oracle_scope_table('APP','PARENT');child=self.progressive_structure(self.oracle_scope_table('OTHER','CHILD'))
+            child['keys']=[{'name':'FK_PARENT','kind':'FOREIGN KEY','columns':['ID'],'target_schema':'APP','target_table':'PARENT','target_columns':['ID']}]
+            objects=[self.oracle_scope_table('APP',f'T{i:04d}') for i in range(1000)];objects[0]=parent
+            requests[-1]['done'](self.persistent_oracle_catalog(source,objects));ex._selected=parent['id'];ex.focus_relations();ex.refresh_cached_structure();read=events[-1]
+            self.assertEqual(read['args']['focus_object']['name'],'PARENT');read['done'](self.progressive_graph_payload([self.progressive_structure(parent)],[child]));app.processEvents()
+            self.assertEqual(set(ex.graph._nodes),{parent['id'],child['id']});self.assertEqual(len(ex.graph._edges),1);self.assertEqual(len(ex._inventory_page_ids),1000)
+        def test_progressive_structure_satisfies_cached_columns_but_definition_is_explicit(self):
+            from unittest import mock
+            source,ex,requests,events=self.persistent_oracle_fixture(trusted=True,progressive=True);obj=self.oracle_scope_table('APP');requests[-1]['done'](self.persistent_oracle_catalog(source,[obj]));ex.select_object(obj['id'])
+            value=self.oracle_details_result(source,self.progressive_structure(obj));value['cache']={'generation':'g1','read_at':'2026-10-06'};requests[-1]['done'](value);count=len(requests)
+            callback=mock.Mock();self.assertTrue(ex.ensure_details(obj['id'],callback));callback.assert_called_once();ex.expand_columns(ex._tree_items[obj['id']].index());self.assertEqual(len(requests),count)
+            self.assertEqual(ex.columns_model.rowCount(),1);self.assertIn('nie została',ex.definition.toPlainText());self.assertIn('Indeksy i definicja',ex.detail_note.text())
+            ex.details.setCurrentIndex(3);self.assertEqual(requests[-1]['operation'],'database_cache_details');requests[-1]['done'](value);self.assertEqual(requests[-1]['operation'],'database_object_details')
+            complete=self.oracle_details_result(source,dict(obj,definition='CREATE TABLE T(ID NUMBER)',definition_kind='original'));requests[-1]['done'](complete);self.assertIn('CREATE TABLE',ex.definition.toPlainText());self.assertEqual(ex.details.currentIndex(),3)
+        def test_progressive_partial_definition_with_complete_structure_runs_callback(self):
+            from unittest import mock
+            source,ex,requests,events=self.persistent_oracle_fixture(progressive=True);obj=self.oracle_scope_table('APP');requests[-1]['done'](self.persistent_oracle_catalog(source,[obj]));done=mock.Mock();ex.ensure_details(obj['id'],done)
+            result=self.oracle_details_result(source,dict(self.progressive_structure(obj),details_loaded=True),warnings=['Definicja niedostępna']);result['cache']={'generation':'g1'};requests[-1]['done'](result)
+            done.assert_called_once();self.assertTrue(ex.structure_ready(ex._objects[obj['id']]));self.assertFalse(ex._objects[obj['id']]['details_complete'])
+        def test_progressive_late_graph_reply_does_not_cross_scope_or_project(self):
+            source,ex,requests,events=self.persistent_oracle_fixture(progressive=True);obj=self.oracle_scope_table('APP');requests[-1]['done'](self.persistent_oracle_catalog(source,[obj]));ex.refresh_cached_structure();late=events[-1]
+            ex._oracle_schema_override='OTHER';ex.reload(False);self.assertTrue(late['cancelled']);late['done'](self.progressive_graph_payload([self.progressive_structure(obj)]));self.assertFalse(ex._objects[obj['id']]['columns']);self.assertFalse(ex._structure_job)
+            ex.reset();late['done'](self.progressive_graph_payload([self.progressive_structure(obj)]));self.assertIsNone(ex.catalog)
+        def test_progressive_compact_cards_fit_four_across_at_1100(self):
+            source,ex,requests,events=self.persistent_oracle_fixture(progressive=True);objects=[self.oracle_scope_table('APP','LONG_TABLE_NAME_FOR_READABLE_CARD_'+str(i)) for i in range(8)]
+            for obj in objects[1:]:obj['keys']=[{'name':'FK_PARENT','kind':'FOREIGN KEY','columns':['ID'],'target_schema':'APP','target_table':objects[0]['name'],'target_columns':['ID']}]
+            self.window.resize(1100,760);requests[-1]['done'](self.persistent_oracle_catalog(source,objects));ex.tabs.setCurrentIndex(1);app.processEvents();self.wait(lambda:not ex.graph._initial_view)
+            ex.merge_cached_structure(self.progressive_graph_payload([self.progressive_structure(o) for o in objects]));ex.graph.arrange_nodes(preserve=False);app.processEvents()
+            nodes=list(ex.graph._nodes.values());rows=collections.Counter(round(n.pos().y()) for n in nodes);self.assertGreaterEqual(max(rows.values()),4,[(n.pos().x(),n.pos().y(),n.rect().width()) for n in nodes]);self.assertTrue(all(220<=n.rect().width()<=250 for n in nodes))
+            self.assertAlmostEqual(ex.graph.transform().m11(),1.0,places=3)
+        def test_progressive_close_waits_for_background_without_foreground_warning(self):
+            from unittest import mock
+            source,ex,requests,events=self.persistent_oracle_fixture(trusted=True,progressive=True);requests[-1]['done'](self.persistent_oracle_catalog(source,[self.oracle_scope_table('APP')]));job=events[-1]
+            with mock.patch.object(self.service.hub,'running',return_value=['hydrate']),mock.patch.dict(self.service.hub.jobs,{'hydrate':{'lane':'catalog-sync','status':'running'}}),mock.patch.object(QW.QMessageBox,'exec') as warning:
+                event=ui['QtGui'].QCloseEvent();self.window.closeEvent(event);self.assertFalse(event.isAccepted());warning.assert_not_called();self.assertTrue(job['cancelled']);self.assertTrue(self.window.close_pending)
+            self.window.close_pending=False
+        def test_progressive_taller_cards_avoid_overlap_and_keep_dragged_position(self):
+            source,ex,requests,events=self.persistent_oracle_fixture(progressive=True);objects=[self.oracle_scope_table('APP',f'T{i}') for i in range(8)]
+            self.window.resize(1100,760);requests[-1]['done'](self.persistent_oracle_catalog(source,objects));ex.tabs.setCurrentIndex(1);app.processEvents();self.wait(lambda:not ex.graph._initial_view)
+            pinned=objects[0]['id'];ex.graph._nodes[pinned].setPos(35,60);position=ex.graph._nodes[pinned].pos();self.assertIn(pinned,ex.graph._manual_positions)
+            for obj in objects:obj['columns']=[dict(obj['columns'][0],name='COL_'+str(i),pk_position=0) for i in range(8)]
+            ex.merge_cached_structure(self.progressive_graph_payload([self.progressive_structure(o) for o in objects]));app.processEvents();nodes=list(ex.graph._nodes.values())
+            self.assertEqual(ex.graph._nodes[pinned].pos(),position)
+            for i,node in enumerate(nodes):
+                for other in nodes[i+1:]:self.assertFalse(node.sceneBoundingRect().intersects(other.sceneBoundingRect()),(node._object['name'],other._object['name']))
+        def test_progressive_identity_stub_keeps_hydrated_parent_columns_and_keys(self):
+            source,ex,requests,events=self.persistent_oracle_fixture(trusted=True,progressive=True);parent=self.oracle_scope_table('APP','PARENT');child=self.oracle_scope_table('APP','CHILD')
+            parent['keys']=[{'name':'PK_PARENT','kind':'PRIMARY KEY','columns':['ID']}];child['keys']=[{'name':'FK_PARENT','kind':'FOREIGN KEY','columns':['ID'],'target_schema':'APP','target_table':'PARENT','target_columns':['ID']}]
+            requests[-1]['done'](self.persistent_oracle_catalog(source,[parent,child]));ex.merge_cached_structure(self.progressive_graph_payload([self.progressive_structure(parent),self.progressive_structure(child)]))
+            stub=dict(clone(parent),columns=[],keys=[],details_loaded=False);ex.ensure_details(child['id'],full=True);requests[-1]['done']({'cache_miss':True});requests[-1]['done'](self.oracle_details_result(source,child,[stub]))
+            self.assertEqual(ex._objects[parent['id']]['columns'],parent['columns']);self.assertEqual(ex._objects[parent['id']]['keys'],parent['keys']);self.assertEqual(ex.catalog['relations'][0]['target'],parent['id'])
+            ex.merge_cached_structure(self.progressive_graph_payload([stub],[self.progressive_structure(child)],revision='stub'))
+            self.assertEqual(ex._objects[parent['id']]['columns'],parent['columns']);self.assertEqual(ex._objects[parent['id']]['keys'],parent['keys']);ex.tabs.setCurrentIndex(1);self.assertEqual(len(ex.graph._edges),1)
+        def test_progressive_explicit_incomplete_coverage_never_claims_ready_or_loops(self):
+            from unittest import mock
+            source,ex,requests,events=self.persistent_oracle_fixture(trusted=True,progressive=True);obj=self.oracle_scope_table('APP');requests[-1]['done'](self.persistent_oracle_catalog(source,[obj]));done=mock.Mock();ex.ensure_details(obj['id'],done)
+            partial=dict(clone(obj),details_loaded=True,columns=[],coverage={'columns':False,'relations':False,'definition':True});value=self.oracle_details_result(source,partial,warnings=['Kolumny niedostępne']);value['cache']={'generation':'g1'};requests[-1]['done'](value)
+            self.assertFalse(ex.structure_ready(ex._objects[obj['id']]));done.assert_not_called();count=len(requests);ex.select_object(obj['id']);self.assertEqual(len(requests),count)
+            self.assertIn('częściowe',ex.detail_note.text());self.assertNotIn('Odczytuję',ex.detail_note.text())
+            ex.open_data(obj['id']);self.assertEqual(requests[-1]['operation'],'database_cache_details');requests[-1]['done'](value);self.assertEqual(len(requests),count+1);self.assertFalse(ex._data_pages)
+        def test_progressive_evicted_pin_cancels_old_hydration_and_starts_new_generation(self):
+            source,ex,requests,events=self.persistent_oracle_fixture(trusted=True,progressive=True);obj=self.oracle_scope_table('APP');requests[-1]['done'](self.persistent_oracle_catalog(source,[obj]));old=events[-1]
+            ex.turn_inventory(1);requests[-1]['done']({'cache_miss':True});self.assertTrue(old['cancelled']);self.assertIsNone(requests[-1]['args']['generation']);requests[-1]['done'](self.persistent_oracle_catalog(source,[obj],generation='g2',offset=1000))
+            new=events[-1];self.assertEqual(new['operation'],'database_cache_hydrate');self.assertEqual(new['args']['generation'],'g2');old['failed']('Stara generacja');self.assertTrue(ex._hydrate_job);self.assertNotIn('Stara generacja',ex.cache_note.text())
         def test_persistent_catalog_opens_offline_without_driver_or_trust(self):
             from unittest import mock
             source,ex,requests,events=self.persistent_oracle_fixture(ready=False);obj=self.oracle_scope_table('APP')
@@ -17295,7 +18395,7 @@ def ui_test():
             requests[-1]['done'](self.oracle_inventory_catalog(source,[child],query='CHILD'));ex.search.setText('CHILD');ex._filter_timer.stop();ex.select_object(child['id'])
             stub=clone(parent);stub.update(columns=[],keys=[],details_loaded=False);requests[-1]['done'](self.oracle_details_result(source,child,[stub]));self.assertIn(parent['id'],ex._objects)
             self.assertFalse(ex.catalog['relations'][0]['resolved']);ex.focus_relations();self.wait(lambda:parent['id'] in ex.graph._nodes)
-            self.assertIn('tylko z odczytanych',ex._graph_scope_note);self.assertEqual(ex._inventory_page_ids,[child['id']])
+            self.assertIn('tylko z odczytanych',ex.graph.toolTip());self.assertIn('struktura',ex._graph_scope_note);self.assertEqual(ex._inventory_page_ids,[child['id']])
             with mock.patch.object(ex,'open_join') as open_join:
                 ex.open_graph_selection([child['id'],parent['id']]);self.assertEqual(requests[-1]['args']['object']['id'],parent['id']);open_join.assert_not_called()
                 requests[-1]['done'](self.oracle_details_result(source,parent));self.assertTrue(ex.catalog['relations'][0]['resolved']);open_join.assert_called_once()
@@ -17560,7 +18660,7 @@ def ui_test():
             path,ex=self.open_database_fixture();ex.tabs.setCurrentIndex(1);app.processEvents();self.wait(lambda:not ex.graph._initial_view)
             child=next(n for n in ex.graph._nodes.values() if n._object['name']=='child')
             self.assertGreater(child.anchor('p','right').y(),child.anchor('id','right').y())
-            self.assertGreaterEqual(child._field_font.pixelSize(),13)
+            self.assertGreaterEqual(child._field_font.pixelSize(),12);self.assertGreaterEqual(child._title_font.pixelSize(),13)
         def test_sqlite_opens_whole_catalog_without_analysis_wizard(self):
             path,ex=self.open_database_fixture();self.assertEqual(self.service.document['analyses'],[])
             self.assertEqual(len(self.service.document['sources']),1);self.assertFalse(self.window._sheet_mode)
