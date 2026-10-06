@@ -4412,6 +4412,23 @@ EXCEL_SESSION_MAX_MESSAGE=4*1024*1024
 EXCEL_SESSION_BOOTSTRAP="[Console]::InputEncoding=New-Object Text.UTF8Encoding($false); & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadLine()))))"
 
 
+def excel_session_foreground(owned,hwnd,cancelled):
+    """Only an explicit reveal may foreground its verified, still-owned Excel."""
+    if os.name!='nt' or cancelled.is_set() or not owned or not owned.alive():return False
+    if type(hwnd) is not int or hwnd<=0:return False
+    api=_ExcelNativeWindows();c=api.c;user=api.user
+    for name,args,result in (('IsIconic',[c.c_void_p],c.c_int),('ShowWindowAsync',[c.c_void_p,c.c_int],c.c_int),('GetForegroundWindow',[],c.c_void_p)):
+        function=getattr(user,name);function.argtypes=args;function.restype=result
+    if api.pid(hwnd)!=owned.pid or api.root(hwnd)!=hwnd or api.class_name(hwnd)!='XLMAIN':return False
+    foreground=int(user.GetForegroundWindow() or 0)
+    # Do not interrupt somebody who changed to another application while COM
+    # was busy. Windows also retains its own foreground activation restrictions.
+    if foreground and api.pid(foreground) not in (os.getpid(),owned.pid):return False
+    if user.IsIconic(hwnd):user.ShowWindowAsync(hwnd,9)  # SW_RESTORE, never block on Excel's message loop.
+    if cancelled.is_set() or not owned.alive() or api.pid(hwnd)!=owned.pid:return False
+    return bool(user.SetForegroundWindow(hwnd))
+
+
 def excel_session_edits(edits):
     """Validate the entire explicit write set before any Office command is sent."""
     if not isinstance(edits,list) or len(edits)>1000:raise UserError('Jedna operacja może zmienić najwyżej 1000 komórek.')
@@ -4688,6 +4705,7 @@ try {
                     [void]$excel.Goto($shape.TopLeftCell,$true)
                     try { [void]$shape.Select() } catch {}
                     $extra.native_only=$true
+                    $extra.reveal_hwnd=[Int64]$excel.ActiveWindow.Hwnd
                 }
                 'run_control_macro' {
                     $sheet=Find-Sheet $command; $shape=Find-Control $command $sheet
@@ -4860,6 +4878,12 @@ class ExcelSessionController:
         with self.lock:
             if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
             pending=self.pending if event=='done' else None
+            owned=self.owned_process;operation=self.state.get('operation')
+        if event=='done' and operation=='reveal_control' and value.get('operation')=='reveal_control':
+            result=value.get('result') or {};value['result']=result
+            try:result['foreground']=excel_session_foreground(owned,result.get('reveal_hwnd'),self.cancelled)
+            except Exception:result['foreground']=False
+            if not result['foreground']:value['message']='Kontrolka jest wskazana w Excelu. Wybierz okno Excela na pasku zadań, jeśli Windows nie przeniósł go na pierwszy plan.'
         if pending:
             try:result=self._publish(pending);value['result']=dict(value.get('result') or {},**result)
             except Exception as exc:event='error';value['message']=safe_error(exc)
@@ -10462,9 +10486,10 @@ def native_ui_types():
             self.native_macro=button('Uruchom przypisane makro',self.run_control_macro);control_row.addWidget(self.native_macro);native_layout.addLayout(control_row)
             self.native_note=label('Dane i obliczenia pochodzą z tej sesji Excela. Edycja komórki jest wysyłana do otwartego skoroszytu.',True,True);native_layout.addWidget(self.native_note)
             self.native_macro.setToolTip('Uruchamia przypisane makro po nazwie. Kontrolki wymagające Application.Caller lub ActiveX kliknij w oknie Excela.')
-            self.native_sheets.currentIndexChanged.connect(self.native_sheet_changed);self.native_controls.currentIndexChanged.connect(self.update_controls);self.native_frame.hide();outer.addWidget(self.native_frame,2)
+            self.native_sheets.currentIndexChanged.connect(self.native_sheet_changed);self.native_controls.currentIndexChanged.connect(self.update_controls)
+            self.body_tabs=QW.QTabWidget();self.body_tabs.addTab(self.native_frame,'Arkusz Excela');self.body_tabs.setTabVisible(0,False);self._prompt_tab_key=None
             self.prompt_frame=QW.QGroupBox('Rzeczywiste komunikaty Excela');self.prompt_layout=QW.QVBoxLayout(self.prompt_frame)
-            self.prompt_scroll=QW.QScrollArea();self.prompt_scroll.setWidgetResizable(True);self.prompt_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.prompt_scroll.setWidget(self.prompt_frame);outer.addWidget(self.prompt_scroll,1)
+            self.prompt_scroll=QW.QScrollArea();self.prompt_scroll.setWidgetResizable(True);self.prompt_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.prompt_scroll.setWidget(self.prompt_frame);self.body_tabs.addTab(self.prompt_scroll,'Komunikaty');outer.addWidget(self.body_tabs,1)
             self.history_toggle=QW.QToolButton();self.history_toggle.setText('Historia sesji');self.history_toggle.setCheckable(True);outer.addWidget(self.history_toggle,0,Qt.AlignmentFlag.AlignLeft)
             self.history=QW.QPlainTextEdit();self.history.setReadOnly(True);self.history.setMaximumBlockCount(100);self.history.setMaximumHeight(110);self.history.hide();self.history_toggle.toggled.connect(self.history.setVisible);outer.addWidget(self.history)
             row=QW.QHBoxLayout();self.stop_button=button('Przerwij sesję',self.stop_session);row.addWidget(self.stop_button);row.addStretch();self.close_button=button('Zamknij',self.close);row.addWidget(self.close_button);outer.addLayout(row)
@@ -10512,7 +10537,7 @@ def native_ui_types():
             if not path or Path(path).suffix.lower() not in WORKBOOK_SUFFIXES:self.message.setText('Wybierz plik XLSM albo XLSX.');return
             self._epoch+=1;self._event_seq=0;self._last_result_key=None;self._last_scan=0;self._native_digest=None;self._scan_pending=False;self._action_pending=False;self._sent_prompts={};self._retry_prompts=set();self.history.clear();self.message.clear();self.render_prompts([])
             try:
-                self._native_book_id='';self.native_frame.hide();self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._native_loading=True
+                self._native_book_id='';self.body_tabs.setTabVisible(0,False);self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._native_loading=True
                 self.native_model.set_snapshot({});self.native_sheets.clear();self.native_controls.clear();self._native_controls=[];self._native_loading=False
                 self._controller=ExcelSessionController(path,self._host_window.service.root/'excel-sessions');options={'run_open_events':self.open_events.isChecked()}
                 if self._office_context or self._companion_paths:options['context']=dict(clone(self._office_context or {}),companion_paths=list(self._companion_paths))
@@ -10557,6 +10582,9 @@ def native_ui_types():
         def run_control_macro(self):
             control=self.native_controls.currentData() or {}
             if control.get('macro_supported'):self.submit('run_control_macro',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'control_id':control['id']})
+        def show_native_view(self):
+            first=not self.body_tabs.isTabVisible(0);self.body_tabs.setTabVisible(0,True)
+            if first and not self._last_prompts:self.body_tabs.setCurrentIndex(0)
         def apply_native_result(self,result,allow_reveal=True):
             if not isinstance(result,dict):return
             if not allow_reveal:self._initial_control_pending=False
@@ -10570,7 +10598,7 @@ def native_ui_types():
                         for sheet in result['sheets']:
                             if sheet.get('visible',True) in (True,-1):self.native_sheets.addItem(str(sheet.get('name',sheet.get('id',''))),sheet.get('id'))
                         active=self.native_sheets.findText(str(result.get('active_sheet','')));self.native_sheets.setCurrentIndex(active if active>=0 else max(0,self.native_sheets.findData(current)))
-                    self.native_frame.show();self._last_view_refresh=0
+                    self.show_native_view();self._last_view_refresh=0
                     if result.get('snapshot_warning'):self.native_note.setText('Nie odczytano zakresu: '+str(result['snapshot_warning']))
                 finally:self._native_loading=False
                 return
@@ -10614,7 +10642,7 @@ def native_ui_types():
                 note='Dane i obliczenia pochodzą z tej sesji Excela. Edycja komórki jest wysyłana do otwartego skoroszytu.'
                 if result.get('sheets_complete') is False:note+=' Lista arkuszy jest częściowa; pozostałe wybierz w Excelu.'
                 if view.get('controls_complete') is False:note+=' Lista kontrolek jest częściowa; pozostałe są dostępne w Excelu.'
-                self.native_note.setText(note);self.native_frame.show();self._last_view_refresh=time.monotonic()
+                self.native_note.setText(note);self.show_native_view();self._last_view_refresh=time.monotonic()
             finally:self._native_loading=False
             if self._initial_control_pending:
                 self._initial_control_pending=False
@@ -10677,6 +10705,10 @@ def native_ui_types():
                 self._scan_pending=False;self.message.setText('Nie odczytano komunikatów. Użyj okna Excela. '+str(error))
             self._tasks.submit(lambda:excel_native_dialogs(pid,hwnd),done,failed,'Komunikaty Excela')
         def render_prompts(self,items):
+            key=digest([(item.get('hwnd'),item.get('fingerprint')) for item in items]) if items else None
+            if key and key!=self._prompt_tab_key:self.body_tabs.setCurrentIndex(1)
+            elif not key and self._prompt_tab_key and self._native_book_id and self.body_tabs.currentIndex()==1:self.body_tabs.setCurrentIndex(0)
+            self._prompt_tab_key=key
             self._last_prompts=clone(items)
             self.prompt_scroll.setMinimumHeight(230 if items else 60)
             while self.prompt_layout.count():
@@ -18637,6 +18669,29 @@ send('closed')
             controller=self.start()
             for n in range(150):controller._event('done',result={'snapshot':{'cells':['x'*10000]},'revision':n})
             state=controller.poll();self.assertEqual(len(state['events']),100);self.assertEqual(sum('snapshot' in e.get('result',{}) for e in state['events']),1)
+        @unittest.skipUnless(os.name=='nt','Windows foreground API')
+        def test_explicit_reveal_restores_only_owned_window_without_stealing_focus(self):
+            import ctypes
+            from unittest.mock import MagicMock
+            api=MagicMock();api.c=ctypes;api.root.side_effect=lambda hwnd:hwnd;api.class_name.return_value='XLMAIN'
+            api.pid.side_effect=lambda hwnd:424242 if hwnd==848484 else os.getpid();api.user.GetForegroundWindow.return_value=99;api.user.IsIconic.return_value=True;api.user.SetForegroundWindow.return_value=1
+            owned=MagicMock();owned.pid=424242;owned.alive.return_value=True;cancel=threading.Event()
+            with patch(__name__+'._ExcelNativeWindows',return_value=api):
+                self.assertTrue(excel_session_foreground(owned,848484,cancel));api.user.ShowWindowAsync.assert_called_once_with(848484,9);api.user.SetForegroundWindow.assert_called_once_with(848484)
+                api.user.SetForegroundWindow.reset_mock();api.user.ShowWindowAsync.reset_mock();api.pid.side_effect=lambda hwnd:424242 if hwnd==848484 else 999
+                self.assertFalse(excel_session_foreground(owned,848484,cancel));api.user.ShowWindowAsync.assert_not_called();api.user.SetForegroundWindow.assert_not_called()
+                api.pid.side_effect=lambda hwnd:999 if hwnd==848484 else os.getpid()
+                self.assertFalse(excel_session_foreground(owned,848484,cancel));api.user.SetForegroundWindow.assert_not_called()
+                cancel.set();self.assertFalse(excel_session_foreground(owned,848484,cancel));api.user.SetForegroundWindow.assert_not_called()
+        def test_only_completed_current_reveal_requests_foreground(self):
+            controller=self.start()
+            with patch(__name__+'.excel_session_foreground',return_value=True) as foreground:
+                controller.state.update(job_id='current',operation='read_range')
+                controller._consume({'event':'done','session_id':controller.session_id,'id':'current','operation':'reveal_control','result':{'reveal_hwnd':848484}});foreground.assert_not_called()
+                controller.state.update(job_id='reveal',operation='reveal_control')
+                controller._consume({'event':'done','session_id':controller.session_id,'id':'stale','operation':'reveal_control','result':{'reveal_hwnd':848484}});foreground.assert_not_called()
+                controller._consume({'event':'done','session_id':controller.session_id,'id':'reveal','operation':'reveal_control','result':{'reveal_hwnd':848484}});foreground.assert_called_once_with(controller.owned_process,848484,controller.cancelled)
+                self.assertTrue(controller.poll()['last_result']['foreground'])
         @unittest.skipUnless(os.name=='nt','Windows PowerShell helper execution')
         def test_powershell_edit_preflight_partial_state_and_macro_identity(self):
             import base64
@@ -22207,6 +22262,12 @@ def ui_test():
                 def cancel(self):Rejected.cancelled=True
             with mock.patch(__name__+'.ExcelSessionController',Rejected):dialog.start_session()
             self.assertTrue(Rejected.cancelled);self.assertFalse(dialog.session_running());self.assertTrue(dialog.open_button.isEnabled());self.assertIn('Odrzucony',dialog.message.text());dialog.start_session();self.assertTrue(dialog.session_running());self.assertEqual(len(instances),1)
+        def test_office_compact_tabs_show_prompt_actions_at_900_by_760_without_stealing_manual_tab(self):
+            dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();self.wait(lambda:not dialog._scan_pending);instances[0].snapshot['last_result']=self.native_excel_payload();dialog.poll()
+            prompt=self.excel_prompt_fixture();dialog.render_prompts([prompt]);dialog.resize(900,760);QTest.qWait(60);app.processEvents()
+            self.assertLessEqual(dialog.height(),760);self.assertEqual(dialog.body_tabs.currentIndex(),1);skip=self.excel_button(dialog,'Pomiń → Nie');self.assertTrue(dialog.prompt_scroll.viewport().rect().contains(skip.mapTo(dialog.prompt_scroll.viewport(),skip.rect().center())))
+            dialog.body_tabs.setCurrentIndex(0);dialog.render_prompts([prompt]);self.assertEqual(dialog.body_tabs.currentIndex(),0)
+            prompt['fingerprint']='new-prompt';dialog.render_prompts([prompt]);self.assertEqual(dialog.body_tabs.currentIndex(),1);dialog.render_prompts([]);self.assertEqual(dialog.body_tabs.currentIndex(),0)
         def excel_prompt_fixture(self):
             return {'pid':701,'main_hwnd':702,'hwnd':703,'title':'Microsoft Excel','text':'Znaleziono błąd: Nieprawidłowy numer projektu. Dopuszczalne: Pxxxx KIT-xxxxx KIT-xxxxx Czy przerwać sprawdzanie?',
                 'buttons':[{'hwnd':704,'text':'Tak','id':6,'enabled':True},{'hwnd':705,'text':'Nie','id':7,'enabled':True}],'fingerprint':'prompt-one','complete':True,'enabled':True}
