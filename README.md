@@ -142,14 +142,14 @@ Aplikacja nie ma wbudowanej telemetrii ani WebEngine. Sieć jest potrzebna przy 
 
 ## Status i ograniczenia
 
-**0.7.4 · aktywnie rozwijane wydanie.** Nowe przygotowanie sterowników, kontrolowany restart oraz aktualny złoty znak Przesmyk w **Pomoc → O autorze**. Poprawiono zapis projektu, eksport i tworzenie pivota z zakresu na Windows. Pivot Studio nie jest pełnym zamiennikiem Excela. Obsługa formuł i formatowania ma określony zakres; makra i część obiektów XLSX nie są obsługiwane. Przy ważnych plikach zachowaj oryginał i sprawdź eksportowaną kopię.
+**0.7.4 · aktywnie rozwijane wydanie.** Nowe przygotowanie sterowników, kontrolowany restart oraz aktualny złoty znak Przesmyk w **Pomoc → O autorze**. Poprawiono zapis projektu, eksport i tworzenie pivota z zakresu na Windows, a także filtrowanie i sortowanie `DECIMAL_TEXT`, szczegóły pivota dla dat SQLite oraz formatowanie zakresów ze scaleniami. Pivot Studio nie jest pełnym zamiennikiem Excela. Obsługa formuł i formatowania ma określony zakres; makra i część obiektów XLSX nie są obsługiwane. Przy ważnych plikach zachowaj oryginał i sprawdź eksportowaną kopię.
 
 Roboczy skoroszyt ma limit **200 000 zapisanych komórek**, a pojedyncza operacja — **100 000**. Plan JOIN obejmuje **2–8 różnych tabel z jednego źródła**. Płaskie połączenie nie jest wielotabelowym modelem miar Excela. Widoczność katalogu bazy zależy od uprawnień konta.
 
 <details>
 <summary><b>Stan testów i pochodzenie materiałów</b></summary>
 
-Weryfikacja **0.7.4 na Windows**: zestaw rdzenia obejmuje **414 testów — 412 przeszło, 2 pominięto z powodu braku uprawnienia do dowiązań**. Zestaw przygotowania obejmuje **70 sprawdzonych testów** (pełny przebieg 69 oraz dodatkowa regresja i ponowny przebieg logiki instalatora po poprawce). Rzeczywista instalacja z publicznego PyPI w osobnym katalogu przygotowała wszystkie pięć profili, przeszła `pip check` i importy. Sprawdzono także rzeczywisty restart Qt z kopią niezapisanej pracy i potwierdzeniem startu nowego okna.
+Weryfikacja **0.7.4 na Windows, Python 3.12 i 3.14**: na każdej wersji uruchomiono **427 testów rdzenia — 425 przeszło, 2 pominięto z powodu braku uprawnienia do dowiązań**. Regresje obejmują zapis projektu, eksport CSV/XLSX, pivot z zakresu, dokładne porównania i stronicowanie `DECIMAL_TEXT`, szczegóły dat oraz formatowanie scaleń z cofaniem i eksportem. Zestaw przygotowania obejmuje **70 sprawdzonych testów** (pełny przebieg 69 oraz dodatkowa regresja i ponowny przebieg logiki instalatora po poprawce). Rzeczywista instalacja z publicznego PyPI w osobnym katalogu przygotowała wszystkie pięć profili, przeszła `pip check` i importy. Sprawdzono także rzeczywisty restart Qt z kopią niezapisanej pracy i potwierdzeniem startu nowego okna.
 
 Pełny przebieg Qt w trybie `offscreen` liczył 137 testów: pozostało 5 wcześniejszych niepowodzeń dotyczących klawiatury/IME, układu nagłówka i limitu czasu wykazu technologii. Dwa dodatkowe błędy fixture drag/drop poprawiono i sprawdzono osobno. Nowe testy przygotowania, restartu i logo przechodzą. Wynik nie potwierdza wszystkich interakcji w zwykłym oknie Windows. Połączenie z firmowym Artifactory i rzeczywistymi instancjami H2, Firebird oraz Oracle wymaga dostępu do tych systemów.
 

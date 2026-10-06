@@ -32,6 +32,7 @@ widocznym aktywnym dialogu. Osadzona geometria, bez sieci i bez nowego intro.
 0.7.4: przygotowanie sterowników przy połączeniu, pamięć źródła pobierania,
 opcjonalne sterowniki od pierwszego startu i restart z potwierdzoną kopią pracy.
 Aktualny złoty znak Przesmyk z /zloto/; poprawki zapisu i eksportu na Windows.
+Dokładne filtry DECIMAL_TEXT, szczegóły dat SQLite i formatowanie scaleń.
 """
 from __future__ import annotations
 
@@ -1167,7 +1168,10 @@ class QueryBuilder:
                 elif col.kind=='date':
                     value=str(value)
                     parsed=dt.datetime.fromisoformat(value) if 'T' in value or ' ' in value else dt.date.fromisoformat(value)
-                    value=parsed.isoformat() if self.adapter.kind=='sqlite' else parsed
+                    # SQLite stores the raw date text. Keep its delimiter,
+                    # fractional precision and offset so drill-down matches the
+                    # exact dimension key returned by that database.
+                    if self.adapter.kind!='sqlite':value=parsed
             except (ValueError,decimal.InvalidOperation,OverflowError) as e:
                 raise UserError(f'Nieprawidłowa wartość filtra dla pola {col.name}. Liczby: 1234.56; daty: RRRR-MM-DD.') from e
         self.params.append(value)
@@ -2691,13 +2695,21 @@ def database_relation_meta(adapter, obj):
     return cols
 
 
+def database_exact_decimal(adapter, column):
+    return adapter.kind=='sqlite' and 'DECIMAL_TEXT' in str(column.get('type','')).upper()
+
+
+def database_order_expression(adapter, column, expression):
+    return expression+(' COLLATE PS_DECIMAL' if database_exact_decimal(adapter,column) else '')
+
+
 def database_page(adapter, args):
     """One bounded live page. Filters/sort run at source, not on an arbitrary sample.
 
     Page offsets are positions, not persistent row IDs. With concurrent writes,
     subsequent pages may change; a page is not advertised as an offline snapshot.
     """
-    obj=args.get('object',{});cols=database_relation_meta(adapter,obj);names={c['name'] for c in cols}
+    obj=args.get('object',{});cols=database_relation_meta(adapter,obj);names={c['name']:c for c in cols}
     offset=max(0,int(args.get('offset',0)))
     if offset>100000000:raise UserError('Zbyt odległa strona; zawęź dane filtrem.')
     limit=max(1,min(int(args.get('limit',DATABASE_PAGE_SIZE)),DATABASE_PAGE_SIZE,max(1,20000//len(cols))))
@@ -2719,12 +2731,15 @@ def database_page(adapter, args):
             else:expr='CAST('+expr+(' AS TEXT)' if adapter.kind=='sqlite' else ' AS VARCHAR(8191))')
             clauses.append(expr+' LIKE '+bind('%'+text+'%')+" ESCAPE '!'")
         elif op in ('eq','ne','lt','gt','le','ge'):
-            if item.get('numeric'):
+            exact=database_exact_decimal(adapter,names[name])
+            if item.get('numeric') or exact:
                 try:raw=Decimal(str(raw))
                 except decimal.InvalidOperation:raise UserError('Filtr liczbowy wymaga liczby.') from None
                 if not raw.is_finite():raise UserError('Filtr wymaga skończonej liczby.')
                 if adapter.kind=='sqlite':raw=str(raw)
-            clauses.append(expr+{'eq':' = ','ne':' <> ','lt':' < ','gt':' > ','le':' <= ','ge':' >= '}[op]+bind(raw))
+            operator={'eq':' = ','ne':' <> ','lt':' < ','gt':' > ','le':' <= ','ge':' >= '}[op]
+            param=bind(raw)
+            clauses.append(f'ps_cmp({expr}, {param})'+operator+'0' if exact else expr+operator+param)
         else:raise UserError('Nieobsługiwany filtr przeglądu.')
     exprs=[]
     for col in cols:
@@ -2744,7 +2759,10 @@ def database_page(adapter, args):
     if not primary:
         pk=args.get('primary_key',[])
         if pk and all(isinstance(n,str) and n in names for n in pk):primary=list(pk)
-    order=([('ps_db.'+qident(sort))+' '+direction] if sort else [])+[('ps_db.'+qident(n))+' ASC' for n in primary if n!=sort]
+    order=([database_order_expression(adapter,names[sort],'ps_db.'+qident(sort))+' '+direction] if sort else [])
+    # Distinct text keys such as '1' and '1.0' tie numerically. Keep their
+    # original key order as a final tie-break, also when sorting that same key.
+    order+=['ps_db.'+qident(n)+' ASC' for n in primary if n!=sort or database_exact_decimal(adapter,names[n])]
     # Without a key, don't force a full sort (or try to sort a LOB column) just to open a table.
     if order:sql+=' ORDER BY '+', '.join(order)
     if adapter.kind in ('oracle','h2'):sql+=f' OFFSET {offset} ROWS FETCH NEXT {limit+1} ROWS ONLY'
@@ -3044,12 +3062,12 @@ def database_join_verify(adapter,plan):
 
 
 def database_join_filters(adapter,columns,filters):
-    mapping={c['name']:c['expression'] for c in columns};clauses=[];params=[]
+    mapping={c['name']:c for c in columns};clauses=[];params=[]
     if not isinstance(filters,list) or len(filters)>16:raise UserError('Maksymalnie 16 filtrów połączenia.')
     def bind(v):params.append(v);return adapter.bind(len(params))
     for item in filters:
         if not isinstance(item,dict) or item.get('column') not in mapping:raise UserError('Filtr wskazuje nieznane pole połączenia.')
-        expr=mapping[item['column']];op=item.get('op','contains')
+        column=mapping[item['column']];expr=column['expression'];op=item.get('op','contains')
         if op in ('is_null','not_null'):clauses.append(expr+(' IS NULL' if op=='is_null' else ' IS NOT NULL'));continue
         value=item.get('value','')
         if not isinstance(value,(str,int,float)) or isinstance(value,bool) or len(str(value))>4096:raise UserError('Nieprawidłowa wartość filtra.')
@@ -3058,12 +3076,15 @@ def database_join_filters(adapter,columns,filters):
             expr='TO_CHAR('+expr+')' if adapter.kind=='oracle' else 'CAST('+expr+(' AS TEXT)' if adapter.kind=='sqlite' else ' AS VARCHAR(8191))')
             clauses.append(expr+' LIKE '+bind('%'+value+'%')+" ESCAPE '!'")
         elif op in ('eq','ne','lt','gt','le','ge'):
-            if item.get('numeric'):
+            exact=database_exact_decimal(adapter,column)
+            if item.get('numeric') or exact:
                 try:value=Decimal(str(value))
                 except decimal.InvalidOperation:raise UserError('Filtr liczbowy wymaga liczby.') from None
                 if not value.is_finite():raise UserError('Filtr wymaga skończonej liczby.')
                 if adapter.kind=='sqlite':value=str(value)
-            clauses.append(expr+{'eq':' = ','ne':' <> ','lt':' < ','gt':' > ','le':' <= ','ge':' >= '}[op]+bind(value))
+            operator={'eq':' = ','ne':' <> ','lt':' < ','gt':' > ','le':' <= ','ge':' >= '}[op]
+            param=bind(value)
+            clauses.append(f'ps_cmp({expr}, {param})'+operator+'0' if exact else expr+operator+param)
         else:raise UserError('Nieobsługiwany filtr połączenia.')
     return (' WHERE '+' AND '.join('('+x+')' for x in clauses) if clauses else ''),params
 
@@ -3079,13 +3100,14 @@ def database_join_page(adapter,args):
     limit=max(1,min(int(args.get('limit',DATABASE_PAGE_SIZE)),DATABASE_PAGE_SIZE,max(1,20000//len(columns))))
     names={c['name']:c for c in columns};sort=args.get('sort','');direction='DESC' if args.get('direction')=='desc' else 'ASC'
     if sort and sort not in names:raise UserError('Nieprawidłowe pole sortowania.')
-    order=[names[sort]['expression']+' '+direction] if sort else [];keys=[];stable=adapter.kind=='sqlite'
+    order=[database_order_expression(adapter,names[sort],names[sort]['expression'])+' '+direction] if sort else [];keys=[];stable=adapter.kind=='sqlite'
     for obj in plan['objects']:
         pk=[c['name'] for c in sorted(live[obj['id']],key=lambda c:c['pk_position']) if c['pk_position']]
         stable=stable and bool(pk) and all(not c['nullable'] for c in obj['columns'] if c['pk_position'])
         for name in pk:
             expr=compiled['aliases'][obj['id']]+'.'+qident(name)
-            if not sort or expr!=names[sort]['expression']:keys.append(expr+' ASC')
+            column=next(c for c in live[obj['id']] if c['name']==name)
+            if not sort or expr!=names[sort]['expression'] or database_exact_decimal(adapter,column):keys.append(expr+' ASC')
     if order or keys:sql+=' ORDER BY '+', '.join(order+keys)
     if adapter.kind in ('oracle','h2'):sql+=f' OFFSET {offset} ROWS FETCH NEXT {limit+1} ROWS ONLY'
     elif adapter.kind=='firebird':sql+=f' ROWS {offset+1} TO {offset+limit+1}'
@@ -5187,12 +5209,16 @@ class SheetSession:
         before={};after={}
         for address,value in changes.items():
             r,c=sheet_position(address);address=sheet_address(r,c)
-            for merge in sheet['merges']:
-                a,b,d,e=sheet_range(merge)
-                if a<=r<=d and b<=c<=e and (r,c)!=(a,b) and value:
-                    raise UserError('Edytuj lewą górną komórkę scalenia albo najpierw rozłącz komórki.')
             cleaned=sheet_cell_validate(value,len(self.book['styles']))
             original=sheet['cells'].get(address)
+            content={k:v for k,v in (cleaned or {}).items() if k in ('v','f','error')}
+            previous={k:v for k,v in (original or {}).items() if k in ('v','f','error')}
+            for merge in sheet['merges']:
+                a,b,d,e=sheet_range(merge)
+                # Covered cells retain physical styles for XLSX borders/fills.
+                # Formatting must not permit entering hidden values or formulas.
+                if a<=r<=d and b<=c<=e and (r,c)!=(a,b) and content and content!=previous:
+                    raise UserError('Edytuj lewą górną komórkę scalenia albo najpierw rozłącz komórki.')
             if original!=cleaned:before[address]=clone(original);after[address]=cleaned
         if not after:return False
         total=sum(len(s['cells']) for s in self.book['sheets'])+sum((1 if v else 0)-(1 if before[k] else 0) for k,v in after.items())
@@ -13192,6 +13218,39 @@ def sheet_test_suite():
             sheet_find(self.book,self.sid)['merges']=['A1:B2']
             with self.assertRaises(UserError):self.put('B2',5)
             self.put('A1',5);self.assertEqual(self.get('A1'),5)
+        def test_format_merged_range_undo_redo_and_clear(self):
+            self.put('A1','Title');sh=sheet_find(self.book,self.sid);sh['merges']=['A1:B1']
+            sh['cells']['B1']={'format':{'italic':True}};before=clone(sh['cells'])
+            self.assertTrue(self.session.format_range(self.sid,(0,0,0,2),{'bold':True,'background':'#E2EFDA'}))
+            after=clone(sh['cells']);self.assertEqual(self.get('A1'),'Title');self.assertIsNone(self.get('B1'))
+            for address in ('A1','B1','C1'):self.assertTrue(sheet_effective_style(self.book,sh['cells'][address])['bold'])
+            self.assertTrue(sheet_effective_style(self.book,sh['cells']['B1'])['italic'])
+            self.assertTrue(self.session.undo());self.assertEqual(sh['cells'],before)
+            self.assertTrue(self.session.redo());self.assertEqual(sh['cells'],after);self.assertEqual(sh['merges'],['A1:B1'])
+            self.session.clear_range(self.sid,(0,0,0,2));self.assertIsNone(self.get('A1'))
+            self.assertEqual(sh['cells']['B1'],after['B1']);self.assertTrue(sh['cells']['A1']['format']['bold'])
+        def test_merged_style_patch_cannot_change_covered_content(self):
+            self.put('A1','Title');sh=sheet_find(self.book,self.sid);sh['merges']=['A1:B1']
+            sh['cells']['B1']={'v':pack('Imported hidden value'),'format':{'italic':True}}
+            self.session.format_range(self.sid,(0,0,0,1),{'bold':True})
+            self.assertEqual(sh['cells']['B1']['v'],pack('Imported hidden value'))
+            for content in ({'v':pack(5)},{'f':'=1+1'},{'error':'#VALUE!'}):
+                before=clone(self.book);history_position=self.session.position
+                with self.subTest(content=content),self.assertRaises(UserError):
+                    self.session.apply_cells(self.sid,{'A1':{'v':pack('Changed')},'B1':{**content,'format':{'bold':False}}})
+                self.assertEqual(self.book,before);self.assertEqual(self.session.position,history_position)
+        def test_merged_anchor_and_range_format_xlsx_roundtrip(self):
+            self.put('A1','Title');sh=sheet_find(self.book,self.sid);sh['merges']=['A1:B1']
+            self.session.format_range(self.sid,(0,0,0,0),{'bold':True,'align':'center'})
+            self.assertNotIn('B1',sh['cells'])
+            self.session.format_range(self.sid,(0,0,0,1),{'background':'#E2EFDA','border':True})
+            path=self.root/'merged-styles.xlsx';sheet_export_xlsx(self.book,path)
+            restored=sheet_read_xlsx(path);rs=restored['sheets'][0]
+            self.assertEqual(rs['merges'],['A1:B1']);self.assertEqual(unpack(rs['cells']['A1']['v']),'Title')
+            self.assertNotIn('v',rs['cells']['B1'])
+            for address in ('A1','B1'):
+                style=sheet_effective_style(restored,rs['cells'][address]);self.assertEqual(style['background'],'#E2EFDA');self.assertTrue(style['border'])
+            anchor=sheet_effective_style(restored,rs['cells']['A1']);self.assertTrue(anchor['bold']);self.assertEqual(anchor['align'],'center')
         def test_format_validation(self):
             for style in ({'size':float('nan')},{'size':1000},{'background':'notacolor'},{'align':'bad'}):
                 with self.subTest(style=style),self.assertRaises(UserError):sheet_style_validate(style)
@@ -13456,6 +13515,45 @@ def database_explorer_test_suite():
         def test_numeric_filter_and_null(self):
             page=self.page(filters=[{'column':'amount','op':'gt','numeric':True,'value':'450'}]);self.assertEqual(len(page['rows']),3)
             self.assertEqual(len(self.page('parent',filters=[{'column':'parent_id','op':'is_null'}])['rows']),1)
+        def decimal_fixture(self):
+            with test_sqlite_connection(self.path) as c:
+                c.execute('CREATE TABLE decimals(id INTEGER PRIMARY KEY,amount DECIMAL_TEXT)')
+                c.executemany('INSERT INTO decimals VALUES(?,?)',enumerate(
+                    ['2','10','100','10.00',None,'0','-2','9007199254740992.000000000000000001','9007199254740992.000000000000000002'],1))
+        def test_decimal_text_filters_compare_numbers_and_scales_exactly(self):
+            self.decimal_fixture()
+            for numeric in (False,True):
+                for op,expected in [('eq',[2,4]),('ne',[1,3,6,7,8,9]),('lt',[1,6,7]),
+                                    ('gt',[3,8,9]),('le',[1,2,4,6,7]),('ge',[2,3,4,8,9])]:
+                    with self.subTest(numeric=numeric,op=op):
+                        page=self.page('decimals',filters=[{'column':'amount','op':op,'numeric':numeric,'value':'10.000'}])
+                        self.assertEqual([int(row[0]['v']) for row in page['rows']],expected)
+            page=self.page('decimals',filters=[{'column':'amount','op':'gt','numeric':True,'value':'9'}])
+            self.assertEqual([int(row[0]['v']) for row in page['rows']],[2,3,4,8,9])
+            page=self.page('decimals',filters=[{'column':'amount','op':'gt','value':'9007199254740992.000000000000000001'}])
+            self.assertEqual([int(row[0]['v']) for row in page['rows']],[9])
+        def test_decimal_text_sort_is_numeric_before_paging(self):
+            self.decimal_fixture()
+            for direction,expected in [('asc',[5,7,6,1,2,4,3,8,9]),('desc',[9,8,3,2,4,1,6,7,5])]:
+                with self.subTest(direction=direction):
+                    page=self.page('decimals',sort='amount',direction=direction)
+                    self.assertEqual([int(row[0]['v']) for row in page['rows']],expected)
+                    page=self.page('decimals',sort='amount',direction=direction,offset=1,limit=3)
+                    self.assertEqual([int(row[0]['v']) for row in page['rows']],expected[1:4]);self.assertTrue(page['has_more'])
+        def test_decimal_text_filter_rejects_non_numeric_values(self):
+            self.decimal_fixture()
+            for value in ('NaN','Infinity',"' OR 1=1 --"):
+                with self.subTest(value=value),self.assertRaises(UserError):
+                    self.page('decimals',filters=[{'column':'amount','op':'eq','value':value}])
+        def test_decimal_text_primary_sort_keeps_distinct_scale_keys_stable(self):
+            with test_sqlite_connection(self.path) as c:
+                c.execute('CREATE TABLE decimal_keys(amount DECIMAL_TEXT PRIMARY KEY NOT NULL)')
+                c.executemany('INSERT INTO decimal_keys VALUES(?)',[('1.0',),('1',),('10',),('2',)])
+            for direction,expected in [('asc',['1','1.0','2','10']),('desc',['10','2','1','1.0'])]:
+                with self.subTest(direction=direction):
+                    pages=[self.page('decimal_keys',sort='amount',direction=direction,limit=1,offset=i) for i in range(4)]
+                    self.assertEqual([page['rows'][0][0]['v'] for page in pages],expected)
+                    self.assertTrue(all(page['stable_order'] for page in pages))
         def test_filter_finite_values_only(self):
             with self.assertRaises(UserError):self.page(filters=[{'column':'amount','op':'eq','numeric':True,'value':'NaN'}])
         def test_null_and_zero_stay_distinct(self):
@@ -13650,6 +13748,45 @@ def database_join_test_suite():
             page=self.page(filters=[{'column':'operations · operation_id','op':'is_null'}]);self.assertEqual(self.values(page,'events · id'),['4','5'])
         def test_numeric_filter(self):
             page=self.page(filters=[{'column':'events · id','op':'gt','value':'3','numeric':True}]);self.assertEqual(self.values(page,'events · id'),['4','5'])
+        def decimal_plan(self):
+            with test_sqlite_connection(self.path) as c:
+                c.execute('CREATE TABLE decimal_records(id INTEGER PRIMARY KEY,operation_id TEXT REFERENCES operations(operation_id),amount DECIMAL_TEXT)')
+                c.executemany('INSERT INTO decimal_records VALUES(?,?,?)',[(i,'op1',v) for i,v in enumerate(
+                    ['2','10','100','10.00',None,'0','-2','9007199254740992.000000000000000001','9007199254740992.000000000000000002'],1)])
+            self.catalog=DatabaseInspector(self.adapter()).read();self.objects.update({o['name']:o for o in self.catalog['objects'] if o['kind']=='table'})
+            return self.plan(('decimal_records','operations'))
+        def test_decimal_text_join_filters_preserve_exact_numeric_semantics(self):
+            plan=self.decimal_plan();column='decimal_records · amount'
+            for numeric in (False,True):
+                for op,value,expected in [('gt','9',['2','3','4','8','9']),('eq','10.000',['2','4']),
+                        ('ne','10',['1','3','6','7','8','9']),('lt','10',['1','6','7']),
+                        ('le','10',['1','2','4','6','7']),('ge','10',['2','3','4','8','9']),
+                        ('gt','9007199254740992.000000000000000001',['9'])]:
+                    with self.subTest(numeric=numeric,op=op,value=value):
+                        page=self.page(plan,filters=[{'column':column,'op':op,'numeric':numeric,'value':value}])
+                        self.assertEqual(self.values(page,'decimal_records · id'),expected)
+            for value in ('NaN','Infinity',"' OR 1=1 --"):
+                with self.subTest(value=value),self.assertRaises(UserError):
+                    self.page(plan,filters=[{'column':column,'op':'eq','value':value}])
+        def test_decimal_text_join_sort_and_paging_are_numeric(self):
+            plan=self.decimal_plan()
+            for direction,expected in [('asc',['5','7','6','1','2','4','3','8','9']),('desc',['9','8','3','2','4','1','6','7','5'])]:
+                with self.subTest(direction=direction):
+                    page=self.page(plan,sort='decimal_records · amount',direction=direction)
+                    self.assertEqual(self.values(page,'decimal_records · id'),expected)
+                    page=self.page(plan,sort='decimal_records · amount',direction=direction,offset=1,limit=3)
+                    self.assertEqual(self.values(page,'decimal_records · id'),expected[1:4]);self.assertTrue(page['has_more'])
+        def test_decimal_text_join_primary_sort_keeps_scale_keys_stable(self):
+            with test_sqlite_connection(self.path) as c:
+                c.execute('CREATE TABLE decimal_keys(amount DECIMAL_TEXT PRIMARY KEY NOT NULL,operation_id TEXT REFERENCES operations(operation_id))')
+                c.executemany('INSERT INTO decimal_keys VALUES(?,?)',[(v,'op1') for v in ('1.0','1','10','2')])
+            self.catalog=DatabaseInspector(self.adapter()).read();self.objects.update({o['name']:o for o in self.catalog['objects'] if o['kind']=='table'})
+            plan=self.plan(('decimal_keys','operations'))
+            for direction,expected in [('asc',['1','1.0','2','10']),('desc',['10','2','1','1.0'])]:
+                with self.subTest(direction=direction):
+                    pages=[self.page(plan,sort='decimal_keys · amount',direction=direction,limit=1,offset=i) for i in range(4)]
+                    self.assertEqual([self.values(page,'decimal_keys · amount')[0] for page in pages],expected)
+                    self.assertTrue(all(page['stable_order'] for page in pages))
         def test_like_is_literal(self):
             page=self.page(filters=[{'column':'events · state','op':'contains','value':'%'}]);self.assertEqual(page['rows'],[])
         def test_sort_and_pagination(self):
@@ -14344,6 +14481,38 @@ def self_test():
         def test_grouped_date_filter(self):
             a=json.loads(dumps(self.a)); a['filters']=[{'field':'day','grain':'month','op':'eq','value':'2026-02'}]
             m,p,_=self.pivot(validate_analysis(a)); self.assertEqual(self.value(m,p,None,'sum'),Decimal('.2'))
+        def timestamp_fixture(self):
+            values=['2026-10-05 12:34:56','2026-10-05T12:34:56',
+                    '2026-10-05 12:34:56.1234+02:00','2026-10-05T12:34:56.123400+02:00',
+                    '2026-10-05 12:34:57','2026-10-05T12:34:57',None]
+            with test_sqlite_connection(self.db) as c:
+                c.execute('CREATE TABLE moments(id INTEGER PRIMARY KEY,occurred TIMESTAMP,amount INTEGER)')
+                c.executemany('INSERT INTO moments VALUES(?,?,?)',[(i,value,i) for i,value in enumerate(values,1)])
+            analysis=validate_analysis({'dataset':{'source_id':self.source['id'],'table':'moments'},
+                'rows':[{'field':'occurred'}],'measures':[{'id':'amount','field':'amount','agg':'sum'}],'totals':False})
+            return analysis,values
+        def test_raw_timestamp_filters_preserve_sqlite_representation(self):
+            analysis,values=self.timestamp_fixture();adapter=self.adapter();cols=adapter.columns(analysis['dataset'])
+            for i,value in enumerate(values[:-1],1):
+                for op,filter_value in [('eq',value),('in',[value]),('between',[value,value])]:
+                    with self.subTest(value=value,op=op):
+                        filtered=clone(analysis);filtered['filters']=[{'field':'occurred','op':op,'value':filter_value}]
+                        qb=QueryBuilder(adapter,validate_analysis(filtered),cols);sql,params,_=qb.preview_query()
+                        self.assertTrue(all(parameter==value for parameter in params))
+                        self.assertEqual([row[0] for row in adapter.fetch(sql,params)],[i])
+            filtered=clone(analysis);filtered['filters']=[{'field':'occurred','op':'eq','value':'not a date'}]
+            with self.assertRaises(UserError):QueryBuilder(adapter,validate_analysis(filtered),cols)
+        def test_raw_timestamp_drill_returns_only_its_original_group(self):
+            analysis,values=self.timestamp_fixture();meta,page,path=self.pivot(analysis)
+            self.assertEqual(meta['row_count'],len(values));measure=next(c['id'] for c in meta['columns'] if c.get('measure'))
+            for row in page['rows']:
+                key=row['v'][0]['v'] if row['v'][0] is not None else None
+                with self.subTest(timestamp=key):
+                    original,filters=ResultStore.drill_filters(path,row['i'],measure)
+                    output=self.root/(uid()+'.sqlite')
+                    detail=run_preview(self.adapter(),original,output,extra=filters,drill=True)
+                    self.assertEqual(detail['row_count'],1)
+                    self.assertEqual(next(ResultStore.iter_rows(output))[0][0]['v'],str(values.index(key)+1))
         def test_decimal_equivalence_grouping_and_unique(self):
             with test_sqlite_connection(self.db) as c:
                 c.executemany('INSERT INTO sales(amount) VALUES(?)',[('1',),('1.0',),('1.00',),('-0',)])
@@ -14450,6 +14619,16 @@ def self_test():
                 for n in z.namelist():
                     if n.endswith('.xml') or n.endswith('.rels'): ET.fromstring(z.read(n))
             preview=import_preview(dest,{'header':True}); self.assertTrue(preview['columns'])
+        def test_csv_export_roundtrip(self):
+            meta,_,path=self.pivot();dest=self.root/'export.csv'
+            result=export_result(path,dest,'csv')
+            with dest.open(encoding='utf-8-sig',newline='') as stream:
+                rows=list(csv.reader(stream,delimiter=';'))
+            self.assertEqual(len(rows),meta['row_count']+1)
+            self.assertEqual(len(rows[0]),len(meta['columns']))
+            expected=[[csv_safe(cell) for cell in cells] for cells,_ in ResultStore.iter_rows(path)]
+            self.assertEqual(rows[1:],expected)
+            self.assertEqual(json.loads(Path(result['metadata_path']).read_text('utf-8'))['fingerprint'],meta['fingerprint'])
         def test_csv_formula_injection_and_xlsx_large_number(self):
             self.assertTrue(csv_safe({'t':'s','v':'=1+1'}).startswith("'"))
             self.assertEqual(csv_safe({'t':'n','v':'-2'}),'-2')
