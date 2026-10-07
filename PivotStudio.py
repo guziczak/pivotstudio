@@ -4418,6 +4418,7 @@ def excel_copy_workbook(source,destination,cancelled,cancel_flag=None):
 
 
 EXCEL_SESSION_MAX_MESSAGE=4*1024*1024
+EXCEL_HANDOFF_INCOMPLETE_MESSAGE='Przeniesienie zmian nie zostało zakończone. Przejrzyj lub zapisz kopię w Excelu, a potem rozpocznij nową sesję. Makra i edycja są wstrzymane.'
 
 
 def excel_worker_command():
@@ -4443,7 +4444,9 @@ def excel_session_foreground(owned,hwnd,cancelled):
     # Do not interrupt somebody who changed to another application while COM
     # was busy. Windows also retains its own foreground activation restrictions.
     if foreground and api.pid(foreground) not in (os.getpid(),owned.pid):return False
-    if user.IsIconic(hwnd):user.ShowWindowAsync(hwnd,9)  # SW_RESTORE, never block on Excel's message loop.
+    # A normal, hidden automation window is not iconic. Reveal it as well as
+    # restoring a minimized one; never wait on Excel's potentially blocked STA.
+    user.ShowWindowAsync(hwnd,9 if user.IsIconic(hwnd) else 5)
     if cancelled.is_set() or not owned.alive() or api.pid(hwnd)!=owned.pid:return False
     return bool(user.SetForegroundWindow(hwnd))
 
@@ -4484,6 +4487,34 @@ def excel_session_edits(edits):
             item['expected']=checked(ek,ev,True)
         result.append(item)
     if len(dumps(result).encode('utf-8'))>1024*1024:raise UserError('Zmiany komórek przekraczają 1 MiB. Podziel operację.')
+    return result
+
+
+def excel_session_layout(layout):
+    """Bound only explicit row/column dimension changes, expressed in pixels."""
+    if not isinstance(layout,list) or len(layout)>500:raise UserError('Nieprawidłowa lista zmian wymiarów arkuszy Excel.')
+    result=[];sheets=set();count=0
+    for raw in layout:
+        if not isinstance(raw,dict) or set(raw)-{'sheet','columns','rows'}:raise UserError('Nieprawidłowa zmiana układu Excel.')
+        name=raw.get('sheet')
+        if not isinstance(name,str):raise UserError('Zmiana wymiarów wymaga nazwy arkusza.')
+        sheet_title(name)
+        if name.casefold() in sheets:raise UserError('Arkusz występuje dwukrotnie w zmianach wymiarów.')
+        sheets.add(name.casefold());item={'sheet':name,'columns':[],'rows':[]}
+        for axis,field,limit,maximum in (('columns','width',16384,2000),('rows','height',1048576,546)):
+            entries=raw.get(axis,[])
+            if not isinstance(entries,list):raise UserError('Wymiary arkusza muszą być listą.')
+            seen=set()
+            for entry in entries:
+                if not isinstance(entry,dict) or set(entry)!={'index',field}:raise UserError('Nieprawidłowy wymiar arkusza Excel.')
+                index=entry['index'];value=entry[field]
+                if type(index) is not int or not 1<=index<=limit or index in seen:raise UserError('Nieprawidłowy albo powtórzony indeks wymiaru Excel.')
+                if type(value) not in (int,float) or not math.isfinite(value) or not 0<value<=maximum:raise UserError('Wymiar Excel jest poza obsługiwanym zakresem: '+field+'.')
+                seen.add(index);count+=1
+                if count>10000:raise UserError('Sesja Excel przyjmuje najwyżej 10 000 zmian wymiarów.')
+                item[axis].append({'index':index,field:float(value)})
+        if item['columns'] or item['rows']:result.append(item)
+    if len(dumps(result).encode('utf-8'))>1024*1024:raise UserError('Zmiany wymiarów przekraczają 1 MiB.')
     return result
 
 
@@ -4577,10 +4608,41 @@ class _ExcelOleMessageFilter:
 
 def excel_worker_error_text(exc):
     """Keep HRESULTs in JSON errors so the UI can explain Office busy states."""
-    codes=[]
-    for value in (getattr(exc,'hresult',None),(getattr(exc,'excepinfo',None) or (None,)*6)[-1]):
+    codes=[];info=getattr(exc,'excepinfo',None)
+    for value in (getattr(exc,'hresult',None),(info or (None,)*6)[-1]):
         if isinstance(value,int) and value:codes.append('0x%08X'%(value&0xffffffff))
-    return (((' '.join(dict.fromkeys(codes)))+' ') if codes else '')+str(exc)[:1800]
+    text=str(exc)
+    if isinstance(info,(tuple,list)):
+        for value in info[1:3]:
+            if value and str(value) not in text:text+='\n'+str(value)
+    return (((' '.join(dict.fromkeys(codes)))+' ') if codes else '')+text[:5000]
+
+
+def excel_worker_error_fields(exc,operation='',macro_name='',diagnostics=None):
+    """Separate actionable Office text from the original COM diagnostic."""
+    details=excel_worker_error_text(exc);info=getattr(exc,'excepinfo',None)
+    description=str(info[2]).strip() if isinstance(info,(tuple,list)) and len(info)>2 and info[2] else str(exc).strip()
+    description=description[:2500];diagnostics=diagnostics or {};code='operation_failed'
+    busy=bool(re.search(r'0x800AC472|0x8001010A|0x80010001|RPC_E_SERVERCALL_RETRYLATER|RPC_E_CALL_REJECTED',details,re.IGNORECASE))
+    if busy:
+        code='office_busy';message='Excel jest zajęty. Kliknij „Pokaż Excel” i zakończ edycję komórki albo odpowiedz w otwartym oknie.'
+        if macro_name:message+=' Makro „'+macro_name+'” nie zostało automatycznie ponowione.'
+    elif operation in ('run_macro','run_control_macro') or macro_name:
+        code='macro_failed';message='Nie udało się wykonać makra'+(' „'+macro_name+'”' if macro_name else '')+'.'
+        if description:message+=' '+description
+        if re.search(r'cannot run the macro|can.t run the macro|nie można uruchomić makra',description,re.IGNORECASE):
+            code='macro_unavailable';message+=' Sprawdź nazwę procedury i jej modułu oraz komunikat zabezpieczeń w „Pokaż Excel”.'
+        if operation=='run_control_macro':message+=' Jeśli procedura korzysta z Application.Caller, uruchom przycisk bezpośrednio w Excelu.'
+        if diagnostics.get('has_vba_project') is False:message+=' Excel nie wykrywa projektu VBA w tym skoroszycie.'
+        message+=' Sprawdź wynik przed ponowną próbą; makro mogło wykonać część pracy.'
+    else:message=description or 'Excel nie wykonał operacji.'
+    if diagnostics.get('protected_view'):
+        code='protected_view';message+=' Excel ma otwarte okno Widoku chronionego. Sprawdź je przez „Pokaż Excel”; ustawienia zabezpieczeń pozostają bez zmian.'
+    if macro_name:details='Makro: '+macro_name+'\n'+details
+    if diagnostics:details+='\nStan Excela: '+dumps(diagnostics)
+    result={'message':message,'details':details[:6000],'code':code}
+    if macro_name:result['macro_name']=macro_name
+    return result
 
 
 class ExcelSessionWorker:
@@ -4588,7 +4650,7 @@ class ExcelSessionWorker:
     def __init__(self,pythoncom,output,excel=None,session_id=''):
         self.pythoncom=pythoncom;self.output=output;self.excel=excel;self.book=None
         self.session_id=session_id;self.workbook_id=session_id+'-book';self.sheet_refs={};self.control_refs={}
-        self.revision=0;self.applied=0;self.owned_excel=False
+        self.revision=0;self.applied=0;self.layout_applied=0;self.layout_touched=0;self.owned_excel=False;self.working_copy='';self.open_events_enabled=False;self.handoff_incomplete=False
     def send(self,event,**fields):
         data=dumps(dict(fields,event=event,session_id=self.session_id))
         if len(data.encode('utf-8'))>EXCEL_SESSION_MAX_MESSAGE:raise UserError('Snapshot exceeds 4 MiB. Read a smaller range.')
@@ -4613,7 +4675,7 @@ class ExcelSessionWorker:
         if type(request.get('run_open_events',False)) is not bool:raise UserError('Invalid open-event option.')
         context=request.get('context',{})
         if not isinstance(context,dict):raise UserError('Invalid workbook context.')
-        if request.get('run_open_events') and context.get('edits'):raise UserError('Open events cannot run before initial edits.')
+        if request.get('run_open_events') and (context.get('edits') or context.get('layout')):raise UserError('Open events cannot run before initial edits or layout changes.')
     @staticmethod
     def same_com(a,b):
         if a is None or b is None:return False
@@ -4690,11 +4752,69 @@ class ExcelSessionWorker:
                 if modern:cell.Formula2=value
                 else:cell.Formula=value
             self.applied+=1;self.revision+=1
+    @staticmethod
+    def _set_dimension(dimension,axis,pixels):
+        """Keep Hidden; Excel widths use font characters, while our UI uses px."""
+        hidden=bool(dimension.Hidden);previous=None;attribute='ColumnWidth' if axis=='columns' else 'RowHeight';target=float(pixels)*.75
+        try:
+            if hidden:dimension.Hidden=False
+            previous=float(getattr(dimension,attribute))
+            if axis=='rows':
+                if not 0<target<=409.5:raise UserError('Wysokość wiersza przekracza zakres Excela.')
+                dimension.RowHeight=target
+                if float(dimension.RowHeight)<=0 or abs(float(dimension.RowHeight)-target)>.8:raise UserError('Excel nie zachował wysokości wiersza.')
+            else:
+                low,high=.01,255.;actual=float(dimension.Width)
+                candidate=min(high,max(low,previous*target/actual if actual>0 else 8.43))
+                for _ in range(14):
+                    dimension.ColumnWidth=candidate;actual=float(dimension.Width)
+                    if actual>0 and abs(actual-target)<=.8:break  # Excel rounds to physical pixel boundaries.
+                    if actual<target:low=candidate
+                    else:high=candidate
+                    candidate=(low+high)/2
+                else:raise UserError('Szerokość kolumny nie mieści się w zakresie Excela dla czcionki skoroszytu.')
+        except Exception:
+            if previous is not None:setattr(dimension,attribute,previous)
+            raise
+        finally:dimension.Hidden=hidden
+    def apply_layout(self,layout):
+        self.layout_applied=0;self.layout_touched=0;targets=[]
+        for item in excel_session_layout(layout):
+            sheet=self.find_sheet(item)
+            for axis in ('columns','rows'):
+                entries=item.get(axis,[])
+                if entries and sheet.ProtectContents and not getattr(sheet.Protection,'AllowFormattingColumns' if axis=='columns' else 'AllowFormattingRows'):
+                    raise UserError('Arkusz „'+item['sheet']+'” nie pozwala zmieniać wymiarów.')
+                collection=sheet.Columns if axis=='columns' else sheet.Rows
+                for entry in entries:
+                    dimension=collection.get('Item',entry['index']);bool(dimension.Hidden)
+                    targets.append((sheet,item,dimension,axis,entry['width' if axis=='columns' else 'height']))
+        for sheet,item,dimension,axis,pixels in targets:
+            if not self.same_com(sheet,self.find_sheet(item)):raise UserError('Arkusz zmienił się podczas przenoszenia wymiarów. Sprawdź częściowy wynik.')
+            self.layout_touched+=1;self.revision+=1
+            self._set_dimension(dimension,axis,pixels);self.layout_applied+=1
     def macro_name(self,action):
-        name=str(action or '');book_name=str(self.book.Name)
-        for prefix in ("'"+book_name.replace("'","''")+"'!",book_name+'!'):
-            if name.startswith(prefix):name=name[len(prefix):];break
-        return name if re.fullmatch(r'[^\W\d]\w*(?:\.[^\W\d]\w*)?',name) else ''
+        # OnAction may quote apostrophes or use the bound workbook's full path.
+        # Always requalify the accepted procedure against this workbook only.
+        name=str(action or '').strip()
+        match=re.fullmatch(r"(?:(?:'((?:[^']|'')+)'|([^'!]+))!)?([^\W\d]\w*(?:\.[^\W\d]\w*)?)",name)
+        if not match:return ''
+        qualifier=match[1].replace("''","'") if match[1] is not None else match[2]
+        if qualifier is not None:
+            allowed={str(self.book.Name).casefold()}
+            with contextlib.suppress(Exception):allowed.add(str(self.book.FullName).replace('/','\\').casefold())
+            if qualifier.replace('/','\\').casefold() not in allowed:return ''
+        return match[3]
+    def qualified_macro(self,name):return "'"+str(self.book.Name).replace("'","''")+"'!"+name
+    def error_fields(self,exc,operation='',macro_name='',context=None):
+        diagnostics=dict(context or {})
+        if self.working_copy:diagnostics.update(working_copy=self.working_copy,open_events_enabled=self.open_events_enabled)
+        # A rejected call must not trigger more Office calls (or another wait).
+        if not re.search(r'0x800AC472|0x8001010A|0x80010001',excel_worker_error_text(exc),re.IGNORECASE):
+            with contextlib.suppress(Exception):diagnostics['protected_view']=bool(self.excel.ProtectedViewWindows.Count)
+            if macro_name and self.book is not None:
+                with contextlib.suppress(Exception):diagnostics['has_vba_project']=bool(self.book.HasVBProject)
+        return excel_worker_error_fields(exc,operation,macro_name,diagnostics)
     @staticmethod
     def control_state(shape):
         visible=int(shape.Visible)==-1;enabled=True;kind=int(shape.Type)
@@ -4718,8 +4838,10 @@ class ExcelSessionWorker:
             macro=self.macro_name(action);availability=self.control_state(shape)
             self.control_refs[identity]={'shape':shape,'name':name,'action':action,'type':kind,'sheet_id':sid}
             reason=('ActiveX events require the real Excel control; its Object is not invoked by the bridge.' if kind==12 else 'Application.Run does not emulate a click or Application.Caller.')
+            if kind!=12 and not macro:reason='Przypisanie makra jest puste, wskazuje inny skoroszyt albo zawiera argumenty. Użyj przycisku w oknie Excela.'
             result.append(dict(id=identity,name=name,type=kind,on_action=action,caption=caption,native_only=True,unsupported_reason=reason,
                                macro_supported=bool(kind!=12 and macro and availability['visible'] and availability['enabled']),macro_name=macro,
+                               macro_qualified_name=self.qualified_macro(macro) if macro else '',caller_emulated=False,
                                top=float(shape.Top),left=float(shape.Left),width=float(shape.Width),height=float(shape.Height),
                                anchor_row=int(shape.TopLeftCell.Row),anchor_column=int(shape.TopLeftCell.Column),**availability))
         return result
@@ -4771,55 +4893,67 @@ class ExcelSessionWorker:
         if self.book is not None:
             for sheet in itertools.islice(self.book.Worksheets,500):sheets.append({'id':self.sheet_id(sheet),'name':str(sheet.Name),'visible':int(sheet.Visible)})
         return {'active_sheet':active_sheet,'workbook_name':workbook_name,'workbook_id':self.workbook_id,'sheets':sheets,
-                'sheets_complete':self.book is not None and int(self.book.Worksheets.Count)<=500,'revision':self.revision,'applied':self.applied}
+                'sheets_complete':self.book is not None and int(self.book.Worksheets.Count)<=500,'revision':self.revision,'applied':self.applied,
+                'layout_applied':self.layout_applied,'layout_touched':self.layout_touched,'handoff_incomplete':self.handoff_incomplete}
     def open_workbook(self,request):
         # Invoke (without type information) needs VT_ERROR/DISP_E_PARAMNOTFOUND;
         # pythoncom.Missing is reserved for the generated InvokeTypes wrappers.
-        context=request.get('context',{});missing=self.pythoncom.ArgNotFound
+        context=request.get('context',{});missing=self.pythoncom.ArgNotFound;self.working_copy=request['path'];self.open_events_enabled=bool(request.get('run_open_events',False))
         self.excel.AutomationSecurity=2  # msoAutomationSecurityByUI: respect Office/user policy.
-        self.excel.EnableEvents=bool(request.get('run_open_events',False));self.excel.DisplayAlerts=True;self.excel.Visible=True
+        self.excel.EnableEvents=bool(request.get('run_open_events',False));self.excel.DisplayAlerts=True;self.excel.Visible=False
         self.book=self.excel.Workbooks.call('Open',request['path'],0,False,missing,missing,missing,True,missing,missing,False,False,missing,False)
         if self.book is None:raise UserError('Excel did not open the working copy. Check the Excel window.')
-        if request.get('run_open_events'):self.book.call('RunAutoMacros',1)
-        self.excel.EnableEvents=True;initial_error=None
+        initial_error=None
+        if request.get('run_open_events'):
+            try:self.book.call('RunAutoMacros',1)
+            except Exception as exc:initial_error=self.error_fields(exc,'run_macro',self.qualified_macro('Auto_Open'))
+        self.excel.EnableEvents=True
         try:
+            if context.get('layout'):self.apply_layout(context['layout'])
             if context.get('edits'):self.apply_edits(context['edits'])
-        except Exception as exc:initial_error=excel_worker_error_text(exc)
-        if context.get('sheet'):self.find_sheet(context).call('Activate')
+        except Exception as exc:self.handoff_incomplete=True;initial_error=self.error_fields(exc,'open')
+        # Selecting the mirrored viewport does not activate a native window.
+        # Do not re-hide Excel afterward: the user may reveal a waiting dialog.
         result=self.session_info()
         try:result['snapshot']=self.read_range(context)
         except Exception as exc:result['snapshot_warning']=excel_worker_error_text(exc)
-        if initial_error:self.send('error',id=request.get('id'),operation='open',result=result,message=initial_error,applied=self.applied,retry_safe=False)
+        if initial_error:self.send('error',id=request.get('id'),operation='open',result=result,applied=self.applied,layout_applied=self.layout_applied,layout_touched=self.layout_touched,retry_safe=False,**initial_error)
         else:self.send('ready',id=request.get('id'),result=result)
         return result
     def handle_command(self,command):
         if command.get('session_id')!=self.session_id:raise UserError('Wrong session identity.')
         if command.get('action')=='close':return False
-        action=command.get('action');identity=command.get('id');self.applied=0
+        action=command.get('action');identity=command.get('id');self.applied=0;macro='';invocation={}
         self.send('busy',id=identity,operation=action)
         try:
             self.excel.AutomationSecurity=2;self.bound_book()
             if command.get('workbook_id')!=self.workbook_id:raise UserError('Wrong workbook identity.')
+            if self.handoff_incomplete and action in ('run_macro','run_control_macro','apply_edits'):raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
             extra={}
             if action=='run_macro':
                 name=command.get('name','')
                 if not isinstance(name,str) or not re.fullmatch(r'[^\W\d]\w*(?:\.[^\W\d]\w*)?',name):raise UserError('Use a macro name or Module.Macro without workbook qualifiers or arguments.')
-                self.book.call('Activate');self.excel.call('Run',"'"+str(self.book.Name).replace("'","''")+"'!"+name);self.revision+=1
+                macro=self.qualified_macro(name);invocation={'method':'Application.Run','caller_emulated':False};self.book.call('Activate');self.excel.call('Run',macro);self.revision+=1
             elif action=='read_range':extra['snapshot']=self.read_range(command)
             elif action=='list_sheets':pass
             elif action=='apply_edits':self.apply_edits(command.get('edits'))
             elif action=='activate_sheet':
                 sheet=self.find_sheet(command);self.book.call('Activate');sheet.call('Activate');extra['snapshot']=self.read_range(command)
+            elif action=='show_excel':
+                self.excel.Visible=True;self.book.call('Activate')
+                if command.get('sheet_id') or command.get('sheet'):self.find_sheet(command).call('Activate')
+                extra.update(native_only=True,reveal_hwnd=int(self.excel.ActiveWindow.Hwnd))
             elif action=='reveal_control':
                 sheet=self.find_sheet(command);shape=self.find_control(command,sheet)
                 if not self.control_state(shape)['visible']:raise UserError('This control is hidden in Excel. The bridge does not unhide it.')
-                self.book.call('Activate');sheet.call('Activate');self.excel.Visible=True;self.excel.call('Goto',shape.TopLeftCell,True)
+                self.excel.Visible=True;self.book.call('Activate');sheet.call('Activate');self.excel.call('Goto',shape.TopLeftCell,True)
                 with contextlib.suppress(Exception):shape.call('Select')
                 extra.update(native_only=True,reveal_hwnd=int(self.excel.ActiveWindow.Hwnd))
             elif action=='run_control_macro':
-                sheet=self.find_sheet(command);shape=self.find_control(command,sheet);name=self.macro_name(shape.OnAction);availability=self.control_state(shape)
+                sheet=self.find_sheet(command);shape=self.find_control(command,sheet);name=self.macro_name(shape.OnAction);availability=self.control_state(shape);macro=self.qualified_macro(name) if name else str(shape.OnAction)
+                invocation={'method':'Application.Run','on_action':str(shape.OnAction),'control_name':str(shape.Name),'control_type':int(shape.Type),'sheet':str(sheet.Name),'caller_emulated':False}
                 if int(shape.Type)==12 or not name or not availability['visible'] or not availability['enabled']:raise UserError('Use the real Excel control. Hidden, disabled or unverified controls are not invoked; Application.Caller and ActiveX events are not emulated.')
-                self.book.call('Activate');sheet.call('Activate');self.excel.call('Run',"'"+str(self.book.Name).replace("'","''")+"'!"+name);self.revision+=1;extra['caller_emulated']=False
+                self.book.call('Activate');sheet.call('Activate');self.excel.call('Run',macro);self.revision+=1;extra['caller_emulated']=False
             elif action=='export_pdf':
                 sheet=self.excel.ActiveSheet
                 if sheet is None:raise UserError('No active sheet to export.')
@@ -4830,7 +4964,7 @@ class ExcelSessionWorker:
             result=self.session_info();result.update(extra);self.send('done',id=identity,operation=action,result=result)
         except Exception as exc:
             with contextlib.suppress(Exception):self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
-            self.send('error',id=identity,operation=action,applied=self.applied,retry_safe=False,message=excel_worker_error_text(exc))
+            self.send('error',id=identity,operation=action,applied=self.applied,retry_safe=False,**self.error_fields(exc,action,macro,invocation))
         return True
     def close(self):
         if self.owned_excel and self.excel is not None:
@@ -4862,7 +4996,7 @@ class ExcelSessionWorker:
                 if command is None or not self.handle_command(command):break
             return 0
         except Exception as exc:
-            fields={'message':excel_worker_error_text(exc)}
+            fields=self.error_fields(exc,'open')
             if isinstance(exc,DependencyError):fields['dependency']=exc.dependency
             with contextlib.suppress(Exception):self.send('fatal',**fields)
             return 1
@@ -4889,7 +5023,7 @@ def excel_session_worker_main(stdin=None,stdout=None):
         running=True
         return worker.run(stdin,request=request)
     except Exception as exc:
-        fields={'message':excel_worker_error_text(exc)}
+        fields=excel_worker_error_fields(exc,'open')
         if isinstance(exc,DependencyError):fields['dependency']=exc.dependency
         with contextlib.suppress(Exception):worker.send('fatal',**fields)
         return 1
@@ -4916,7 +5050,8 @@ class ExcelSessionController:
         self.original=Path(os.path.abspath(os.path.expanduser(str(source_path))));self.root=Path(os.path.abspath(os.path.expanduser(str(root))));self.on_event=on_event
         self.session_id=uid();self.lock=threading.RLock();self.write_lock=threading.Lock();self.cancelled=threading.Event();self.finished=threading.Event()
         self.process=None;self.owned_process=None;self.thread=None;self.reaper=None;self.dispatcher=None;self.previous=set();self.pending=None;self.temp_root=None;self.staged=None;self._copy_cancel=None
-        self.state={'session_id':self.session_id,'workbook_id':self.session_id+'-book','state':'new','job_id':'','operation':'','original_path':str(self.original),'source_path':str(self.original),'staged_path':'','working_copy':'','temp_root':'','workspace_path':'','last_saved_path':'','pid':0,'hwnd':0,'owned':False,'alive':False,'active_sheet':'','last_result':{},'last_operation':'','error':'','error_operation':'','events':[],'cancelled':False,'finished':False}
+        self.state={'session_id':self.session_id,'workbook_id':self.session_id+'-book','state':'new','job_id':'','operation':'','original_path':str(self.original),'source_path':str(self.original),'staged_path':'','working_copy':'','temp_root':'','workspace_path':'','last_saved_path':'','pid':0,'hwnd':0,'owned':False,'alive':False,'active_sheet':'','last_result':{},'last_operation':'','error':'','error_operation':'','events':[],'cancelled':False,'finished':False,'handoff_incomplete':False}
+        self.state.update(error_details='',error_code='',macro_name='')
     def _event(self,event,**fields):
         with self.lock:
             if isinstance(fields.get('result'),dict) and 'snapshot' in fields['result']:
@@ -4934,9 +5069,10 @@ class ExcelSessionController:
         if type(run_open_events) is not bool:raise UserError('Nieprawidłowa opcja makr otwarcia.')
         context=clone(context or {})
         if not isinstance(context,dict):raise UserError('Nieprawidłowy kontekst skoroszytu.')
-        context={key:context[key] for key in ('source_revision','edits','sheet','companion_paths') if key in context}
+        context={key:context[key] for key in ('source_revision','edits','layout','sheet','companion_paths') if key in context}
         context['edits']=excel_session_edits(context.get('edits',[]))
-        if context['edits'] and run_open_events:raise UserError('Najpierw otwórz skoroszyt bez makr otwarcia i przenieś zmiany. Potem uruchom wybrane makro.')
+        context['layout']=excel_session_layout(context.get('layout',[]))
+        if (context['edits'] or context['layout']) and run_open_events:raise UserError('Najpierw otwórz skoroszyt bez makr otwarcia i przenieś zmiany. Potem uruchom wybrane makro.')
         revision=context.get('source_revision','')
         if revision and (not isinstance(revision,str) or not re.fullmatch('[0-9a-fA-F]{64}',revision)):raise UserError('Nieprawidłowy skrót źródłowego skoroszytu.')
         if context.get('sheet') and (not isinstance(context['sheet'],str) or len(context['sheet'])>31):raise UserError('Nieprawidłowy arkusz początkowy.')
@@ -4956,6 +5092,13 @@ class ExcelSessionController:
             if process is None or process.poll() is not None:raise UserError('Proces sesji Excel nie działa.')
             if self.cancelled.is_set() and document.get('action') not in ('close','attach','open'):raise Cancelled('Sesja została zamknięta.')
             process.stdin.write(serialized);process.stdin.flush()
+    def reveal_window(self):
+        """Explicit UI rescue also works while Excel is blocked inside COM."""
+        with self.lock:
+            owned=self.owned_process
+            hwnd=self.state.get('hwnd',0)
+        if self.cancelled.is_set() or not owned or not owned.alive():raise UserError('Okno własnej sesji Excel nie jest jeszcze dostępne.')
+        return excel_session_foreground(owned,hwnd,self.cancelled)
     def _run(self,run_open_events,context):
         try:
             available=excel_availability()
@@ -5041,22 +5184,23 @@ class ExcelSessionController:
             self._send({'action':'close' if self.cancelled.is_set() else 'attach'});return
         if event=='fatal':
             message=str(value.get('message','Nie ukończono otwierania sesji Excel.'))[:1800]
+            details=str(value.get('details',''))[:16384];code=str(value.get('code',''))[:100];macro_name=str(value.get('macro_name',''))[:1000]
             with self.lock:
-                self.state.update(state='error',error=excel_session_error_text(message),error_operation='open',job_id='')
+                self.state.update(state='error',error=excel_session_error_text(message),error_operation='open',error_details=details,error_code=code,macro_name=macro_name,job_id='')
                 issue=value.get('dependency')
                 if isinstance(issue,dict) and issue.get('profile')=='excel' and issue.get('state') in ('missing','broken'):
                     self.state['dependency']=dependency_problem('excel',issue['state'],issue.get('details',''))
-            self._event('error',message=message);return
+            self._event('error',operation='open',message=message,details=details,code=code,macro_name=macro_name);return
         if event=='closed':return
         with self.lock:
             if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
             pending=self.pending if event=='done' else None
             owned=self.owned_process;operation=self.state.get('operation')
-        if event=='done' and operation=='reveal_control' and value.get('operation')=='reveal_control':
+        if event=='done' and operation in ('reveal_control','show_excel') and value.get('operation')==operation:
             result=value.get('result') or {};value['result']=result
             try:result['foreground']=excel_session_foreground(owned,result.get('reveal_hwnd'),self.cancelled)
             except Exception:result['foreground']=False
-            if not result['foreground']:value['message']='Kontrolka jest wskazana w Excelu. Wybierz okno Excela na pasku zadań, jeśli Windows nie przeniósł go na pierwszy plan.'
+            if not result['foreground']:value['message']='Wybrano okno sesji Excel. Wybierz je na pasku zadań, jeśli Windows nie przeniósł go na pierwszy plan.'
         if pending:
             try:result=self._publish(pending);value['result']=dict(value.get('result') or {},**result)
             except Exception as exc:event='error';value['message']=safe_error(exc)
@@ -5065,20 +5209,22 @@ class ExcelSessionController:
             if event=='busy':self.state['state']='busy'
             elif event in ('ready','done','error'):
                 self._remove_pending();self.state['last_operation']=str(value.get('operation') or operation or 'open')
+                if isinstance(value.get('result'),dict) and value['result'].get('handoff_incomplete') is True:self.state['handoff_incomplete']=True
                 if event=='error':
-                    self.state.update(error=excel_session_error_text(value.get('message','Błąd Excel.'))[:1800],error_operation=str(value.get('operation') or operation or 'open'),applied=value.get('applied',0))
+                    self.state.update(error=excel_session_error_text(value.get('message','Błąd Excel.'))[:1800],error_operation=str(value.get('operation') or operation or 'open'),error_details=str(value.get('details',''))[:16384],error_code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],applied=value.get('applied',0))
                     if value.get('result'):self.state.update(last_result=clone(value['result']),active_sheet=str(value['result'].get('active_sheet','')))
                 else:
-                    result=value.get('result') or {};self.state.update(error='',error_operation='',last_result=clone(result),active_sheet=str(result.get('active_sheet','')))
+                    result=value.get('result') or {};self.state.update(error='',error_operation='',error_details='',error_code='',macro_name='',last_result=clone(result),active_sheet=str(result.get('active_sheet','')))
                     if result.get('saved_path'):self.state['last_saved_path']=result['saved_path']
                 self.state.update(state='ready',job_id='',operation='')
-        self._event(event,operation=value.get('operation','open'),message=value.get('message',''),result=value.get('result',{}),applied=value.get('applied',0),retry_safe=False)
+        self._event(event,operation=value.get('operation','open'),message=value.get('message',''),details=str(value.get('details',''))[:16384],code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],result=value.get('result',{}),applied=value.get('applied',0),retry_safe=False)
     def submit(self,action,args=None):
         args=args or {}
         if not isinstance(args,dict):raise UserError('Nieprawidłowe parametry sesji Excel.')
         with self.lock:
             if self.state['state']!='ready' or self.cancelled.is_set() or not self.owned_process or not self.owned_process.alive():raise UserError('Poczekaj na gotową, własną sesję Excel.')
-            if action not in ('run_macro','export_pdf','save_copy','save_working','read_range','list_sheets','apply_edits','activate_sheet','reveal_control','run_control_macro'):raise UserError('Nieobsługiwana akcja sesji Excel.')
+            if action not in ('run_macro','export_pdf','save_copy','save_working','read_range','list_sheets','apply_edits','activate_sheet','reveal_control','run_control_macro','show_excel'):raise UserError('Nieobsługiwana akcja sesji Excel.')
+            if self.state.get('handoff_incomplete') and action in ('run_macro','run_control_macro','apply_edits'):raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
             workbook_id=self.state['workbook_id']
             if args.get('workbook_id',workbook_id)!=workbook_id:raise UserError('Polecenie dotyczy innego skoroszytu.')
             jid=uid();command={'action':action,'id':jid,'workbook_id':workbook_id}
@@ -5091,7 +5237,7 @@ class ExcelSessionController:
                 if not isinstance(raw,str) or not raw or '\0' in raw:raise UserError('Wybierz docelowy plik.')
                 command['destination']=raw
             elif action=='apply_edits':command['edits']=excel_session_edits(args.get('edits',[]))
-            elif action in ('read_range','activate_sheet','reveal_control','run_control_macro'):
+            elif action in ('read_range','activate_sheet','reveal_control','run_control_macro','show_excel'):
                 for key in ('sheet_id','sheet','control_id'):
                     if key in args:
                         if not isinstance(args[key],str) or not args[key] or len(args[key])>200:raise UserError('Nieprawidłowa tożsamość arkusza lub kontrolki.')
@@ -5103,7 +5249,7 @@ class ExcelSessionController:
                     if type(value) is not int or not 1<=value<=maximum:raise UserError('Nieprawidłowy zakres podglądu Excel.')
                     command[key]=value
                 if command['top']+command['rows']-1>1048576 or command['left']+command['cols']-1>16384:raise UserError('Podgląd wychodzi poza arkusz Excel.')
-            self.state.update(state='busy',job_id=jid,operation=action,error='',error_operation='')
+            self.state.update(state='busy',job_id=jid,operation=action,error='',error_operation='',error_details='',error_code='',macro_name='')
             self.dispatcher=threading.Thread(target=self._dispatch,args=(command,),name='pivot-excel-request',daemon=False);self.dispatcher.start()
         self._event('submitted',operation=action,id=jid);return jid
     def _dispatch(self,command):
@@ -5263,11 +5409,18 @@ def sheet_excel_handoff(book,path=None):
     local_sheets=book['sheets'];source_sheets=original['sheets']
     if book.get('date1904',False)!=original.get('date1904',False) or [s['name'] for s in local_sheets]!=[s['name'] for s in source_sheets]:
         raise UserError('Zmieniono strukturę skoroszytu lokalnie. Przenoszenie obejmuje wartości i formuły; zmianę arkuszy wykonaj w sesji Excel.')
-    edits=[]
+    edits=[];layout=[]
     for local,source in zip(local_sheets,source_sheets):
-        for key,default in (('merges',[]),('columns',{}),('rows',{}),('hidden',False),('hidden_rows',[]),('hidden_columns',[]),('freeze',[0,0]),('filter',''),('default_row_height',None),('default_column_width',None),('controls',[])):
+        for key,default in (('merges',[]),('hidden',False),('hidden_rows',[]),('hidden_columns',[]),('freeze',[0,0]),('filter',''),('default_row_height',None),('default_column_width',None),('controls',[])):
             if local.get(key,default)!=source.get(key,default):
-                raise UserError('Zmieniono układ arkusza „'+local['name']+'”. Przenoszenie obejmuje wartości i formuły; układ zmień w sesji Excel.')
+                raise UserError('Zmieniono układ arkusza „'+local['name']+'”. Przenoszenie obejmuje wartości, formuły oraz szerokości kolumn i wysokości wierszy; pozostały układ zmień w sesji Excel.')
+        dimensions={'sheet':local['name'],'columns':[],'rows':[]}
+        for axis,field,default_key,fallback in (('columns','width','default_column_width',112),('rows','height','default_row_height',27)):
+            before=source.get(axis,{});after=local.get(axis,{})
+            for key in sorted(set(before)|set(after),key=int):
+                old=before.get(key,source.get(default_key,fallback));new=after.get(key,local.get(default_key,fallback))
+                if abs(float(old)-float(new))>=.5:dimensions[axis].append({'index':int(key)+1,field:new})
+        if dimensions['columns'] or dimensions['rows']:layout.append(dimensions)
         for address in sorted(set(local['cells'])|set(source['cells']),key=sheet_position):
             before=source['cells'].get(address) or {};after=local['cells'].get(address) or {}
             local_style=dict(book['styles'][after.get('s',0)],**after.get('format',{}))
@@ -5279,7 +5432,7 @@ def sheet_excel_handoff(book,path=None):
             if content['kind']=='error':raise UserError('Nie można przenieść lokalnego błędu jako wartości '+local['name']+'!'+address+'. Popraw komórkę albo użyj Excela.')
             edits.append(dict(content,sheet=local['name'],address=address,expected=previous))
             if len(edits)>1000:raise UserError('Sesja Excel przyjmuje do 1000 zmienionych komórek na otwarcie. Większą zmianę wykonaj bezpośrednio w Excelu.')
-    return {'book_id':book['id'],'source_path':str(path),'source_revision':revision,'edits':edits}
+    return {'book_id':book['id'],'source_path':str(path),'source_revision':revision,'edits':edits,'layout':excel_session_layout(layout)}
 
 
 def worker_main():
@@ -7992,20 +8145,47 @@ class SheetSession:
     def __init__(self, book, changed=None):
         self.book=book;self.changed=changed or (lambda:None);self.calculator=SheetCalculator(book)
         self.last_change=SheetChange();self.structure_epoch=0
-        self.history=[];self.position=0;self.history_bytes=0;self.available_bytes=lambda:SHEET_MAX_BYTES
+        self.history=[];self.position=0;self.history_bytes=0;self.available_bytes=lambda:SHEET_MAX_BYTES;self._dimension_stamp=None
     def notify(self, change=None):
         self.last_change=change or SheetChange()
         if self.last_change.kind=='book':self.structure_epoch+=1
-        self.book['revision']=self.book.get('revision',0)+1;self.calculator.invalidate();self.changed()
-    def record(self,command):
+        previous=self.book.get('revision',0);cache=self.book.get('formula_cache',{})
+        preserve=self.last_change.kind=='dimensions' and cache.get('revision')==previous and bool(cache.get('source_revision')) and cache.get('source_revision')==self.book.get('source_revision')
+        self.book['revision']=previous+1
+        if self.last_change.kind=='dimensions':
+            if preserve:cache['revision']=self.book['revision']
+            if self.calculator.revision!=previous:self.calculator.invalidate()
+            self.calculator.revision=self.book['revision']
+        else:self.calculator.invalidate()
+        self.changed()
+    def record(self,command,coalesce=False):
         import zlib
+        now=time.monotonic();previous=self.history[-1] if self.history and self.position==len(self.history) else None
+        if (coalesce and command['type']=='dimensions' and previous and previous['type']=='dimensions' and self._dimension_stamp is not None
+                and now-self._dimension_stamp<.5 and all(previous[key]==command[key] for key in ('sid','axis','index'))):
+            self.history_bytes-=previous['_bytes'];previous['after']=command['after'];previous.pop('_bytes')
+            previous['_bytes']=len(dumps(previous).encode('utf-8'));self.history_bytes+=previous['_bytes'];self._dimension_stamp=now
+            self.notify(SheetChange('dimensions',command['sid'],(command['axis']+':'+str(command['index']),)));return
+        self._dimension_stamp=now if coalesce and command['type']=='dimensions' else None
         command['_bytes']=len(dumps(command).encode('utf-8'))
         self.history=self.history[:self.position];self.history.append(command)
         self.history_bytes=sum(x['_bytes'] for x in self.history)
         while len(self.history)>60 or self.history_bytes>24*1024*1024:
             removed=self.history.pop(0);self.history_bytes-=removed['_bytes']
         self.position=len(self.history)
-        self.notify(SheetChange('cells',command['sid'],tuple(command['after'])) if command['type']=='cells' else SheetChange())
+        self.notify(SheetChange('cells',command['sid'],tuple(command['after'])) if command['type']=='cells' else SheetChange('dimensions',command['sid'],(command['axis']+':'+str(command['index']),)) if command['type']=='dimensions' else SheetChange())
+    def set_dimension(self,sid,axis,index,size,coalesce=False):
+        if axis not in ('columns','rows') or type(index) is not int or not 0<=index<(SHEET_MAX_COLS if axis=='columns' else SHEET_MAX_ROWS):raise UserError('Nieprawidłowy wymiar arkusza.')
+        if size is not None and (type(size) not in (int,float) or not math.isfinite(size) or not 0<size<=(2000 if axis=='columns' else 1000)):raise UserError('Nieprawidłowy rozmiar kolumny lub wiersza.')
+        sheet=sheet_find(self.book,sid);key=str(index);old=sheet[axis].get(key)
+        fallback=sheet.get('default_column_width' if axis=='columns' else 'default_row_height',112 if axis=='columns' else 27)
+        if old==size or (old is None and size is not None and abs(size-fallback)<.5):return False
+        if old is None and len(dumps(self.book).encode('utf-8'))+128>min(SHEET_MAX_BYTES,self.available_bytes())-4096:raise UserError('Brak miejsca na zmianę wymiaru w projekcie.')
+        if size is None:sheet[axis].pop(key,None)
+        else:sheet[axis][key]=float(size)
+        self.record({'type':'dimensions','sid':sid,'axis':axis,'index':index,'before':old,'after':size,
+                     'label':'Szerokość kolumny' if axis=='columns' else 'Wysokość wiersza'},coalesce=coalesce)
+        return True
     def apply_cells(self,sid,changes,label='Edycja komórek'):
         sheet=sheet_find(self.book,sid)
         if len(changes)>SHEET_MAX_PATCH:raise UserError('Jedna operacja może zmienić najwyżej 100 000 komórek.')
@@ -8057,19 +8237,30 @@ class SheetSession:
             staged=clone(self.book);self._patch(sheet_find(staged,command['sid']),command[direction])
             if len(dumps(staged).encode('utf-8'))>self.available_bytes()-4096:raise UserError('Cofnięcie przekroczyłoby limit projektu.')
             self._patch(sheet_find(self.book,command['sid']),command[direction])
+        elif command['type']=='dimensions':
+            dimensions=sheet_find(self.book,command['sid'])[command['axis']];key=str(command['index']);value=command[direction]
+            if value is None:dimensions.pop(key,None)
+            else:dimensions[key]=value
         else:
             import zlib,base64
             raw=json.loads(zlib.decompress(base64.b64decode(command[direction])).decode('utf-8'))
             if len(dumps(raw).encode('utf-8'))>self.available_bytes()-4096:raise UserError('Przywrócenie przekroczyłoby limit projektu.')
             rev=self.book.get('revision',0);self.book.clear();self.book.update(raw);self.book['revision']=rev
-        self.notify(SheetChange('cells',command['sid'],tuple(command[direction])) if command['type']=='cells' else SheetChange())
+        self._dimension_stamp=None
+        self.notify(SheetChange('cells',command['sid'],tuple(command[direction])) if command['type']=='cells' else SheetChange('dimensions',command['sid'],(command['axis']+':'+str(command['index']),)) if command['type']=='dimensions' else SheetChange())
     def undo(self):
         if self.position:
-            self._restore(self.history[self.position-1],'before');self.position-=1;return True
+            self.position-=1
+            try:self._restore(self.history[self.position],'before')
+            except Exception:self.position+=1;raise
+            return True
         return False
     def redo(self):
         if self.position<len(self.history):
-            command=self.history[self.position];self._restore(command,'after');self.position+=1;return True
+            command=self.history[self.position];self.position+=1
+            try:self._restore(command,'after')
+            except Exception:self.position-=1;raise
+            return True
         return False
     def format_range(self,sid,rect,properties):
         if sheet_rect_count(rect)>SHEET_MAX_PATCH:raise UserError('Zaznacz mniejszy zakres do formatowania.')
@@ -10631,7 +10822,7 @@ def native_ui_types():
             return editor
 
     class ExcelStatusLine(QW.QLabel):
-        """One line of the latest message; the full text is in the tooltip and the options tab."""
+        """Compact notice; the complete error is persistently available in Messages."""
         clicked=QC.Signal()
         def __init__(self,parent=None):
             super().__init__(parent);self._full='';self.setObjectName('muted');self.setTextFormat(Qt.TextFormat.PlainText)
@@ -10654,6 +10845,7 @@ def native_ui_types():
             super().__init__(window);self._host_window=window;self._controller=None;self._snapshot={};self._epoch=0;self._disposed=False;self._closing=False;self._close_after_save=False
             self._scan_pending=False;self._action_pending=False;self._command_pending=False;self._sent_prompts={};self._retry_prompts=set();self._last_prompts=[];self._last_scan=0.;self._native_digest=None;self._event_seq=0;self._last_result_key=None
             self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
+            self._last_failure=None;self._last_failure_key=None;self._show_pending=False
             self._office_context=None;self._native_book_id='';self._native_controls=[];self._native_loading=False;self._last_view_refresh=0.;self._initial_control_pending=False;self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._companion_paths=[]
             self._tasks=AsyncTasks(self);self._timer=QC.QTimer(self);self._timer.setInterval(250);self._timer.timeout.connect(self.poll)
             self.setWindowTitle('Excel: makra i PDF');self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -10665,7 +10857,7 @@ def native_ui_types():
             self.native_controls=QW.QComboBox();self.native_controls.setPlaceholderText('Wybierz przycisk skoroszytu');control_row.addWidget(self.native_controls,1);outer.addWidget(self.control_bar)
             self.body_tabs=QW.QTabWidget();outer.addWidget(self.body_tabs,1);self._prompt_tab_key=None
             self.options_frame=QW.QWidget();options=QW.QVBoxLayout(self.options_frame);options.setContentsMargins(10,10,10,10)
-            options.addWidget(label('Uruchom sesję Excela, a potem wybierz przycisk skoroszytu i kliknij „Uruchom”. Excel pracuje na osobnej kopii pliku.',True,True))
+            options.addWidget(label('Uruchom sesję Excela, a potem wybierz przycisk skoroszytu i kliknij „Uruchom”. Excel pracuje w tle na osobnej kopii pliku. Jego okno otworzysz przyciskiem „Pokaż w Excelu”.',True,True))
             self.dependency_card=DependencyCard(window,self);options.addWidget(self.dependency_card)
             self.file=PathField(path,'Skoroszyty Excel (*.xlsx *.xlsm)');options.addWidget(self.file)
             self.open_events=QW.QCheckBox('Uruchom także makra otwarcia');self.open_events.setToolTip('Dotyczy tylko tej zewnętrznej sesji. Excel stosuje własne ustawienia zabezpieczeń makr.');options.addWidget(self.open_events)
@@ -10675,7 +10867,7 @@ def native_ui_types():
             session_options.addWidget(label('Makro po nazwie',False))
             row=QW.QHBoxLayout();self.macro_name=QW.QLineEdit();self.macro_name.setPlaceholderText('Nazwa makra, np. Moduł1.PrzygotujRaport');row.addWidget(self.macro_name,1)
             self.run_button=button('Uruchom makro',self.run_macro);row.addWidget(self.run_button);session_options.addLayout(row)
-            self.pdf_button=button('PDF arkusza…',self.export_pdf);self.pdf_button.setToolTip('Eksportuje arkusz aktywny w widocznym oknie Excela.')
+            self.pdf_button=button('PDF arkusza…',self.export_pdf);self.pdf_button.setToolTip('Eksportuje bieżący arkusz skoroszytu sesji Excel.')
             self.save_copy_button=button('Zapisz kopię…',self.save_copy);self.save_working_button=button('Zapisz stan sesji',lambda:self.submit('save_working',{}));self.open_workspace_button=button('Folder sesji',self.open_workspace)
             commands=QW.QGridLayout()
             for i,control in enumerate((self.pdf_button,self.save_working_button,self.save_copy_button,self.open_workspace_button)):commands.addWidget(control,i//2,i%2)
@@ -10689,20 +10881,31 @@ def native_ui_types():
             self.native_model=ExcelViewportModel(self);self.native_model.editRequested.connect(self.edit_native);self.native_table=QW.QTableView();self.native_table.setModel(self.native_model)
             self.native_table.setObjectName('excelLiveGrid');self.native_table.setStyleSheet('QTableView#excelLiveGrid { background: #ffffff; color: #000000; gridline-color: #cccccc; } QHeaderView::section { padding: 0px 5px; }');self.native_table.setItemDelegate(ExcelViewportDelegate(self.native_table))
             self.native_table.setMinimumHeight(150);self.native_table.horizontalHeader().setDefaultSectionSize(95);self.native_table.verticalHeader().setDefaultSectionSize(24);self.native_table.horizontalHeader().setMinimumSectionSize(1);self.native_table.verticalHeader().setMinimumSectionSize(1);native_layout.addWidget(self.native_table,1)
-            self.native_reveal=button('Pokaż w Excelu',self.reveal_control)
+            self.native_reveal=button('Pokaż w Excelu',self.show_excel)
             self.native_macro=button('Uruchom',self.run_control_macro,True)
             self.native_note=label('Dane i obliczenia pochodzą z tej sesji Excela. Edycja komórki jest wysyłana do otwartego skoroszytu.',True,True);native_layout.addWidget(self.native_note)
             self.native_macro.setToolTip('Uruchamia przypisane makro po nazwie. Kontrolki wymagające Application.Caller lub ActiveX kliknij w oknie Excela.')
             self.native_sheets.currentIndexChanged.connect(self.native_sheet_changed);self.native_controls.currentIndexChanged.connect(self.update_controls)
             self.native_scroll=QW.QScrollArea();self.native_scroll.setWidgetResizable(True);self.native_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.native_scroll.setWidget(self.native_frame);self.body_tabs.addTab(self.native_scroll,'Arkusz Excela');self.body_tabs.setTabVisible(0,False)
-            self.prompt_frame=QW.QGroupBox('Rzeczywiste komunikaty Excela');self.prompt_layout=QW.QVBoxLayout(self.prompt_frame)
+            self.prompt_frame=QW.QGroupBox('Komunikaty sesji Excel');self.prompt_layout=QW.QVBoxLayout(self.prompt_frame)
+            self.failure_frame=QW.QGroupBox('Ostatnia operacja nie powiodła się');failure_layout=QW.QVBoxLayout(self.failure_frame)
+            self.failure_text=QW.QPlainTextEdit();self.failure_text.setReadOnly(True);self.failure_text.setAccessibleName('Pełna treść ostatniego błędu sesji Excel')
+            self.failure_text.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.WidgetWidth);self.failure_text.setWordWrapMode(QG.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+            self.failure_text.setMinimumHeight(90);self.failure_text.setMaximumHeight(240);failure_layout.addWidget(self.failure_text,1)
+            failure_actions=QW.QGridLayout();self.failure_details=button('Szczegóły błędu…',self.show_error_details);self.failure_copy=button('Kopiuj szczegóły',self.copy_error_details)
+            failure_actions.addWidget(self.failure_details,0,0);failure_actions.addWidget(self.failure_copy,0,1);failure_layout.addLayout(failure_actions)
+            self.prompt_layout.addWidget(self.failure_frame);self.failure_frame.hide()
+            self.prompt_empty=label('',True,True);self.prompt_empty.setTextFormat(Qt.TextFormat.PlainText);self.prompt_layout.addWidget(self.prompt_empty)
+            self.native_prompt_host=QW.QWidget();self.native_prompt_layout=QW.QVBoxLayout(self.native_prompt_host);self.native_prompt_layout.setContentsMargins(0,0,0,0);self.prompt_layout.addWidget(self.native_prompt_host)
+            self.prompt_layout.addStretch()
             self.prompt_scroll=QW.QScrollArea();self.prompt_scroll.setWidgetResizable(True);self.prompt_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.prompt_scroll.setWidget(self.prompt_frame);self.body_tabs.addTab(self.prompt_scroll,'Komunikaty')
             self.history_toggle=QW.QToolButton();self.history_toggle.setText('Historia sesji');self.history_toggle.setCheckable(True);options.addWidget(self.history_toggle,0,Qt.AlignmentFlag.AlignLeft)
             self.history=QW.QPlainTextEdit();self.history.setReadOnly(True);self.history.setMaximumBlockCount(100);self.history.setMaximumHeight(110);self.history.hide();self.history_toggle.toggled.connect(self.history.setVisible);options.addWidget(self.history)
             self.stop_button=button('Przerwij sesję',self.stop_session);options.addWidget(self.stop_button,0,Qt.AlignmentFlag.AlignLeft);options.addStretch()
             self.options_scroll=QW.QScrollArea();self.options_scroll.setWidgetResizable(True);self.options_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.options_scroll.setWidget(self.options_frame);self.body_tabs.addTab(self.options_scroll,'Plik i opcje');self.body_tabs.setCurrentIndex(2)
             self.notice_button=ExcelStatusLine();self.notice_button.clicked.connect(self.show_message);outer.addWidget(self.notice_button)
-            row=QW.QHBoxLayout();self.open_button=button('Uruchom sesję Excela',self.start_session,True);row.addWidget(self.open_button);row.addWidget(self.native_macro);row.addWidget(self.native_reveal);row.addStretch();self.close_button=button('Zamknij',self.close);row.addWidget(self.close_button);outer.addLayout(row)
+            self.footer=QW.QWidget();self.footer_layout=QW.QGridLayout(self.footer);self.footer_layout.setContentsMargins(0,0,0,0)
+            self.open_button=button('Uruchom sesję Excela',self.start_session,True);self.close_button=button('Zamknij',self.close);outer.addWidget(self.footer);self._footer_compact=None
             # Only the footer and short status rows constrain the window. Each page can scroll.
             for area in (self.native_scroll,self.prompt_scroll,self.options_scroll):area.setMinimumSize(0,0);area.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Ignored)
             for combo in (self.native_sheets,self.native_controls):combo.setMinimumContentsLength(1);combo.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);combo.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed)
@@ -10739,7 +10942,45 @@ def native_ui_types():
                 self._screen_handle=handle;handle.screenChanged.connect(self._screen_changed);self._screen_changed(handle.screen())
             self.fit_to_screen();QC.QTimer.singleShot(0,self._work_area_changed)
         def show_message(self):
-            self.body_tabs.setCurrentIndex(2);self.options_scroll.ensureWidgetVisible(self.message)
+            self.body_tabs.setCurrentIndex(1)
+            self.prompt_scroll.ensureWidgetVisible(self.failure_frame if self._last_failure else self.prompt_empty)
+        def error_report(self):
+            failure=self._last_failure or {}
+            return '\n\n'.join(str(failure[key]) for key in ('message','details','code','operation') if failure.get(key))
+        def copy_error_details(self):QW.QApplication.clipboard().setText(self.error_report())
+        def show_error_details(self):
+            if not self._last_failure:return
+            dialog=FormDialog('Szczegóły błędu sesji Excel',self);text=QW.QPlainTextEdit();text.setReadOnly(True);text.setPlainText(self.error_report())
+            text.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.WidgetWidth);text.setWordWrapMode(QG.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere);dialog.add_widget(text)
+            dialog.add_widget(button('Kopiuj szczegóły',self.copy_error_details));limited_dialog_size(dialog,720,480);dialog.exec()
+        def remember_failure(self,message,details='',code='',operation=''):
+            message=str(message or 'Nie udało się wykonać operacji Excela.');details=str(details or '')
+            # Older workers can still expose raw COM tuples. Keep those in the
+            # diagnostic view; their representation is not an instruction for a user.
+            if re.match(r'^\(?-?\d{6,}\s*,',message):
+                details=details or message;message='Excel nie wykonał polecenia. Sprawdź komunikaty skoroszytu przyciskiem „Pokaż w Excelu”. Szczegóły błędu możesz otworzyć lub skopiować poniżej.'
+            value={'message':message,'details':details,'code':str(code or ''),'operation':str(operation or '')};key=digest(value)
+            if key==self._last_failure_key:return
+            self._last_failure_key=key;self._last_failure=value;self.failure_text.setPlainText(message);self.failure_frame.show()
+            self.body_tabs.setCurrentIndex(1);self.prompt_scroll.verticalScrollBar().setValue(0)
+        def clear_failure(self):
+            self._last_failure=None;self._last_failure_key=None;self.failure_text.clear();self.failure_frame.hide()
+        def reflow_footer(self):
+            if not hasattr(self,'footer_layout'):return
+            active=self.session_running();controls=[self.native_macro,self.native_reveal,self.close_button] if active else [self.open_button,self.close_button]
+            compact=sum(widget.sizeHint().width() for widget in controls)+self.footer_layout.spacing()*(len(controls)+1)>max(1,self.width()-24)
+            key=(active,compact)
+            if key==self._footer_compact:return
+            self._footer_compact=key
+            while self.footer_layout.count():self.footer_layout.takeAt(0)
+            for column in range(4):self.footer_layout.setColumnStretch(column,0)
+            for index,widget in enumerate(controls[:-1]):self.footer_layout.addWidget(widget,0,index)
+            if compact:self.footer_layout.addWidget(self.close_button,1,max(0,len(controls)-2),1,1,Qt.AlignmentFlag.AlignRight)
+            else:
+                self.footer_layout.setColumnStretch(len(controls)-1,1);self.footer_layout.addWidget(self.close_button,0,len(controls))
+            for widget in controls:widget.setAutoDefault(False)
+        def resizeEvent(self,event):
+            super().resizeEvent(event);self.reflow_footer()
         def session_running(self):
             return bool(self._controller and (self._snapshot.get('owned') or (not self._snapshot.get('finished') and self._snapshot.get('state')!='closed')))
         def choose_companions(self):
@@ -10753,25 +10994,27 @@ def native_ui_types():
             if self.session_running():raise UserError('Zamknij poprzednią sesję Excela przed otwarciem innego skoroszytu.')
             self._office_context=clone(context);self._launch_context=clone(context);self.file.edit.setText(str(context.get('source_path',self.file.text())))
             self.setWindowModality(Qt.WindowModality.WindowModal);self._initial_control_pending=bool(context.get('control'))
-            edits=context.get('edits',[])
-            if edits:self.open_events.setChecked(False);self.open_events.setToolTip('Najpierw przenosimy '+str(len(edits))+' jawnych edycji. Makra otwarcia nie mogą uruchomić się przed tym zapisem.')
-            self.message.setText(('Zmiany z arkusza Pivot do przeniesienia do kopii w Excelu: '+str(len(edits))+'. ' if edits else '')+'Kliknij „Uruchom sesję Excela” na dole okna.');self.update_controls()
+            edits=context.get('edits',[]);layout=context.get('layout',[])
+            if edits or layout:self.open_events.setChecked(False);self.open_events.setToolTip('Najpierw przenosimy zmiany komórek i układu. Makra otwarcia nie mogą uruchomić się przed tym zapisem.')
+            self.message.setText(('Zmiany z arkusza Pivot do przeniesienia do kopii w Excelu: '+str(len(edits))+' komórek'+(' oraz układ arkusza' if layout else '')+'. ' if edits or layout else '')+'Kliknij „Uruchom sesję Excela” na dole okna.');self.update_controls()
         def blocking_error(self):
-            # Only a partly transferred handoff blocks macros until the sheet is read again.
-            return bool(self._snapshot.get('error')) and self._snapshot.get('error_operation','open') in ('open','')
+            # A read/save cannot complete an interrupted handoff. Only a fresh
+            # session may enable writes after this persistent transfer failure.
+            return bool(self._snapshot.get('handoff_incomplete')) or (bool(self._snapshot.get('error')) and self._snapshot.get('error_operation','open') in ('open',''))
         def background_read_active(self):
             return bool(self._auto_read and (self._command_pending or self._snapshot.get('state')=='busy'))
         def update_controls(self,*_):
             state=self._snapshot.get('state','idle');active=self.session_running();ready=state=='ready' and self._snapshot.get('owned') and not self._closing and not self._command_pending
             # An automatic sheet read never disables explicit commands: they wait for it and run once.
             usable=bool(self._snapshot.get('owned') and not self._closing and self._queued is None and (ready or self.background_read_active()));blocked=self.blocking_error()
-            self.file.setEnabled(not active and not self._closing and not self._office_context);self.open_events.setEnabled(not active and not self._closing and not (self._office_context or {}).get('edits'))
+            self.file.setEnabled(not active and not self._closing and not self._office_context);self.open_events.setEnabled(not active and not self._closing and not ((self._office_context or {}).get('edits') or (self._office_context or {}).get('layout')))
             self.companion_button.setEnabled(not active and not self._closing)
             for widget in (self.file,self.open_button,self.open_events,self.companion_button,self.companion_note):widget.setVisible(not active)
             self.session_options.setVisible(active or bool(self._snapshot.get('workspace_path')));self.control_bar.setVisible(active);self.native_macro.setVisible(active);self.native_reveal.setVisible(active);self.stop_button.setVisible(active)
             target=(self._office_context or {}).get('control') or {};caption=str(target.get('caption') or target.get('name') or '')
             self.selected_note.setText('Wybrany przycisk: '+caption);self.selected_note.setToolTip(self.selected_note.text());self.selected_note.setVisible(bool(caption and not active))
-            self.state_note.setToolTip(self.state_note.text());self.notice_button.set_full_text(self.message.text());self.notice_button.setVisible(bool(self.message.text()) and self.body_tabs.currentWidget() is not self.options_scroll)
+            self.state_note.setToolTip(self.state_note.text());notice=(self._last_failure or {}).get('message') or self.message.text();self.notice_button.set_full_text(notice)
+            self.notice_button.setVisible(bool(notice) and self.body_tabs.currentWidget() is not self.prompt_scroll)
             self.open_button.setEnabled(bool(self._availability.get('available') and self.file.text().strip() and not active and not self._closing))
             self.macro_name.setEnabled(usable);self.run_button.setEnabled(bool(usable and self.macro_name.text().strip() and not blocked));self.pdf_button.setEnabled(usable);self.save_copy_button.setEnabled(usable)
             self.save_working_button.setEnabled(usable)
@@ -10779,15 +11022,23 @@ def native_ui_types():
             self.stop_button.setEnabled(bool(active and not self._closing));self.close_button.setEnabled(not self._closing)
             native_ready=bool(ready and self._native_book_id);native_usable=bool(usable and self._native_book_id);self.native_model.editable=native_ready and not blocked
             for widget in (self.native_sheets,self.native_top,self.native_left,self.native_refresh):widget.setEnabled(native_ready)
-            control=self.native_controls.currentData() or {};self.native_controls.setEnabled(native_usable);self.native_reveal.setEnabled(native_usable and bool(control))
+            control=self.native_controls.currentData() or {};self.native_controls.setEnabled(native_usable)
+            self.native_reveal.setEnabled(bool(self._snapshot.get('owned') and not self._closing and not self._show_pending))
+            self.native_reveal.setToolTip('Otwórz okno tej sesji Excela, aby zobaczyć skoroszyt lub odpowiedzieć na jego komunikat.')
             self.native_macro.setEnabled(native_usable and bool(control.get('macro_supported')) and not blocked)
             self.native_controls.setToolTip(self.native_controls.currentText());self.native_macro.setToolTip('Uruchom makro przycisku: '+self.native_controls.currentText()+'. Jeśli wymaga Application.Caller, kliknij przycisk bezpośrednio w Excelu.' if control.get('macro_supported') else 'Tę kontrolkę uruchom w oknie Excela. Kliknij „Pokaż w Excelu”.')
+            self.prompt_empty.setVisible(not self._last_prompts)
+            prompt_hint=('Sesja działa w tle. Tutaj pojawią się pytania i komunikaty Excela. Jeśli makro czeka na inne okno, kliknij „Pokaż w Excelu”.' if active else 'Uruchom sesję Excela. Tutaj pojawią się jej pytania i komunikaty.')
+            if self.message.text() and not self._last_failure:prompt_hint=self.message.text()+'\n\n'+prompt_hint
+            self.prompt_empty.setText(prompt_hint if not self._last_failure else 'Możesz ponowić polecenie po usunięciu przyczyny błędu. „Pokaż w Excelu” otwiera okno tej sesji.')
+            if self._snapshot.get('handoff_incomplete'):self.prompt_empty.setText('Nie przeniesiono wszystkich zmian z Pivot. Makra i edycja w tej sesji są zablokowane. Sprawdź stan kopii, zapisz ją w razie potrzeby i uruchom nową sesję. „Pokaż w Excelu” otwiera jej okno.')
+            self.reflow_footer()
         def start_session(self):
             if self._disposed or self._closing or not self._availability.get('available'):return
             if self.session_running():return
             path=self.file.text().strip()
             if not path or Path(path).suffix.lower() not in WORKBOOK_SUFFIXES:self.message.setText('Wybierz plik XLSM albo XLSX.');self.update_controls();return
-            self._epoch+=1;self._event_seq=0;self._last_result_key=None;self._last_scan=0;self._native_digest=None;self._scan_pending=False;self._action_pending=False;self._sent_prompts={};self._retry_prompts=set();self.history.clear();self.message.clear();self.render_prompts([])
+            self._epoch+=1;self._event_seq=0;self._last_result_key=None;self._last_scan=0;self._native_digest=None;self._scan_pending=False;self._action_pending=False;self._show_pending=False;self._sent_prompts={};self._retry_prompts=set();self.history.clear();self.message.clear();self.clear_failure();self.render_prompts([])
             self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
             try:
                 self._native_book_id='';self.body_tabs.setTabVisible(0,False);self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._native_loading=True
@@ -10798,9 +11049,11 @@ def native_ui_types():
             except Exception as exc:
                 if self._controller:
                     with contextlib.suppress(Exception):self._controller.cancel()
-                self._controller=None;self._snapshot={'state':'error','finished':True};self.state_note.setText('Nie otwarto sesji Excela.');self.message.setText(safe_error(exc));self.update_controls()
+                self._controller=None;self._snapshot={'state':'error','finished':True};self.state_note.setText('Nie otwarto sesji Excela.');self.message.setText(safe_error(exc));self.remember_failure(safe_error(exc),operation='open');self.update_controls()
         def submit(self,action,args,background=False):
             if self._disposed or self._closing or not self._controller:return False
+            if self._snapshot.get('handoff_incomplete') and action in ('run_macro','run_control_macro','apply_edits'):
+                self.message.setText(EXCEL_HANDOFF_INCOMPLETE_MESSAGE);self.show_message();self.update_controls();return False
             if self._command_pending or self._snapshot.get('state')!='ready':
                 if background or self._queued is not None or not self.background_read_active():return False
                 self._queued=(action,clone(args));self.message.setText('Kończę odczyt arkusza w Excelu, potem wykonam polecenie.');self.update_controls();return True
@@ -10819,7 +11072,7 @@ def native_ui_types():
                 if self._disposed or epoch!=self._epoch:return
                 self._command_pending=False
                 if background:self.poll();self.native_note.setText('Nie odświeżono podglądu: '+str(error));return
-                self._close_after_save=False;self.poll();self.message.setText(str(error))
+                self._close_after_save=False;self.poll();self.message.setText(str(error));self.remember_failure(str(error),operation=action);self.update_controls()
             self._tasks.submit(work,done,failed,'Polecenie Excela');return True
         def run_macro(self):
             name=self.macro_name.text().strip()
@@ -10839,6 +11092,27 @@ def native_ui_types():
         def reveal_control(self):
             control=self.native_controls.currentData() or {}
             if control:self.submit('reveal_control',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'control_id':control['id']})
+        def show_excel(self):
+            if self._disposed or self._closing or not self._controller or not self._snapshot.get('owned') or self._show_pending:return
+            if self._snapshot.get('state')=='ready' and not self._command_pending:
+                if self.native_controls.currentData():self.reveal_control()
+                else:
+                    args={'workbook_id':self._native_book_id or self._snapshot.get('workbook_id')}
+                    if self.native_sheets.currentData():args['sheet_id']=self.native_sheets.currentData()
+                    self.submit('show_excel',args)
+                return
+            # A modal COM call may be blocked. Showing our verified native HWND
+            # must not queue another COM command behind the question being answered.
+            self._show_pending=True;controller=self._controller;epoch=self._epoch;self.update_controls()
+            def done(foreground):
+                if self._disposed or epoch!=self._epoch:return
+                self._show_pending=False
+                if not foreground:self.message.setText('Okno sesji Excela jest dostępne na pasku zadań. Wybierz je, aby odpowiedzieć na komunikat.')
+                self.update_controls()
+            def failed(error):
+                if self._disposed or epoch!=self._epoch:return
+                self._show_pending=False;self.message.setText(str(error));self.remember_failure(str(error),operation='show_excel');self.update_controls()
+            self._tasks.submit(controller.reveal_window,done,failed,'Pokaż okno sesji Excel')
         def run_control_macro(self):
             control=self.native_controls.currentData() or {}
             if control.get('macro_supported') and not self.blocking_error():
@@ -10911,8 +11185,7 @@ def native_ui_types():
             finally:self._native_loading=False
             if self._initial_control_pending:
                 self._initial_control_pending=False
-                if matched:QC.QTimer.singleShot(0,self.reveal_control)
-                else:self.message.setText('Nie rozpoznano wskazanej kontrolki. Wybierz ją bezpośrednio w oknie Excela.')
+                if not matched:self.message.setText('Nie rozpoznano wskazanej kontrolki. Kliknij „Pokaż w Excelu”, aby wybrać ją w skoroszycie.')
         def export_pdf(self):
             if self._snapshot.get('state')!='ready' and not self.background_read_active():return
             name=Path(self.file.text()).stem+'.pdf';destination=QW.QFileDialog.getSaveFileName(self,'PDF bieżącego arkusza',name,'PDF (*.pdf)')[0]
@@ -10927,15 +11200,16 @@ def native_ui_types():
         def poll(self):
             if self._disposed or not self._controller:return
             try:snapshot=self._controller.poll()
-            except Exception as exc:self.message.setText(safe_error(exc));return
+            except Exception as exc:self.message.setText(safe_error(exc));self.remember_failure(safe_error(exc),operation='session');self.update_controls();return
             previous=self.session_identity();self._snapshot=snapshot;identity=self.session_identity();state=snapshot.get('state')
+            completed_background=self._auto_read;preparation_needed=False
             if snapshot.get('dependency') and self.dependency_card.issue!=snapshot['dependency']:
                 self._availability.update(available=False,dependency=clone(snapshot['dependency']))
-                self.dependency_card.set_issue(snapshot['dependency']);self.body_tabs.setCurrentWidget(self.options_scroll)
+                self.dependency_card.set_issue(snapshot['dependency']);preparation_needed=True
             if self._auto_read and state!='busy' and not self._command_pending:
                 # The automatic read has ended. Its failure is shown under the sheet, not as a command error.
                 self._auto_read=False;self._quiet_read_error=bool(snapshot.get('error')) and snapshot.get('error_operation')=='read_range'
-            names={'starting':'Otwieranie kopii w Excelu…','ready':'Excel gotowy.','busy':'Excel wykonuje zadanie…','closing':'Zamykanie własnej sesji Excela…','closed':'Sesja Excela zakończona.','error':'Nie udało się wykonać operacji Excela.'}
+            names={'starting':'Otwieranie kopii w Excelu…','ready':'Sesja Excela gotowa.','busy':'Excel wykonuje zadanie…','closing':'Zamykanie własnej sesji Excela…','closed':'Sesja Excela zakończona.','error':'Nie udało się wykonać operacji Excela.'}
             status='Excel gotowy · odświeżam podgląd arkusza…' if self.background_read_active() else names.get(state,str(state or ''))
             self.state_note.setText(status+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
             result=snapshot.get('last_result')
@@ -10944,9 +11218,10 @@ def native_ui_types():
             if result and state=='ready' and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);destination=result.get('destination') if isinstance(result,dict) else None
                 operation=(result.get('action') or snapshot.get('last_operation') or snapshot.get('operation') or '') if isinstance(result,dict) else ''
+                if operation and operation not in ('open','show_excel','reveal_control') and not completed_background and not snapshot.get('handoff_incomplete'):self.clear_failure()
                 if operation in ('save_working','save_copy') and isinstance(result,dict) and (result.get('saved_path') or destination):self.saved_copy_path=str(result.get('saved_path') or destination);self.saved_copy_revision=str(result.get('saved_revision',''))
                 if operation not in ('read_range','open'):
-                    done={'reveal_control':'Przycisk jest wskazany w Excelu. Kliknij „Uruchom” tutaj albo ten przycisk w Excelu.','run_control_macro':'Makro zakończyło działanie.','run_macro':'Makro zakończyło działanie.','apply_edits':'Zapisano zmianę komórki w Excelu.'}
+                    done={'show_excel':'Otwarto okno tej sesji Excela.','reveal_control':'Przycisk jest wskazany w Excelu. Kliknij „Uruchom” tutaj albo ten przycisk w Excelu.','run_control_macro':'Makro zakończyło działanie.','run_macro':'Makro zakończyło działanie.','apply_edits':'Zapisano zmianę komórki w Excelu.'}
                     text='Zapisano: '+str(destination) if destination else done.get(operation,'Operacja zakończona.')
                     if operation=='reveal_control' and result.get('foreground') is False:text+=' Jeśli okno Excela nie wyszło na wierzch, wybierz je na pasku zadań.'
                     self.message.setText(text)
@@ -10956,12 +11231,16 @@ def native_ui_types():
             if snapshot.get('error'):
                 # After the (previous) result is shown, so its default sheet note cannot hide this.
                 if self._quiet_read_error:self.native_note.setText('Nie odświeżono podglądu: '+str(snapshot['error']))
-                else:self.message.setText(str(snapshot['error']))
+                else:
+                    self.message.setText(str(snapshot['error']))
+                    self.remember_failure(snapshot['error'],snapshot.get('error_details',''),snapshot.get('error_code',''),snapshot.get('error_operation',''))
                 self._close_after_save=False
+            if state=='ready' and self._last_failure and not self.background_read_active():
+                self.state_note.setText('Sesja Excela gotowa · ostatnia operacja nie powiodła się.'+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
             if self._queued and state=='ready' and not self._command_pending and not self._closing:
                 action,args=self._queued;self._queued=None
                 if action=='run_control_macro' and not any(c.get('id')==args.get('control_id') for c in self._native_controls):self.message.setText('Przycisk zmienił się w Excelu podczas odczytu. Wybierz go ponownie i kliknij „Uruchom”.')
-                elif action in ('run_macro','run_control_macro') and self.blocking_error():self.message.setText(str(snapshot.get('error')))
+                elif action in ('run_macro','run_control_macro','apply_edits') and self.blocking_error():self.message.setText(EXCEL_HANDOFF_INCOMPLETE_MESSAGE if snapshot.get('handoff_incomplete') else str(snapshot.get('error')))
                 else:self.submit(action,args)
             elif self._queued and state not in ('ready','busy'):self._queued=None
             for event in snapshot.get('events',[]):
@@ -10976,6 +11255,7 @@ def native_ui_types():
             if retry-self._retry_prompts:self._retry_prompts|=retry;self.render_prompts(self._last_prompts)
             if identity and state not in ('closed','error') and not self._scan_pending and not self._action_pending and time.monotonic()-self._last_scan>=.75:self.scan_prompts(identity)
             elif not identity and self._native_digest is not None:self._native_digest=None;self.render_prompts([])
+            if preparation_needed:self.body_tabs.setCurrentWidget(self.options_scroll)
             self.update_controls()
             # Each read is hundreds of COM calls. Mirror Excel only while this view is looked at; never while Excel asks something.
             interval=10 if snapshot.get('error') else 3
@@ -10997,13 +11277,13 @@ def native_ui_types():
         def render_prompts(self,items):
             key=digest([(item.get('hwnd'),item.get('fingerprint')) for item in items]) if items else None
             if key and key!=self._prompt_tab_key:self.body_tabs.setCurrentIndex(1)
-            elif not key and self._prompt_tab_key and self._native_book_id and self.body_tabs.currentIndex()==1:self.body_tabs.setCurrentIndex(0)
+            elif not key and self._prompt_tab_key and self._native_book_id and not self._last_failure and self.body_tabs.currentIndex()==1:self.body_tabs.setCurrentIndex(0)
             self._prompt_tab_key=key
             self._last_prompts=clone(items)
-            while self.prompt_layout.count():
-                item=self.prompt_layout.takeAt(0)
+            while self.native_prompt_layout.count():
+                item=self.native_prompt_layout.takeAt(0)
                 if item.widget():item.widget().hide();item.widget().deleteLater()
-            if not items:self.prompt_layout.addWidget(label('Odpowiedzi, np. „Tak” i „Nie”, pojawią się tutaj, gdy Excel wyświetli pytanie. Najpierw uruchom sesję, wybierz przycisk skoroszytu i kliknij „Uruchom”. Możesz też użyć przycisku bezpośrednio w oknie Excela.',True,True))
+            self.prompt_empty.setVisible(not items)
             for snapshot in items:
                 frame=QW.QWidget();layout=QW.QVBoxLayout(frame);layout.setContentsMargins(0,0,0,8);title=label(str(snapshot.get('title','Excel')),False,True);title.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(title)
                 text=QW.QPlainTextEdit();text.setReadOnly(True);body=str(snapshot.get('text',''));text.setPlainText(body);text.setFixedHeight(min(110,max(56,20*max(body.count('\n')+1,math.ceil(len(body)/95))+12)));layout.addWidget(text)
@@ -11020,13 +11300,12 @@ def native_ui_types():
                     layout.addWidget(label('Okno nadal czeka. Możesz ponownie wybrać odpowiedź lub użyć okna Excela.',True,True))
                     layout.addWidget(button('Odblokuj odpowiedzi',lambda checked=False,s=clone(snapshot):self.retry_prompt(s)))
                 if snapshot.get('complete') is False:layout.addWidget(label('Nie odczytano całego okna. Odpowiedz bezpośrednio w Excelu.',True,True))
-                self.prompt_layout.addWidget(frame)
-            self.prompt_layout.addStretch()
+                self.native_prompt_layout.addWidget(frame)
         def click_prompt(self,snapshot,native):
             identity=self.session_identity()
             if self._disposed or self._closing or self._action_pending or not identity or self._sent_prompts.get(snapshot.get('hwnd'),(None,))[0]==snapshot.get('fingerprint'):return
             self._action_pending=True
-            for control in self.prompt_frame.findChildren(QW.QPushButton):control.setEnabled(False)
+            for control in self.native_prompt_host.findChildren(QW.QPushButton):control.setEnabled(False)
             pid,hwnd=identity[-2:];caption=str(native.get('text','')).replace('&','')
             def done(result):
                 if self._disposed or identity!=self.session_identity():return
@@ -12823,6 +13102,9 @@ def native_ui_types():
             editor.setStyleSheet('QLineEdit#cellEditor { padding: 1px 4px; border: 1px solid '+ui_color('accent').name()+
                 '; border-radius: 0; color: '+foreground+'; background-color: '+background+
                 '; selection-color: '+selected_fg+'; selection-background-color: '+selected_bg+'; }')
+            # Entering edit mode can remove a spill beyond the editor's own
+            # rectangle. Repaint after Qt installs the editor and updates state.
+            QC.QTimer.singleShot(0,self._grid.viewport().update)
             return editor
         def setEditorData(self,editor,index):
             self._grid._workspace.interaction.attach_editor(editor,index,self._grid)
@@ -12831,6 +13113,7 @@ def native_ui_types():
         def destroyEditor(self,editor,index):
             self._grid._workspace.interaction.editor_destroyed(editor)
             super().destroyEditor(editor,index)
+            QC.QTimer.singleShot(0,self._grid.viewport().update)
         def eventFilter(self,editor,event):
             if isinstance(editor,SheetInput):
                 controller=self._grid._workspace.interaction
@@ -12860,6 +13143,9 @@ def native_ui_types():
                 if style.get('wrap'):opt.features|=QW.QStyleOptionViewItem.ViewItemFeature.WrapText
                 else:opt.features&=~QW.QStyleOptionViewItem.ViewItemFeature.WrapText
                 opt.rect=option.rect.adjusted(4,1,-4,-1)
+                # Spill text is drawn after all cells, so a blank neighbour's
+                # delegate cannot paint over the remainder of a heading.
+                if self._grid.text_overflow(index) is not None:opt.text=''
                 renderer=self._content_style or self._grid.style()
                 renderer.drawControl(QW.QStyle.ControlElement.CE_ItemViewItem,opt,painter,self._grid)
                 if style.get('border'):
@@ -12880,6 +13166,8 @@ def native_ui_types():
             self.setHorizontalScrollMode(QW.QAbstractItemView.ScrollMode.ScrollPerPixel);self.setVerticalScrollMode(QW.QAbstractItemView.ScrollMode.ScrollPerPixel)
             self.horizontalHeader().setDefaultSectionSize(112);self.horizontalHeader().setMinimumSectionSize(28)
             self.horizontalHeader().setSectionsMovable(False);self.horizontalHeader().setHighlightSections(True);self.horizontalHeader().setMinimumHeight(28)
+            self.horizontalHeader().sectionHandleDoubleClicked.connect(lambda col:self._workspace.safe(lambda:self._workspace.fit_columns([col])))
+            self.horizontalHeader().setToolTip('Przeciągnij granicę kolumny lub kliknij ją dwukrotnie, aby dopasować szerokość do treści.')
             self.verticalHeader().setDefaultSectionSize(27);self.verticalHeader().setMinimumSectionSize(18);self.verticalHeader().setMinimumWidth(44)
             self.setItemDelegate(SheetDelegate(self));self.setMouseTracking(True)
             self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu);self.customContextMenuRequested.connect(self.context_menu)
@@ -13003,6 +13291,62 @@ def native_ui_types():
                     if rect.isEmpty():continue
                     if self.showGrid():rect=rect.adjusted(0,0,1,1)
                     yield index,rect
+        def text_overflow(self,index):
+            """Unwrapped text may occupy adjacent empty cells, never their data.
+
+            Work only inside this pane, respecting merges, hidden columns,
+            backgrounds and selection. No worksheet widths or values change.
+            """
+            model=self.model()
+            if model is None or not index.isValid() or self.isColumnHidden(index.column()):return None
+            if self.state()==QW.QAbstractItemView.State.EditingState and index==self.currentIndex():return None
+            value=model.value(index)
+            if not isinstance(value,str) or not value:return None
+            style=model.cell_style(index)
+            if style.get('wrap') or style.get('align','general') not in ('general','left'):return None
+            if self.columnSpan(index.row(),index.column())!=1 or self.rowSpan(index.row(),index.column())!=1:return None
+            rect=self.visualRect(index)
+            if rect.isEmpty() or not rect.intersects(self.viewport().rect()):return None
+            if self.indexAt(rect.intersected(self.viewport().rect()).center())!=index:return None
+            text=model.data(index) or ''
+            if '\n' in text or '\r' in text:return None
+            width=QG.QFontMetricsF(model.data(index,Qt.ItemDataRole.FontRole)).horizontalAdvance(text)+10
+            if width<=rect.width():return None
+            selection=self.selectionModel();selected=bool(selection and selection.isSelected(index))
+            background=model.display_colors(index,selected=selected,current=index==self.currentIndex())[1]
+            result=QC.QRect(rect)
+            for col in range(index.column()+1,min(model.columnCount(),index.column()+65)):
+                if self.isColumnHidden(col):break
+                neighbour=model.index(index.row(),col);cell=model.cell_record(neighbour)
+                if self.state()==QW.QAbstractItemView.State.EditingState and neighbour==self.currentIndex():break
+                if cell.get('v') is not None or cell.get('f') or cell.get('error') or cell.get('formula_type'):break
+                if self.columnSpan(index.row(),col)!=1 or self.rowSpan(index.row(),col)!=1:break
+                area=self.visualRect(neighbour)
+                if area.isEmpty() or area.left()>=self.viewport().width():break
+                if self.indexAt(area.intersected(self.viewport().rect()).center())!=neighbour:break
+                other_selected=bool(selection and selection.isSelected(neighbour))
+                if model.display_colors(neighbour,selected=other_selected,current=neighbour==self.currentIndex())[1]!=background:break
+                result=result.united(area)
+                if result.width()>=width:break
+            if result.width()<=rect.width():return None
+            return result
+        def _paint_overflow(self,painter):
+            model=self.model();selection=self.selectionModel()
+            rows=tuple(self._visible_sections(self.verticalHeader(),self.viewport().height()))
+            cols=tuple(self._visible_sections(self.horizontalHeader(),self.viewport().width()))
+            for row,_top,_bottom in rows:
+                for col,_left,_right in cols:
+                    index=model.index(row,col);rect=self.text_overflow(index)
+                    if rect is None:continue
+                    selected=bool(selection and selection.isSelected(index))
+                    foreground,background=model.display_colors(index,selected=selected,current=index==self.currentIndex())
+                    painter.save()
+                    try:
+                        painter.setClipRect(rect,Qt.ClipOperation.IntersectClip)
+                        painter.fillRect(rect.adjusted(0,1,0,-1),QG.QColor(background))
+                        painter.setFont(model.data(index,Qt.ItemDataRole.FontRole));painter.setPen(QG.QColor(foreground))
+                        painter.drawText(rect.adjusted(6,1,-4,-1),int(model.data(index,Qt.ItemDataRole.TextAlignmentRole))|int(Qt.TextFlag.TextSingleLine),model.data(index) or '')
+                    finally:painter.restore()
         def selectionChanged(self,selected,deselected):
             super().selectionChanged(selected,deselected)
             # Qt's normal dirty region can omit an adjacent grid gutter. Request
@@ -13019,6 +13363,7 @@ def native_ui_types():
             painter.setRenderHint(QG.QPainter.RenderHint.Antialiasing,False)
             try:
                 painter.setClipRegion(event.region())
+                self._paint_overflow(painter)
                 viewport=self.viewport().rect()
                 dpr=max(1.0,self.viewport().devicePixelRatioF())
                 # Cosmetic one-device-pixel separators stay thin at any zoom/DPI.
@@ -13297,6 +13642,23 @@ def native_ui_types():
         def document_changed(self):
             self.register_book();self._recovery_timer.start()
             change=self.session.last_change
+            if change.kind=='dimensions':
+                if change.sheet_id==self.sheet_id:
+                    sh=self.active_sheet();factor=self.zoom.value()/100;loading=self._loading;syncing=self.views._syncing
+                    self._loading=True;self.views._syncing=True
+                    try:
+                        for dimension in change.addresses:
+                            axis,index=dimension.split(':');index=int(index);column=axis=='columns'
+                            default=sh.get('default_column_width' if column else 'default_row_height',112 if column else 27)
+                            size=round(sh[axis].get(str(index),default)*factor)
+                            for view in self.views.views:
+                                if index<(self.model.columnCount() if column else self.model.rowCount()):
+                                    (view.setColumnWidth if column else view.setRowHeight)(index,size)
+                            getattr(self,'_sized_columns' if column else '_sized_rows',set()).add(index)
+                        self.views._sizes();self.views.schedule_controls()
+                    finally:self._loading=loading;self.views._syncing=syncing
+                    self._geometry_timer.start()
+                self._host_window.update_title();self._host_window.update_actions();self.update_notice();return
             if change.kind=='cells':self.model.cells_changed(change)
             else:self._pending_reset=True
             if not self._refresh_queued:
@@ -13407,11 +13769,12 @@ def native_ui_types():
             finally:self.views._syncing=False;self._loading=False
         def dimension_changed(self,kind,index,size):
             if self._loading or not self.session:return
-            sh=self.active_sheet();value=max(20 if kind=='columns' else 16,min(2000 if kind=='columns' else 1000,size/(self.zoom.value()/100)))
-            if abs(sh[kind].get(str(index),0)-value)<.5:return
-            sh[kind][str(index)]=value
-            getattr(self,'_sized_columns' if kind=='columns' else '_sized_rows',set()).add(index)
-            self.session.book['revision']+=1;self.register_book();self._recovery_timer.start();self._host_window.update_title();self._geometry_timer.start()
+            sh=self.active_sheet();office=Path(self.session.book.get('origin','')).suffix.lower() in WORKBOOK_SUFFIXES
+            maximum=2000 if kind=='columns' else 546 if office else 1000
+            value=max(1 if office else 20 if kind=='columns' else 16,min(maximum,size/(self.zoom.value()/100)))
+            default=sh.get('default_column_width' if kind=='columns' else 'default_row_height',112 if kind=='columns' else 27)
+            if abs(sh[kind].get(str(index),default)-value)<.5:return
+            self.safe(lambda:self.session.set_dimension(self.sheet_id,kind,index,value,coalesce=True))
         def update_wrapped_rows(self):
             if not self.session or self._loading:return
             top=self.grid.rowAt(0);bottom=self.grid.rowAt(self.grid.viewport().height()-1)
@@ -13660,7 +14023,7 @@ def native_ui_types():
             if not self.commit_active_editor():return
             menu=QW.QMenu(self)
             for title,fn in [('Kopiuj\tCtrl+C',lambda:self.copy_cells(False)),('Wytnij\tCtrl+X',lambda:self.copy_cells(True)),('Wklej\tCtrl+V',self.paste_cells),('Wklej wartości\tCtrl+Shift+V',lambda:self.paste_cells(True)),('Wyczyść zawartość\tDelete',self.clear_selection)]:menu.addAction(title,lambda checked=False,f=fn:self.safe(f))
-            menu.addSeparator();menu.addAction('Edytuj pełną treść…',lambda:self.safe(self.edit_full_text));menu.addAction('Format komórek…',lambda:self.safe(self.format_dialog));menu.addAction('Dopasuj kolumny',lambda:self.safe(self.fit_columns))
+            menu.addSeparator();menu.addAction('Pokaż pełną treść…',lambda:self.safe(self.view_full_text));menu.addAction('Edytuj pełną treść…',lambda:self.safe(self.edit_full_text));menu.addAction('Format komórek…',lambda:self.safe(self.format_dialog));menu.addAction('Dopasuj kolumny',lambda:self.safe(self.fit_columns))
             menu.addSeparator();menu.addAction('Tabela przestawna z zakresu…',lambda:self.safe(self.make_pivot));menu.addAction('Wykres z zakresu…',lambda:self.safe(self.make_chart));menu.exec(point)
         def header_menu(self,header,axis,point):
             if not self.commit_active_editor():return
@@ -13680,6 +14043,7 @@ def native_ui_types():
             source=(r,c,r,ec) if direction=='down' else (r,c,er,c)
             self.session.fill(self.sheet_id,source,rect)
         def fit_columns(self,columns=None):
+            if not self.commit_active_editor():return
             rect=self.used_rect();columns=columns if columns is not None else range(rect[1],min(rect[3]+1,self.model.columnCount()))
             for col in columns:
                 width=60
@@ -13689,6 +14053,21 @@ def native_ui_types():
                     width=max(width,min(520*self.model.zoom,max((fm.horizontalAdvance(line) for line in text.split('\n')),default=0)+20))
                 self.grid.setColumnWidth(col,math.ceil(width))
             self._geometry_timer.start()
+        def view_full_text(self):
+            if not self.commit_active_editor():return
+            index=self.grid.currentIndex()
+            if not index.isValid():return
+            dialog=QW.QDialog(self);dialog.setWindowTitle('Pełna treść · '+sheet_address(index.row(),index.column()))
+            layout=QW.QVBoxLayout(dialog);layout.addWidget(label('Wartość wyświetlana',True))
+            value=QW.QPlainTextEdit();value.setReadOnly(True);value.setPlainText(self.model.data(index) or '');layout.addWidget(value)
+            cell=self.model.cell_record(index)
+            if cell.get('f'):
+                layout.addWidget(label('Formuła',True));formula=QW.QPlainTextEdit();formula.setReadOnly(True);formula.setPlainText(cell['f']);layout.addWidget(formula)
+            buttons=QW.QDialogButtonBox(QW.QDialogButtonBox.StandardButton.Close);buttons.rejected.connect(dialog.reject)
+            copy=buttons.addButton('Kopiuj wartość',QW.QDialogButtonBox.ButtonRole.ActionRole);copy.clicked.connect(lambda:QW.QApplication.clipboard().setText(value.toPlainText()))
+            layout.addWidget(buttons);limited_dialog_size(dialog,680,390)
+            try:dialog.exec()
+            finally:dialog.deleteLater()
         def edit_full_text(self):
             if not self.commit_active_editor():return
             index=self.grid.currentIndex();dialog=FormDialog('Komórka '+sheet_address(index.row(),index.column()),self)
@@ -17597,6 +17976,29 @@ def sheet_office_fidelity_test_suite():
             restored,_=ProjectStore.load(destination,self.root/'loaded');saved=restored['workpads'][0]
             self.assertEqual(saved['sheets'][0]['controls'],sh['controls']);self.assertEqual(saved['formula_cache'],book['formula_cache'])
             self.assertEqual(SheetCalculator(saved).cell(sh['id'],1,0),123);self.assertEqual(file_digest(path),before)
+        def test_dimension_drag_preserves_saved_formulas_and_has_sparse_undo_redo(self):
+            book=sheet_read_xlsx(self.fixture());sh=book['sheets'][0];sid=sh['id'];session=SheetSession(book);original=clone(sh['columns'])
+            with patch.object(time,'monotonic',side_effect=[100,100.1,100.2]):
+                for size in (180,220,260):session.set_dimension(sid,'columns',0,size,coalesce=True)
+            self.assertEqual(len(session.history),1);self.assertEqual(session.history[0]['type'],'dimensions');self.assertLess(session.history_bytes,300)
+            for undo in (False,True,False):
+                if undo:session.undo();self.assertEqual(sh['columns'],original)
+                elif session.position==0:session.redo();self.assertEqual(sh['columns']['0'],260)
+                self.assertEqual(session.calculator.cell(sid,1,0),123);self.assertEqual(session.calculator.cell(sid,1,1),999)
+                self.assertEqual(session.calculator.cell(sid,1,6),41);self.assertEqual(session.calculator.provenance(sid,1,0)['kind'],'saved')
+                self.assertEqual(book['formula_cache']['revision'],book['revision'])
+        def test_dimensions_and_their_undo_never_revalidate_results_after_content_edits(self):
+            book=sheet_read_xlsx(self.fixture());sid=book['sheets'][0]['id'];session=SheetSession(book)
+            session.edit(sid,10,10,'changed content');invalid_revision=book['formula_cache']['revision']
+            session.set_dimension(sid,'rows',4,38);session.undo();session.redo()
+            self.assertEqual(book['formula_cache']['revision'],invalid_revision);self.assertEqual(session.calculator.cell(sid,1,0).code,'#NAME?')
+            self.assertEqual(session.calculator.cell(sid,1,1),3)
+        def test_dimension_history_separates_axes_and_later_drags(self):
+            book=sheet_read_xlsx(self.fixture());sid=book['sheets'][0]['id'];session=SheetSession(book)
+            with patch.object(time,'monotonic',side_effect=[100,100.1,101]):
+                session.set_dimension(sid,'columns',0,190,coalesce=True);session.set_dimension(sid,'rows',0,31,coalesce=True);session.set_dimension(sid,'rows',0,39,coalesce=True)
+            self.assertEqual(len(session.history),3);session.undo();self.assertEqual(book['sheets'][0]['rows']['0'],31)
+            session.undo();session.undo();self.assertEqual(session.calculator.cell(sid,1,0),123)
         def test_hidden_rows_columns_export_structure_and_undo(self):
             book=sheet_read_xlsx(self.fixture());sh=book['sheets'][0];sid=sh['id']
             self.assertEqual(sh['hidden_rows'],[0,8]);self.assertEqual(sh['hidden_columns'],[1,2])
@@ -17714,7 +18116,7 @@ def excel_native_dialog_test_suite():
                 201:dict(pid=20,root=200,owner=0,parent=200,cls='Static',enabled=True,visible=True,text='Czy przerwać generowanie?'),
                 202:dict(pid=20,root=200,owner=0,parent=200,cls='Button',enabled=True,visible=True,text='&Nie',id=7),
                 203:dict(pid=20,root=200,owner=0,parent=200,cls='Button',enabled=True,visible=True,text='Przerwij',id=3)}
-            self.clicked=[];self.after_activate=lambda:None;self.incomplete=False
+            self.clicked=[];self.activated=[];self.after_activate=lambda:None;self.incomplete=False
         def pid(self,h):return self.nodes.get(h,{}).get('pid',0)
         def root(self,h):return self.nodes.get(h,{}).get('root',0)
         def owner(self,h):return self.nodes.get(h,{}).get('owner',0)
@@ -17727,7 +18129,7 @@ def excel_native_dialog_test_suite():
         def text(self,h,deadline,limit=4096):return self.nodes[h]['text'],not self.incomplete
         def checked(self,h,deadline):return 0
         def windows(self,parent=0,deadline=None,limit=1024):return ([h for h,v in self.nodes.items() if v.get('parent')==parent] if parent else [h for h,v in self.nodes.items() if v['root']==h]),True
-        def activate(self,h):self.after_activate()
+        def activate(self,h):self.activated.append(h);self.after_activate()
         def click(self,h):self.clicked.append(h);return True
     class NativeDialogTests(unittest.TestCase):
         def fake(self):
@@ -17737,6 +18139,25 @@ def excel_native_dialog_test_suite():
             api=self.fake();snapshot=self.snapshot(api);self.assertEqual(snapshot['text'],'Czy przerwać generowanie?');self.assertTrue(snapshot['complete'])
             self.assertEqual(excel_native_dialog_skip_button(snapshot)['hwnd'],202)
             result=excel_native_dialog_action(20,100,snapshot,202);self.assertTrue(result['sent']);self.assertEqual(api.clicked,[202])
+        def test_hidden_excel_still_exposes_its_modal_question_and_real_yes_no_buttons(self):
+            api=self.fake();api.nodes[100]['visible']=False
+            api.nodes[201]['text']='Brak wymaganych pozycji KIT. Czy kontynuować mimo braków?'
+            api.nodes[202].update(text='&Tak',id=6);api.nodes[203].update(text='&Nie',id=7)
+            with patch.object(os,'name','nt'):values=excel_native_dialogs(20,100)
+            self.assertEqual(len(values),1);snapshot=values[0];self.assertIn('KIT',snapshot['text'])
+            self.assertEqual([(b['text'],b['id']) for b in snapshot['buttons']],[('&Tak',6),('&Nie',7)])
+            self.assertIsNone(excel_native_dialog_skip_button(snapshot));self.assertEqual(api.clicked,[])
+            self.assertTrue(excel_native_dialog_action(20,100,snapshot,203)['sent']);self.assertEqual(api.clicked,[203])
+            self.assertEqual(api.activated,[200]);self.assertFalse(api.visible(100))
+        def test_hidden_excel_prompt_keeps_process_ownership_and_stale_text_guards(self):
+            api=self.fake();api.nodes[100]['visible']=False;snapshot=self.snapshot(api)
+            api.nodes[201]['text']='A new question replaced the KIT prompt'
+            with self.assertRaises(UserError):excel_native_dialog_action(20,100,snapshot,202)
+            api.nodes[200]['owner']=0
+            with patch.object(os,'name','nt'):self.assertEqual(excel_native_dialogs(20,100),[])
+            api.nodes[200]['owner']=100;api.nodes[100]['pid']=99
+            with patch.object(os,'name','nt'):self.assertEqual(excel_native_dialogs(20,100),[])
+            self.assertEqual(api.clicked,[]);self.assertEqual(api.activated,[])
         def test_changed_text_pid_owner_button_state_or_removed_window_never_clicks(self):
             for change in ('text','pid','owner','disabled','hidden','deleted','button_pid','button_id'):
                 with self.subTest(change=change):
@@ -18768,6 +19189,28 @@ def excel_handoff_test_suite():
         def test_format_change_requires_native_edit(self):
             self.sh['cells']['A1']['format']={'bold':True}
             with self.assertRaisesRegex(UserError,'format'):self.handoff()
+        def test_resized_columns_and_rows_are_explicit_layout_without_cell_edits(self):
+            before=self.path.read_bytes();self.sh['columns']['0']=220;self.sh['rows']['4']=42
+            result=self.handoff();self.assertEqual(result['edits'],[])
+            self.assertEqual(result['layout'],[{'sheet':self.sh['name'],'columns':[{'index':1,'width':220.0}],'rows':[{'index':5,'height':42.0}]}])
+            self.assertEqual(self.path.read_bytes(),before)
+        def test_reset_dimension_uses_default_instead_of_omitting_the_write(self):
+            self.sh['columns']['2']=180;self.sh['rows']['3']=48;self.path=self.path.with_name('dimensions.xlsx');sheet_export_xlsx(self.book,self.path,allow_loss=True)
+            self.book=sheet_read_xlsx(self.path);self.sh=self.book['sheets'][0];self.book['source_revision']=file_digest(self.path)
+            self.sh['columns'].pop('2');self.sh['rows'].pop('3');result=self.handoff()
+            self.assertEqual(result['layout'],[{'sheet':self.sh['name'],'columns':[{'index':3,'width':float(self.sh.get('default_column_width',112))}],
+                'rows':[{'index':4,'height':float(self.sh.get('default_row_height',27))}]}])
+        def test_layout_transfer_does_not_allow_merge_or_hidden_state_changes(self):
+            self.sh['columns']['0']=220;self.sh['hidden_columns']=[1]
+            with self.assertRaisesRegex(UserError,'układ'):self.handoff()
+            self.sh['hidden_columns']=[];self.sh['merges']=['A1:B1']
+            with self.assertRaisesRegex(UserError,'układ'):self.handoff()
+        def test_layout_validation_rejects_duplicate_indices_and_nonfinite_sizes(self):
+            for entry in ({'index':True,'width':100},{'index':16385,'width':100},{'index':1,'width':float('nan')},{'index':1,'width':0}):
+                with self.subTest(entry=entry),self.assertRaises(UserError):excel_session_layout([{'sheet':'Raport','columns':[entry]}])
+            with self.assertRaises(UserError):excel_session_layout([{'sheet':'Raport','columns':[{'index':1,'width':100}]*2}])
+            with self.assertRaises(UserError):excel_session_layout([{'sheet':'Raport','rows':[{'index':1,'height':547}]}])
+            self.assertEqual(excel_session_layout([{'sheet':'Raport','columns':[{'index':1,'width':20.5}]}]),[{'sheet':'Raport','columns':[{'index':1,'width':20.5}],'rows':[]}])
         def test_delete_and_boolean_are_distinct(self):
             self.sh['cells'].pop('A1');self.sh['cells']['B1']['v']=pack(False)
             edits=self.handoff()['edits'];self.assertEqual(edits[0]['kind'],'blank');self.assertIsNone(edits[0]['value']);self.assertEqual(edits[1]['kind'],'boolean');self.assertIs(edits[1]['value'],False)
@@ -19003,6 +19446,56 @@ send('closed')
                 controller._consume({'event':'done','session_id':controller.session_id,'id':'stale','operation':'reveal_control','result':{'reveal_hwnd':848484}});foreground.assert_not_called()
                 controller._consume({'event':'done','session_id':controller.session_id,'id':'reveal','operation':'reveal_control','result':{'reveal_hwnd':848484}});foreground.assert_called_once_with(controller.owned_process,848484,controller.cancelled)
                 self.assertTrue(controller.poll()['last_result']['foreground'])
+        def test_layout_is_validated_before_start_and_forwarded_in_open_context(self):
+            invalid=ExcelSessionController(self.original,self.private)
+            with self.assertRaises(UserError):invalid.start(context={'layout':[{'sheet':'Raport','rows':[{'index':1,'height':547}]}]})
+            self.assertIsNone(invalid.thread);self.assertFalse(self.launches)
+            layout=[{'sheet':'Raport','columns':[{'index':1,'width':152}],'rows':[{'index':2,'height':40}]}]
+            with self.assertRaises(UserError):invalid.start(True,{'layout':layout})
+            controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller);controller.start(context={'layout':layout})
+            state=self.wait(controller,lambda s:s['state']=='ready');request=json.loads((Path(state['workspace_path'])/'opened.json').read_text('utf-8'))
+            self.assertEqual(request['context']['layout'],excel_session_layout(layout))
+        def test_rich_error_preserves_long_details_in_state_and_event(self):
+            controller=self.start();details='0x80020009 / 0x800A03EC\n'+('Kontekst procedury i skoroszytu. '*250)
+            controller.state.update(job_id='failed-macro',operation='run_control_macro',state='busy')
+            controller._consume({'session_id':controller.session_id,'event':'error','id':'failed-macro','operation':'run_control_macro',
+                'message':'Nie udało się uruchomić procedury Generuj.','details':details,'code':'macro_unavailable','macro_name':"'Book.xlsm'!M.Generuj",'retry_safe':False})
+            state=controller.poll();self.assertEqual(state['state'],'ready');self.assertEqual(state['error_details'],details)
+            self.assertEqual(state['error_code'],'macro_unavailable');self.assertEqual(state['macro_name'],"'Book.xlsm'!M.Generuj")
+            self.assertEqual(state['events'][-1]['details'],details);self.assertEqual(state['events'][-1]['code'],'macro_unavailable')
+        def test_show_excel_forwards_optional_sheet_and_foregrounds_only_its_result(self):
+            controller=self.start();wid=controller.poll()['workbook_id']
+            controller.submit('show_excel',{'workbook_id':wid,'sheet_id':'native-sheet'});state=self.wait(controller,lambda s:s['state']=='ready')
+            command=json.loads((Path(state['workspace_path'])/'commands.jsonl').read_text('utf-8').splitlines()[-1])
+            self.assertEqual(command['action'],'show_excel');self.assertEqual(command['sheet_id'],'native-sheet')
+            with patch(__name__+'.excel_session_foreground',return_value=True) as foreground:
+                controller.state.update(job_id='show',operation='show_excel',state='busy')
+                controller._consume({'session_id':controller.session_id,'event':'done','id':'old','operation':'show_excel','result':{'reveal_hwnd':848484}});foreground.assert_not_called()
+                controller._consume({'session_id':controller.session_id,'event':'done','id':'show','operation':'show_excel','result':{'reveal_hwnd':848484}})
+                foreground.assert_called_once_with(controller.owned_process,848484,controller.cancelled);self.assertTrue(controller.poll()['last_result']['foreground'])
+        def test_busy_reveal_uses_verified_native_handle_without_a_com_command(self):
+            controller=self.start();controller.state.update(state='busy',operation='run_macro')
+            with patch(__name__+'.excel_session_foreground',return_value=True) as foreground,patch.object(controller,'_send') as send:
+                self.assertTrue(controller.reveal_window());foreground.assert_called_once_with(controller.owned_process,848484,controller.cancelled);send.assert_not_called()
+                foreground.reset_mock();controller.owned_process.running=False
+                with self.assertRaises(UserError):controller.reveal_window()
+                foreground.assert_not_called();controller.owned_process.running=True;controller.cancelled.set()
+                with self.assertRaises(UserError):controller.reveal_window()
+                foreground.assert_not_called();controller.cancelled.clear()
+        def test_initial_layout_error_keeps_partial_result_and_allows_saving_working_copy(self):
+            controller=self.start();controller.state.update(state='busy',operation='open',job_id='opening')
+            result={'workbook_id':controller.poll()['workbook_id'],'active_sheet':'Raport','revision':2,'applied':0,'layout_applied':1,'layout_touched':2,'handoff_incomplete':True,
+                    'snapshot':{'sheet':'Raport','row_dimensions':[{'row':1,'height':30,'hidden':False}],'cells':[]}}
+            controller._consume({'session_id':controller.session_id,'event':'error','id':'opening','operation':'open','message':'Nie przeniesiono drugiej kolumny.',
+                'details':'ColumnWidth poza zakresem.','code':'operation_failed','result':result,'applied':0,'layout_applied':1,'layout_touched':2,'retry_safe':False})
+            state=controller.poll();self.assertEqual(state['error_operation'],'open');self.assertEqual(state['last_result'],result);self.assertEqual(state['state'],'ready')
+            controller.submit('save_working');state=self.wait(controller,lambda s:s['state']=='ready' and bool(s['last_saved_path']))
+            self.assertTrue(Path(state['last_saved_path']).is_file());self.assertEqual(self.original.read_bytes(),self.before)
+            self.assertFalse(state['error']);self.assertTrue(state['handoff_incomplete'])
+            controller.submit('read_range');state=self.wait(controller,lambda s:s['state']=='ready' and s['last_operation']=='read_range')
+            self.assertTrue(state['handoff_incomplete'])
+            for action,args in (('run_macro',{'name':'Print'}),('run_control_macro',{'sheet_id':'native-sheet','control_id':'native-control'}),('apply_edits',{'edits':[]})):
+                with self.subTest(action=action),self.assertRaisesRegex(UserError,'Przeniesienie zmian'):controller.submit(action,args)
     class FakeCom:
         def __init__(self,handlers=None,**values):
             self.handlers=handlers or {};self.calls=[];self.__dict__.update(values)
@@ -19097,7 +19590,7 @@ send('closed')
             self.cells['A2'].on_write=reject
             self.worker.handle_command({'session_id':'fixture','workbook_id':'fixture-book','id':'busy-write','action':'apply_edits','edits':[self.edit(),self.edit('A2')]})
             self.assertEqual(self.worker.applied,1);self.assertEqual(self.cells['A1'].writes,[('Value2',2.5)]);self.assertEqual(len(calls),1)
-            result=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(result['event'],'error');self.assertEqual(result['applied'],1);self.assertFalse(result['retry_safe']);self.assertIn('8001010A',result['message'])
+            result=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(result['event'],'error');self.assertEqual(result['applied'],1);self.assertFalse(result['retry_safe']);self.assertIn('8001010A',result['details']);self.assertEqual(result['code'],'office_busy')
         def test_protected_array_and_nonanchor_merge_are_not_written(self):
             cell=self.cells['A1']
             for protected,array,merged in ((True,False,False),(False,True,False),(False,False,True)):
@@ -19143,11 +19636,119 @@ send('closed')
             self.assertEqual(len(self.open_calls),1);args,policy,events=self.open_calls[0]
             self.assertEqual(args[0],request['path']);self.assertEqual(args[1:3],(0,False));self.assertEqual(policy,2);self.assertIs(events,False)
             self.assertNotIn('RunAutoMacros',[name for name,_ in self.book.calls]);self.assertTrue(self.excel.EnableEvents)
+            self.assertIs(self.excel.Visible,False);self.assertNotIn('Activate',[name for name,_ in self.book.calls+self.sheet.calls])
             messages=[json.loads(line) for line in self.output.getvalue().splitlines()]
             self.assertEqual(messages[-1]['event'],'ready');self.assertEqual(messages[-1]['session_id'],'fixture')
+        def test_show_excel_does_not_require_a_selected_control(self):
+            self.worker.open_workbook(self.open_request());self.excel.ActiveWindow=FakeCom(Hwnd=848484)
+            self.worker.handle_command({'action':'show_excel','id':'reveal','session_id':'fixture','workbook_id':'fixture-book'})
+            result=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(result['event'],'done');self.assertEqual(result['result']['reveal_hwnd'],848484)
+            self.assertTrue(self.excel.Visible);self.assertEqual(self.sheet.Shapes.Count,0)
+            self.worker.handle_command({'action':'list_sheets','id':'read','session_id':'fixture','workbook_id':'fixture-book'})
+            self.assertTrue(self.excel.Visible)
+        def test_macro_qualification_keeps_exact_bound_path_and_code_module(self):
+            self.book.FullName=str(self.path);quoted="'"+str(self.path).upper().replace("'","''")+"'!"
+            self.assertEqual(self.worker.macro_name(quoted+'Arkusz1.Drukuj'),'Arkusz1.Drukuj')
+            self.assertEqual(self.worker.macro_name("'"+self.book.Name.upper().replace("'","''")+"'!Moduł.Drukuj"),'Moduł.Drukuj')
+            self.assertEqual(self.worker.macro_name("'C:\\Other\\"+self.book.Name.replace("'","''")+"'!Arkusz1.Drukuj"),'')
+        def test_macro_exception_preserves_real_description_and_never_retries(self):
+            self.open_request();calls=[]
+            class OfficeError(Exception):
+                hresult=-2147352567
+                excepinfo=(0,'Microsoft Excel','Błąd wewnątrz procedury: brak arkusza Dane.',None,0,-2146827284)
+            def fail(name):calls.append(name);raise OfficeError('Exception occurred')
+            self.excel.handlers['Run']=fail;self.book.HasVBProject=True
+            self.worker.handle_command({'action':'run_macro','name':'Moduł.Drukuj','id':'macro','session_id':'fixture','workbook_id':'fixture-book'})
+            error=json.loads(self.output.getvalue().splitlines()[-1])
+            self.assertEqual(len(calls),1);self.assertEqual(error['code'],'macro_failed');self.assertIn('brak arkusza Dane',error['message'])
+            self.assertIn('Moduł.Drukuj',error['message']);self.assertIn('80020009',error['details']);self.assertIn('800A03EC',error['details']);self.assertFalse(error['retry_safe'])
+            OfficeError.excepinfo=(0,'Microsoft Excel','Cannot run the macro. The macro may not be available.',None,0,-2146827284)
+            error=excel_worker_error_fields(OfficeError('Exception occurred'),'run_macro','M.Print')
+            self.assertEqual(error['code'],'macro_unavailable');self.assertIn('M.Print',error['message'])
+        def test_macro_diagnostics_report_observed_protection_without_lowering_policy(self):
+            self.excel.ProtectedViewWindows=FakeCollection([object()]);self.book.HasVBProject=False
+            result=self.worker.error_fields(RuntimeError('macro unavailable'),'run_macro','M.Print')
+            self.assertEqual(result['code'],'protected_view');self.assertIn('Widoku chronionego',result['message']);self.assertIn('nie wykrywa projektu VBA',result['message'])
+            self.assertFalse(hasattr(self.excel,'AutomationSecurity'))
+        def test_control_macro_keeps_exact_assignment_context_and_never_invokes_activex(self):
+            self.worker.open_workbook(self.open_request());self.book.FullName=str(self.path)
+            on_action="'"+str(self.path).replace("'","''")+"'!Moduł.Generuj"
+            shape=FakeCom(ID=9,Name='Generuj',Type=8,OnAction=on_action,Visible=-1,ControlFormat=FakeCom(Enabled=True),
+                Top=10.,Left=20.,Width=50.,Height=18.,TopLeftCell=FakeCom(Row=1,Column=1))
+            self.sheet.Shapes.values=[shape];sid=self.worker.sheet_id(self.sheet);control=self.worker.controls(self.sheet,sid)[0];calls=[]
+            def fail(name):calls.append(name);raise RuntimeError('Cannot run the macro.')
+            self.excel.handlers['Run']=fail
+            command={'action':'run_control_macro','session_id':'fixture','workbook_id':'fixture-book','id':'generate','sheet_id':sid,'control_id':control['id']}
+            self.worker.handle_command(command);error=json.loads(self.output.getvalue().splitlines()[-1])
+            self.assertEqual(calls,[self.worker.qualified_macro('Moduł.Generuj')]);self.assertEqual(error['code'],'macro_unavailable')
+            self.assertIn('Application.Caller',error['message']);self.assertIn('on_action',error['details']);self.assertIn('working_copy',error['details']);self.assertIn('open_events_enabled',error['details'])
+            self.assertEqual(control['macro_qualified_name'],calls[0]);self.assertFalse(control['caller_emulated'])
+            shape.Type=12;command['control_id']=self.worker.controls(self.sheet,sid)[0]['id'];self.worker.handle_command(command)
+            self.assertEqual(len(calls),1);self.assertEqual(json.loads(self.output.getvalue().splitlines()[-1])['event'],'error')
+        def layout_dimensions(self):
+            class Column(FakeCom):
+                @property
+                def Width(inner):return 0. if inner.Hidden else round(inner.ColumnWidth*7+5)*.75
+            column=Column(ColumnWidth=8.43,Hidden=True);row=FakeCom(RowHeight=13.,Hidden=True)
+            self.sheet.Columns=FakeCom({'Item':lambda index:column});self.sheet.Rows=FakeCom({'Item':lambda index:row})
+            return column,row
+        def test_layout_converts_pixels_and_preserves_hidden_dimensions(self):
+            column,row=self.layout_dimensions()
+            self.worker.apply_layout([{'sheet':'Raport','columns':[{'index':1,'width':152.}],'rows':[{'index':2,'height':40.}]}])
+            self.assertTrue(column.Hidden);self.assertTrue(row.Hidden);self.assertAlmostEqual(row.RowHeight,30.)
+            column.Hidden=False;self.assertLessEqual(abs(column.Width-114.),.8);column.Hidden=True
+            self.assertEqual(self.worker.layout_applied,2);self.assertEqual(self.worker.layout_touched,2)
+        def test_layout_preflight_does_not_write_before_all_sheets_are_checked(self):
+            column,row=self.layout_dimensions();before=column.ColumnWidth
+            layout=[{'sheet':'Raport','columns':[{'index':1,'width':152.}]},{'sheet':'Deleted','rows':[{'index':1,'height':40.}]}]
+            with self.assertRaises(UserError):self.worker.apply_layout(layout)
+            self.assertEqual(column.ColumnWidth,before);self.assertEqual(self.worker.layout_applied,0);self.assertTrue(column.Hidden)
+        def test_layout_partial_failure_keeps_prior_changes_and_restores_failed_dimension(self):
+            column,row=self.layout_dimensions();broken=FakeCom(ColumnWidth=8.43,Width=5.,Hidden=True)
+            self.sheet.Columns=FakeCom({'Item':lambda index:column if index==1 else broken})
+            with self.assertRaises(UserError):self.worker.apply_layout([{'sheet':'Raport','columns':[{'index':1,'width':152.},{'index':2,'width':300.}]}])
+            self.assertEqual(self.worker.layout_applied,1);self.assertEqual(self.worker.layout_touched,2)
+            self.assertTrue(column.Hidden);self.assertTrue(broken.Hidden);self.assertEqual(broken.ColumnWidth,8.43)
+        def test_layout_does_not_accept_zero_native_size_as_a_rounding_success(self):
+            class QuantizedRow(FakeCom):
+                def __setattr__(inner,name,value):
+                    if name=='RowHeight' and float(value)<.75:value=0.
+                    object.__setattr__(inner,name,value)
+            row=QuantizedRow(RowHeight=13.,Hidden=False);column=FakeCom(ColumnWidth=8.43,Width=0.,Hidden=False)
+            for dimension,axis in ((row,'rows'),(column,'columns')):
+                with self.assertRaises(UserError):self.worker._set_dimension(dimension,axis,.1)
+                self.assertFalse(dimension.Hidden)
+            self.assertEqual(row.RowHeight,13.);self.assertEqual(column.ColumnWidth,8.43)
+        def test_open_applies_layout_before_cell_edits_and_snapshot(self):
+            request=self.open_request();column,row=self.layout_dimensions()
+            request['context'].update(layout=[{'sheet':'Raport','rows':[{'index':1,'height':40.}]}],edits=[self.edit()])
+            self.cells['A1'].on_write=lambda *_:self.assertEqual(row.RowHeight,30.)
+            result=self.worker.open_workbook(request)
+            self.assertEqual(self.worker.layout_applied,1);self.assertEqual(self.worker.applied,1);self.assertEqual(result['snapshot']['row_dimensions'][0]['height'],30.)
+            request['run_open_events']=True
+            with self.assertRaises(UserError):self.worker.validate_open(request)
+        def test_partial_open_transfer_stays_readable_and_saveable_but_never_runs_more_writes(self):
+            request=self.open_request();column,row=self.layout_dimensions();request['context'].update(layout=[{'sheet':'Raport','rows':[{'index':1,'height':40.}]}],edits=[self.edit(),self.edit('A2',expected='99')])
+            result=self.worker.open_workbook(request);self.assertTrue(result['handoff_incomplete']);self.assertEqual(result['layout_applied'],1);self.assertEqual(result['applied'],0)
+            self.book.handlers['SaveCopyAs']=lambda path:None
+            for action,args in (('list_sheets',{}),('save_copy',{'temp_path':'fake-working-copy.xlsm'})):
+                self.worker.handle_command(dict(args,action=action,id=action,session_id='fixture',workbook_id='fixture-book'))
+                event=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(event['event'],'done');self.assertTrue(event['result']['handoff_incomplete'])
+            before=list(self.cells['A1'].writes)
+            for action,args in (('run_macro',{'name':'Print'}),('run_control_macro',{}),('apply_edits',{'edits':[self.edit()]})):
+                self.worker.handle_command(dict(args,action=action,id=action,session_id='fixture',workbook_id='fixture-book'))
+                event=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(event['event'],'error');self.assertIn('Przeniesienie zmian',event['message'])
+            self.assertEqual(self.cells['A1'].writes,before);self.assertFalse(any(name=='Run' for name,_ in self.excel.calls))
         def test_open_runs_legacy_auto_macro_only_after_explicit_opt_in(self):
             self.worker.open_workbook(self.open_request(True));self.assertIs(self.open_calls[0][2],True)
             self.assertEqual([args for name,args in self.book.calls if name=='RunAutoMacros'],[(1,)])
+        def test_auto_open_failure_keeps_workbook_and_reports_specific_macro_without_retry(self):
+            request=self.open_request(True)
+            def fail(*_):raise RuntimeError('Błąd inicjalizacji makra.')
+            self.book.handlers['RunAutoMacros']=fail;result=self.worker.open_workbook(request)
+            error=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(error['event'],'error');self.assertEqual(error['operation'],'open')
+            self.assertIn('Auto_Open',error['macro_name']);self.assertEqual(error['result'],result);self.assertIs(self.worker.book,self.book)
+            self.assertTrue(self.excel.EnableEvents);self.assertEqual([name for name,_ in self.book.calls].count('RunAutoMacros'),1)
         def run_protocol(self,request,commands,previous=()):
             import io
             stream=io.StringIO(''.join(dumps(dict(command,session_id=command.get('session_id','fixture')))+'\n' for command in commands))
@@ -22641,6 +23242,7 @@ def ui_test():
                 def start(inner,**options):inner.calls.append(('start',options));inner.snapshot.update(state='ready',owned=True);return inner.snapshot['session_id']
                 def poll(inner):return clone(inner.snapshot)
                 def submit(inner,action,args):inner.calls.append((action,clone(args)));inner.snapshot.update(state='busy',operation=action,error='');return uid()
+                def reveal_window(inner):inner.calls.append(('reveal_window',{}));return True
                 def close(inner):inner.calls.append(('close',{}));inner.snapshot.update(state='closed',owned=False,finished=True)
                 def cancel(inner):inner.calls.append(('cancel',{}));inner.snapshot.update(state='closed',owned=False,finished=True,cancelled=True)
             availability={'available':available,'reason':'Microsoft Excel nie jest zainstalowany.'}
@@ -22674,6 +23276,26 @@ def ui_test():
         def test_office_saved_formula_provenance_changes_after_local_edit(self):
             ws=self.office_workspace_fixture();index=ws.model.index(0,2);self.assertEqual(ws.model.data(index),'99');self.assertIn('zapisane',ws.office_notice.text());self.assertIn('Wynik zapisany',ws.model.data(index,Qt.ItemDataRole.ToolTipRole))
             ws.model.setData(ws.model.index(5,0),'edit');app.processEvents();self.assertEqual(ws.model.data(index),'3');self.assertIn('lokalne',ws.office_notice.text());self.assertIn('lokalnego',ws.model.data(index,Qt.ItemDataRole.ToolTipRole))
+        def test_office_column_resize_keeps_cached_values_undo_and_excel_handoff(self):
+            from PySide6.QtTest import QSignalSpy
+            path=create_intake_test_xlsm(self.root/'resize.xlsm','NATIVE_ONLY_FUNCTION()');book=sheet_read_xlsx(path);before=path.read_bytes()
+            self.window.show_sheet_book(book);app.processEvents();ws=self.window.sheet_workspace;index=ws.model.index(1,0)
+            ws.select_rect((1,0,1,0));selection=ws.capture_selection();reset=QSignalSpy(ws.model.modelReset);old=ws.grid.columnWidth(0)
+            self.assertEqual(ws.model.data(index),'123')
+            for width in (211,242,273):ws.grid.setColumnWidth(0,width)
+            app.processEvents();self.assertEqual(len(ws.session.history),1);self.assertEqual(ws.model.data(index),'123');self.assertIn('zapisane',ws.office_notice.text())
+            self.assertEqual(ws.capture_selection(),selection);self.assertEqual(reset.count(),0)
+            handoff=sheet_excel_handoff(ws.session.book);self.assertEqual(handoff['edits'],[]);self.assertEqual(handoff['layout'][0]['columns'],[{'index':1,'width':273.0}])
+            ws.session.undo();app.processEvents();self.assertEqual(ws.grid.columnWidth(0),old);self.assertEqual(ws.model.data(index),'123');self.assertEqual(sheet_excel_handoff(ws.session.book)['layout'],[])
+            ws.session.redo();app.processEvents();self.assertEqual(ws.grid.columnWidth(0),273);self.assertEqual(ws.model.data(index),'123');self.assertEqual(reset.count(),0)
+            self.assertEqual(path.read_bytes(),before);self.assertFalse(self.errors)
+        def test_office_resize_and_undo_preserve_an_active_cell_draft(self):
+            from PySide6.QtTest import QSignalSpy
+            ws=self.office_workspace_fixture();ws.select_rect((5,2,5,2));ws.interaction.focus_cell();app.processEvents()
+            editor=self.nav_editor(ws,'uncommitted draft');draft=ws.interaction.draft;selection=ws.capture_selection();reset=QSignalSpy(ws.model.modelReset)
+            ws.grid.setColumnWidth(2,250);app.processEvents();ws.session.undo();app.processEvents()
+            self.assertIs(ws.interaction.draft,draft);self.assertEqual(editor.text(),'uncommitted draft');self.assertEqual(ws.capture_selection(),selection);self.assertEqual(reset.count(),0)
+            self.assertEqual(ws.model.data(ws.model.index(0,2)),'99');self.assertIn('zapisane',ws.office_notice.text());self.assertFalse(self.errors)
         def native_excel_payload(self):
             return {'workbook_id':'native-book','active_sheet':'Raport','sheets':[{'id':'sheet-1','name':'Raport','visible':-1},{'id':'sheet-2','name':'Dane','visible':-1},{'id':'hidden','name':'Ukryty','visible':0},{'id':'very-hidden','name':'Bardzo ukryty','visible':2}],
                 'snapshot':{'sheet_id':'sheet-1','sheet':'Raport','top':1,'left':1,'rows':4,'cols':4,'cells':[{'row':1,'column':1,'address':'A1','value':7,'text':'7,00 zł','formula':'=CUSTOM(1)','kind':'formula','editable':True,'style':{'fill_color':0xE6E6E6,'font_color':0x563412}},
@@ -22692,11 +23314,17 @@ def ui_test():
             operation,args=controller.calls[-1];self.assertEqual(operation,'apply_edits');self.assertEqual(args['workbook_id'],'native-book');self.assertEqual(args['edits'],[{'sheet':'Raport','sheet_id':'sheet-1','address':'A1','kind':'number','value':'1234567890.123456789','expected':{'kind':'formula','value':'=CUSTOM(1)'}}])
             self.assertEqual(dialog.native_model.data(index),'7,00 zł');self.assertFalse(dialog.native_model.setData(dialog.native_model.index(2,1),'fake full'))
             updated=self.native_excel_payload();updated['snapshot']['cells'][0].update(value=12,text='12,00 zł',formula='',kind='number');controller.snapshot.update(state='ready',last_result=updated);dialog.poll();self.assertEqual(dialog.native_model.data(dialog.native_model.index(0,0)),'12,00 zł')
-        def test_office_context_disables_open_events_and_initial_control_only_reveals(self):
+        def test_office_context_disables_open_events_and_initial_control_only_selects(self):
             dialog,instances,scan,action=self.excel_session_fixture();context={'book_id':'local-book','source_path':dialog.file.text(),'source_revision':'a'*64,'sheet':'Raport','control':{'name':'Button 1','caption':'Generuj raport'},'edits':[{'sheet':'Raport','address':'A3','kind':'text','value':'edited'}]}
             dialog.configure_office_context(context);self.assertFalse(dialog.open_events.isEnabled());self.assertEqual(dialog.windowModality(),Qt.WindowModality.WindowModal);dialog.start_session();controller=instances[0]
-            self.assertEqual(controller.calls[0][1]['context']['edits'],context['edits']);self.assertEqual(dialog._launch_context['book_id'],'local-book');controller.snapshot['last_result']=self.native_excel_payload();dialog.poll();self.wait(lambda:any(c[0]=='reveal_control' for c in controller.calls));self.wait(lambda:not dialog._command_pending)
-            self.assertEqual(controller.calls[-1],('reveal_control',{'workbook_id':'native-book','sheet_id':'sheet-1','control_id':'native-control'}));self.assertFalse(any(c[0] in ('run_macro','run_control_macro') for c in controller.calls))
+            self.assertEqual(controller.calls[0][1]['context']['edits'],context['edits']);self.assertEqual(dialog._launch_context['book_id'],'local-book');controller.snapshot['last_result']=self.native_excel_payload();dialog.poll();app.processEvents();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual(dialog.native_controls.currentData()['id'],'native-control');self.assertFalse(any(c[0] in ('show_excel','reveal_control','run_macro','run_control_macro') for c in controller.calls))
+        def test_office_layout_handoff_disables_open_events_without_cell_edits(self):
+            dialog,instances,scan,action=self.excel_session_fixture();dialog.open_events.setChecked(True)
+            layout=[{'sheet':'Raport','columns':[{'index':2,'width':180}],'rows':[]}]
+            dialog.configure_office_context({'source_path':dialog.file.text(),'edits':[],'layout':layout})
+            self.assertFalse(dialog.open_events.isChecked());self.assertFalse(dialog.open_events.isEnabled());dialog.start_session()
+            self.assertFalse(instances[0].calls[0][1]['run_open_events']);self.assertEqual(instances[0].calls[0][1]['context']['layout'],layout)
         def test_office_missing_control_never_reveals_first_unrelated_control(self):
             dialog,instances,scan,action=self.excel_session_fixture();dialog.configure_office_context({'source_path':dialog.file.text(),'control':{'id':'missing','name':'Missing'},'edits':[]});dialog.start_session();controller=instances[0];controller.snapshot['last_result']=self.native_excel_payload();dialog.poll();app.processEvents()
             self.assertEqual([c[0] for c in controller.calls],['start']);self.assertIn('Nie rozpoznano',dialog.message.text())
@@ -22717,6 +23345,7 @@ def ui_test():
         def test_office_partial_initial_patch_shows_native_state_without_automatic_actions(self):
             dialog,instances,scan,action=self.excel_session_fixture();dialog.configure_office_context({'source_path':dialog.file.text(),'control':{'name':'Button 1'},'edits':[]});dialog.start_session();controller=instances[0]
             controller.snapshot.update(last_result=self.native_excel_payload(),error='Zastosowano 1 zmianę; kolejna komórka jest chroniona.');dialog.poll();app.processEvents()
+            self.assertIs(dialog.body_tabs.currentWidget(),dialog.prompt_scroll);self.assertTrue(dialog.failure_frame.isVisible());dialog.body_tabs.setCurrentIndex(0)
             self.assertTrue(dialog.native_frame.isVisible());self.assertEqual(dialog.native_model.data(dialog.native_model.index(0,0)),'7,00 zł');self.assertFalse(dialog.native_model.editable);self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(dialog._initial_control_pending)
             self.assertEqual([c[0] for c in controller.calls],['start']);self.assertIn('chroniona',dialog.message.text());self.assertTrue(dialog.native_refresh.isEnabled())
         def test_office_native_text_identifiers_and_sheet_activation_match_excel(self):
@@ -22802,7 +23431,7 @@ def ui_test():
             dialog,instances,scan,action=self.excel_session_fixture();dialog._timer.stop();dialog.configure_office_context({'source_path':dialog.file.text(),'control':{'name':'Button 1','caption':'Generuj raport'},'edits':[]})
             self.assertEqual(dialog.open_button.text(),'Uruchom sesję Excela');self.assertTrue(dialog.open_button.isVisible());self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(instances)
             QTest.mouseClick(dialog.open_button,Qt.MouseButton.LeftButton);controller=instances[0];self.assertFalse(dialog.native_macro.isEnabled())
-            controller.snapshot['last_result']=self.native_excel_payload();dialog.poll();self.wait(lambda:any(call[0]=='reveal_control' for call in controller.calls));self.wait(lambda:not dialog._command_pending)
+            controller.snapshot['last_result']=self.native_excel_payload();dialog.poll();app.processEvents();self.assertFalse(any(call[0]=='reveal_control' for call in controller.calls));self.wait(lambda:not dialog._command_pending)
             self.assertFalse(any(call[0] in ('run_macro','run_control_macro') for call in controller.calls))
             controller.snapshot.update(state='ready',operation='',error='');dialog.poll();app.processEvents()
             self.assertEqual(dialog.native_macro.text(),'Uruchom');self.assertEqual(dialog.native_reveal.text(),'Pokaż w Excelu');self.assertTrue(dialog.native_macro.isEnabled())
@@ -22868,6 +23497,19 @@ def ui_test():
             QTest.mouseClick(dialog.native_macro,Qt.MouseButton.LeftButton);self.wait(lambda:not dialog._command_pending);self.assertEqual(controller.calls[-1][0],'run_control_macro')
             controller.snapshot.update(state='ready',error='Zastosowano 1 zmianę; kolejna komórka jest chroniona.',error_operation='open');dialog.poll();app.processEvents()
             self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(dialog.native_model.editable);before=len(controller.calls);dialog.run_control_macro();self.assertEqual(len(controller.calls),before)
+        def test_office_partial_transfer_stays_blocked_after_successful_read_and_save(self):
+            dialog,controller=self.native_session();controller.snapshot.update(state='ready',error='Nie przeniesiono wszystkich zmian.',error_operation='open',handoff_incomplete=True)
+            dialog.poll();self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(dialog.native_model.editable)
+            dialog.refresh_native(background=True);self.wait(lambda:not dialog._command_pending)
+            result=self.native_excel_payload();result['revision']=1;result['handoff_incomplete']=True
+            controller.snapshot.update(state='ready',operation='',last_operation='read_range',error='',error_operation='',last_result=result);dialog.poll();app.processEvents()
+            self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(dialog.native_model.editable);self.assertTrue(dialog.native_refresh.isEnabled());self.assertTrue(dialog.native_reveal.isEnabled());self.assertTrue(dialog.save_working_button.isEnabled())
+            result=dict(result,action='save_working',saved_path=str(self.root/'partial-copy.xlsm'),revision=2)
+            controller.snapshot.update(last_operation='save_working',last_result=result);dialog.poll();app.processEvents()
+            dialog.macro_name.setText('Print');self.assertFalse(dialog.run_button.isEnabled());self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(dialog.native_model.editable)
+            self.assertIn('nową sesję',dialog.prompt_empty.text());self.assertTrue(dialog.native_reveal.isEnabled());self.assertFalse(any(call[0] in ('run_macro','run_control_macro','apply_edits') for call in controller.calls))
+            for action in ('run_macro','run_control_macro','apply_edits'):self.assertFalse(dialog.submit(action,{}))
+            self.assertFalse(any(call[0] in ('run_macro','run_control_macro','apply_edits') for call in controller.calls));self.assertIn('Przeniesienie zmian',dialog.message.text())
         def test_office_background_read_failure_stays_under_the_sheet(self):
             dialog,controller=self.native_session();dialog.message.setText('');dialog.refresh_native(background=True);self.wait(lambda:not dialog._command_pending)
             controller.snapshot.update(state='ready',operation='',error=excel_session_error_text('(Exception from HRESULT: 0x8001010A (RPC_E_SERVERCALL_RETRYLATER))'),error_operation='read_range');dialog.poll();app.processEvents()
@@ -22875,15 +23517,38 @@ def ui_test():
             dialog.refresh_native();self.wait(lambda:not dialog._command_pending);controller.snapshot.update(state='ready',operation='',error='Explicit failure',error_operation='read_range');dialog.poll();self.assertEqual(dialog.message.text(),'Explicit failure')
         def test_office_several_controls_need_explicit_choice_and_vanished_choice_is_not_replaced(self):
             payload=self.native_excel_payload();payload['snapshot']['controls'].append(dict(payload['snapshot']['controls'][0],id='second-control',name='Button 2',caption='Zapisz do bazy'))
-            dialog,controller=self.native_session(payload);self.assertEqual(dialog.native_controls.currentIndex(),-1);self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(dialog.native_reveal.isEnabled())
+            dialog,controller=self.native_session(payload);self.assertEqual(dialog.native_controls.currentIndex(),-1);self.assertFalse(dialog.native_macro.isEnabled());self.assertTrue(dialog.native_reveal.isEnabled())
             dialog.native_controls.setCurrentIndex(1);self.assertTrue(dialog.native_macro.isEnabled());self.assertIn('Zapisz do bazy',dialog.native_macro.toolTip())
             only_first=self.native_excel_payload();controller.snapshot.update(state='ready',last_result=only_first);dialog.poll();app.processEvents()
             self.assertEqual(dialog.native_controls.count(),1);self.assertEqual(dialog.native_controls.currentIndex(),-1);self.assertFalse(dialog.native_macro.isEnabled())
         def test_office_status_line_shows_the_latest_message_on_one_line(self):
             dialog,controller=self.native_session();long='Nie zastosowano zmiany & sprawdź komórkę. '*20
             controller.snapshot.update(state='ready',error=long,error_operation='run_control_macro');dialog.poll();app.processEvents()
+            self.assertIs(dialog.body_tabs.currentWidget(),dialog.prompt_scroll);self.assertEqual(dialog.failure_text.toPlainText(),long);self.assertTrue(dialog.failure_frame.isVisible());dialog.body_tabs.setCurrentIndex(0);app.processEvents()
             self.assertTrue(dialog.notice_button.isVisible());self.assertEqual(dialog.notice_button.toolTip(),long);self.assertLess(dialog.notice_button.height(),60);self.assertTrue(dialog.notice_button.text().endswith(('…','...')));self.assertIn(' & ',dialog.notice_button.text())
-            QTest.mouseClick(dialog.notice_button,Qt.MouseButton.LeftButton);self.assertIs(dialog.body_tabs.currentWidget(),dialog.options_scroll);self.assertFalse(dialog.notice_button.isVisible());self.assertTrue(dialog.message.isVisible())
+            QTest.mouseClick(dialog.notice_button,Qt.MouseButton.LeftButton);self.assertIs(dialog.body_tabs.currentWidget(),dialog.prompt_scroll);self.assertFalse(dialog.notice_button.isVisible());self.assertTrue(dialog.failure_text.isVisible())
+        def test_office_error_keeps_full_details_through_background_read_and_prompt_disappearance(self):
+            dialog,controller=self.native_session();details='COM HRESULT 0x800A03EC '+('X'*1200)+'\nMakro: Raport.Przygotuj'
+            controller.snapshot.update(state='ready',error='Nie można uruchomić makra „Raport.Przygotuj”. Sprawdź, czy jest dostępne w tym skoroszycie.',error_details=details,error_code='macro_unavailable',error_operation='run_macro');dialog.poll();app.processEvents()
+            self.assertIn('ostatnia operacja nie powiodła się',dialog.state_note.text());self.assertTrue(dialog.native_reveal.isEnabled());self.assertNotIn('Najpierw uruchom',dialog.prompt_empty.text())
+            dialog.failure_copy.click();self.assertIn(details,QW.QApplication.clipboard().text());self.assertNotIn('COM HRESULT',dialog.failure_text.toPlainText())
+            dialog.render_prompts([self.excel_prompt_fixture()]);dialog.render_prompts([]);self.assertEqual(dialog.body_tabs.currentIndex(),1);self.assertTrue(dialog.failure_frame.isVisible())
+            dialog.refresh_native(background=True);self.wait(lambda:not dialog._command_pending);payload=self.native_excel_payload();payload['snapshot']['read_at']='later'
+            controller.snapshot.update(state='ready',operation='',last_operation='read_range',last_result=payload,error='');dialog.poll();app.processEvents()
+            self.assertTrue(dialog.failure_frame.isVisible());self.assertIn(details,dialog.error_report())
+            dialog.run_control_macro();self.wait(lambda:not dialog._command_pending);payload['revision']=1
+            controller.snapshot.update(state='ready',operation='',last_operation='run_control_macro',last_result=payload,error='');dialog.poll();app.processEvents()
+            self.assertIsNone(dialog._last_failure);self.assertFalse(dialog.failure_frame.isVisible());self.assertNotIn('nie powiodła',dialog.state_note.text())
+        def test_office_show_window_works_without_control_and_during_blocked_macro(self):
+            payload=self.native_excel_payload();payload['snapshot']['controls']=[];dialog,controller=self.native_session(payload)
+            self.assertTrue(dialog.native_reveal.isEnabled());dialog.native_reveal.click();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual(controller.calls[-1],('show_excel',{'workbook_id':'native-book','sheet_id':'sheet-1'}))
+            controller.snapshot.update(state='busy',operation='run_macro');dialog.poll();self.assertTrue(dialog.native_reveal.isEnabled());dialog.native_reveal.click();self.wait(lambda:not dialog._show_pending)
+            self.assertEqual(controller.calls[-1],('reveal_window',{}));self.assertEqual(controller.snapshot['state'],'busy')
+        def test_office_raw_com_tuple_is_available_only_in_error_details(self):
+            dialog,controller=self.native_session();raw="(-2147352567, 'Exception occurred.', (0, 'Microsoft Excel', 'Cannot run macro', None, 0, -2146827284), None)"
+            controller.snapshot.update(state='ready',error=raw,error_operation='run_macro');dialog.poll();app.processEvents()
+            self.assertIn('Excel nie wykonał polecenia',dialog.failure_text.toPlainText());self.assertNotIn('-2147352567',dialog.failure_text.toPlainText());self.assertIn(raw,dialog.error_report())
         def excel_prompt_fixture(self):
             return {'pid':701,'main_hwnd':702,'hwnd':703,'title':'Microsoft Excel','text':'Znaleziono błąd: Nieprawidłowy numer projektu. Dopuszczalne: Pxxxx KIT-xxxxx KIT-xxxxx Czy przerwać sprawdzanie?',
                 'buttons':[{'hwnd':704,'text':'Tak','id':6,'enabled':True},{'hwnd':705,'text':'Nie','id':7,'enabled':True}],'fingerprint':'prompt-one','complete':True,'enabled':True}
@@ -22954,7 +23619,7 @@ def ui_test():
             instances[0].snapshot.update(state='closed',owned=False,finished=True);dialog.poll();gate.set();self.wait(lambda:not dialog._tasks.pending);self.assertFalse(dialog._last_prompts);action.assert_not_called()
         def test_excel_session_unowned_and_incomplete_prompts_are_not_actionable(self):
             dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();self.wait(lambda:not dialog._scan_pending);scan.reset_mock();instances[0].snapshot['owned']=False;dialog.poll();dialog._last_scan=0;dialog.poll();scan.assert_not_called();self.assertFalse(dialog.pdf_button.isEnabled())
-            prompt=self.excel_prompt_fixture();prompt['complete']=False;dialog.render_prompts([prompt]);self.assertFalse(any(b.isEnabled() for b in dialog.prompt_frame.findChildren(QW.QPushButton)));self.assertFalse(any(b.text().startswith('Pomiń') for b in dialog.prompt_frame.findChildren(QW.QPushButton)))
+            prompt=self.excel_prompt_fixture();prompt['complete']=False;dialog.render_prompts([prompt]);self.assertFalse(any(b.isEnabled() for b in dialog.native_prompt_host.findChildren(QW.QPushButton)));self.assertFalse(any(b.text().startswith('Pomiń') for b in dialog.native_prompt_host.findChildren(QW.QPushButton)))
         def test_excel_session_close_waits_for_owned_cleanup_and_error_finish(self):
             from unittest import mock
             dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();controller=instances[0];controller.snapshot.update(state='error',error='Cleanup pending',owned=True,finished=False);dialog.poll();dialog.start_session();self.assertEqual(len(instances),1);self.assertFalse(dialog.open_button.isEnabled())
@@ -22968,7 +23633,7 @@ def ui_test():
             controller.snapshot.update(state='ready',last_result={'destination':target},error='');dialog.poll();self.assertEqual(controller.calls[-1][0],'close');dialog.poll();self.assertTrue(dialog._disposed)
         def test_excel_session_native_text_is_plain_and_empty_history_events_are_ignored(self):
             prompt=self.excel_prompt_fixture();prompt.update(title='<b>Workbook prompt</b>',text='<script>not markup</script>');dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);dialog.start_session();self.wait(lambda:not dialog._scan_pending)
-            title=next(v for v in dialog.prompt_frame.findChildren(QW.QLabel) if v.text()==prompt['title']);self.assertEqual(title.textFormat(),Qt.TextFormat.PlainText);self.assertEqual(dialog.prompt_frame.findChild(QW.QPlainTextEdit).toPlainText(),prompt['text'])
+            title=next(v for v in dialog.native_prompt_host.findChildren(QW.QLabel) if v.text()==prompt['title']);self.assertEqual(title.textFormat(),Qt.TextFormat.PlainText);self.assertEqual(dialog.native_prompt_host.findChild(QW.QPlainTextEdit).toPlainText(),prompt['text'])
             instances[0].snapshot['events']=[{'seq':1,'event':'created'},{'seq':2,'message':'Gotowe'}];dialog.poll();dialog.poll();self.assertEqual(dialog.history.toPlainText(),'Gotowe')
 
         def test_picker_csv_preserves_existing_analysis(self):
@@ -23273,6 +23938,65 @@ def ui_test():
                 model.setData(model.index(0,0),'42');app.processEvents();model.ensure_cell(1050,55);app.processEvents()
                 self.assertFalse([m for m in messages if 'FAIL!' in m],messages);tester.deleteLater()
             finally:QC.qInstallMessageHandler(previous)
+
+        def overflow_fixture(self):
+            book=sheet_new_book('Overflow fixture');book['origin']=str(self.root/'overflow.xlsx')
+            sheet=book['sheets'][0];sheet['cells']={'A1':{'v':pack('DŁUGI NAGŁÓWEK RAPORTU 0123456789 0123456789 0123456789'),'format':{'foreground':'#112233','background':'#ffffff','bold':True}}}
+            self.window.show_sheet_book(book);ws=self.window.sheet_workspace
+            ws.grid.setColumnWidth(0,72);ws.grid.setColumnWidth(1,100);ws.grid.setColumnWidth(2,100);ws.select_rect((5,5,5,5));app.processEvents()
+            return ws
+        def overflow_ink(self,view,row,column):
+            app.processEvents();view.viewport().repaint();image=view.viewport().grab().toImage();rect=view.visualRect(view.model().index(row,column)).adjusted(7,4,-7,-4)
+            rect=rect.intersected(view.viewport().rect());ratio=image.devicePixelRatio();count=0
+            for y in range(round(rect.top()*ratio),round((rect.bottom()+1)*ratio)):
+                for x in range(round(rect.left()*ratio),round((rect.right()+1)*ratio)):
+                    color=image.pixelColor(x,y)
+                    if color.red()<150 and color.green()<150 and color.blue()<150:count+=1
+            return count
+        def test_sheet_text_overflow_paints_heading_across_empty_neighbours_without_edits(self):
+            ws=self.overflow_fixture();before=dumps(ws.session.book);index=ws.model.index(0,0);source=ws.grid.visualRect(index);spill=ws.grid.text_overflow(index)
+            self.assertIsNotNone(spill);self.assertGreater(spill.right(),ws.grid.visualRect(ws.model.index(0,1)).left());self.assertGreater(self.overflow_ink(ws.grid,0,1),10)
+            self.assertEqual(dumps(ws.session.book),before);self.assertEqual(ws.grid.columnWidth(0),72)
+            # Selecting the heading itself keeps its source background and must
+            # not cut the text merely because a blank neighbour is unselected.
+            ws.select_rect((0,0,0,0));app.processEvents();self.assertIsNotNone(ws.grid.text_overflow(index))
+        def test_sheet_text_overflow_stops_at_values_formulas_and_authored_boundaries(self):
+            ws=self.overflow_fixture();sheet=ws.active_sheet();index=ws.model.index(0,0)
+            for blocker in ({'v':pack('occupied')},{'v':pack(0)},{'f':'=""'},{'format':{'background':'#ffeedd'}}):
+                with self.subTest(blocker=blocker):
+                    sheet['cells']['B1']=blocker;ws.session.calculator.invalidate();ws.model.dataChanged.emit(index,ws.model.index(0,2),[]);app.processEvents()
+                    self.assertIsNone(ws.grid.text_overflow(index))
+            sheet['cells'].pop('B1');ws.session.calculator.invalidate();ws.grid.setColumnHidden(1,True);self.assertIsNone(ws.grid.text_overflow(index));ws.grid.setColumnHidden(1,False)
+            sheet['merges']=['B1:C1'];ws.views.apply_merges(sheet);self.assertIsNone(ws.grid.text_overflow(index))
+            sheet['merges']=['A1:B1'];ws.views.apply_merges(sheet);self.assertIsNone(ws.grid.text_overflow(index))
+            sheet['merges']=[];ws.views.apply_merges(sheet);sheet['cells']['A1']['format']['wrap']=True;self.assertIsNone(ws.grid.text_overflow(index))
+        def test_sheet_text_overflow_respects_frozen_pane_edges(self):
+            ws=self.overflow_fixture();sheet=ws.active_sheet();sheet['cells']['B2']=clone(sheet['cells']['A1']);sheet['freeze']=[1,1];ws.apply_dimensions();ws.session.calculator.invalidate();app.processEvents()
+            self.assertIsNone(ws.views.corner.text_overflow(ws.model.index(0,0)))
+            self.assertIsNone(ws.grid.text_overflow(ws.model.index(0,0)))
+            spill=ws.grid.text_overflow(ws.model.index(1,1));self.assertIsNotNone(spill)
+            self.assertGreaterEqual(spill.left(),0);self.assertFalse(self.overflow_ink(ws.views.corner,0,1))
+        def test_sheet_text_overflow_editor_clears_and_restores_neighbour_pixels(self):
+            ws=self.overflow_fixture();index=ws.model.index(0,0);ws.select_rect((0,0,0,0));ws.grid.setFocus();app.processEvents()
+            self.assertGreater(self.overflow_ink(ws.grid,0,1),10);ws.grid.edit(index);app.processEvents();QTest.qWait(10)
+            editor=next(widget for widget in ws.grid.findChildren(QW.QLineEdit) if widget.objectName()=='cellEditor' and widget.isVisible())
+            self.assertIsNone(ws.grid.text_overflow(index));self.assertEqual(self.overflow_ink(ws.grid,0,1),0)
+            QTest.keyClick(editor,Qt.Key.Key_Escape);app.processEvents();QTest.qWait(10);self.assertGreater(self.overflow_ink(ws.grid,0,1),10)
+            ws.select_rect((0,1,0,1));ws.grid.edit(ws.model.index(0,1));app.processEvents()
+            editor=next(widget for widget in ws.grid.findChildren(QW.QLineEdit) if widget.objectName()=='cellEditor' and widget.isVisible())
+            self.assertIsNone(ws.grid.text_overflow(index));editor.setText('occupied');QTest.keyClick(editor,Qt.Key.Key_Return);app.processEvents();self.assertIsNone(ws.grid.text_overflow(index))
+            self.assertEqual(self.overflow_ink(ws.grid,0,2),0);ws.session.undo();app.processEvents();self.assertIsNotNone(ws.grid.text_overflow(index));self.assertGreater(self.overflow_ink(ws.grid,0,1),10)
+        def test_sheet_text_overflow_paint_scans_only_visible_cells(self):
+            from unittest import mock
+            from PySide6.QtGui import QImage,QPainter
+            ws=self.overflow_fixture();ws.model.ensure_cell(10000,500);app.processEvents();view=ws.grid
+            rows={row for row,_,_ in view._visible_sections(view.verticalHeader(),view.viewport().height())};columns={column for column,_,_ in view._visible_sections(view.horizontalHeader(),view.viewport().width())}
+            image=QImage(view.viewport().size(),QImage.Format.Format_ARGB32);painter=QPainter(image)
+            try:
+                with mock.patch.object(view,'text_overflow',wraps=view.text_overflow) as measure:view._paint_overflow(painter)
+            finally:painter.end()
+            self.assertEqual(measure.call_count,len(rows)*len(columns));self.assertLess(measure.call_count,2000)
+            self.assertTrue(all(call.args[0].row() in rows and call.args[0].column() in columns for call in measure.call_args_list))
 
         def test_sheet_toolbar_fits_small_window(self):
             self.window.resize(920,650);QTest.qWait(180);bar=self.window.titlebar;ws=self.window.sheet_workspace
