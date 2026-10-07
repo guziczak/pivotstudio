@@ -37,6 +37,7 @@ Oracle: stronicowany katalog, wyszukiwanie nazw w bazie i szczegóły obiektów 
 Trwały cache metadanych Oracle w SQLite, odświeżanie generacji i przeglądanie offline.
 Dwuklik pobiera pełną komórkę/LOB; układ mapy dopasowuje się do szerokości widoku.
 Osobna sesja Microsoft Excel: makra, rzeczywiste komunikaty, kopia skoroszytu i PDF.
+Obsługa Excela w osobnym procesie Python/COM; przygotowanie biblioteki pywin32 w aplikacji.
 """
 from __future__ import annotations
 
@@ -102,6 +103,7 @@ REQUIREMENTS = {
     'firebird': ['firebird-driver==2.0.3'],
     'h2': ['JPype1==1.7.1'],
     'secrets': ['keyring==25.6.0'],
+    'excel': ["pywin32==312; sys_platform == 'win32'"],
 }
 
 
@@ -114,9 +116,9 @@ class Cancelled(UserError):
 
 
 DEPENDENCY_MODULES = {'desktop':'PySide6.QtWidgets', 'oracle':'oracledb',
-                      'firebird':'firebird.driver', 'h2':'jpype', 'secrets':'keyring'}
+                      'firebird':'firebird.driver', 'h2':'jpype', 'secrets':'keyring','excel':'pythoncom'}
 DEPENDENCY_NAMES = {'desktop':'interfejsu', 'oracle':'Oracle', 'firebird':'Firebirda',
-                    'h2':'H2', 'secrets':'magazynu poświadczeń'}
+                    'h2':'H2', 'secrets':'magazynu poświadczeń','excel':'sesji Excel'}
 
 
 def dependency_problem(profile, state, details=''):
@@ -129,6 +131,10 @@ def dependency_problem(profile, state, details=''):
     message=('Przygotuj sterownik, aby połączyć się z bazą. Dane połączenia pozostaną zachowane.'
              if state=='missing' else 'Nie można załadować sterownika lub jednej z jego zależności. Przygotuj sprawdzone środowisko.'
              if state=='broken' else 'Wskaż wymagany składnik w ustawieniach połączeń. Pobranie pakietu Python go nie zastępuje.')
+    if profile=='excel':
+        message=('Przygotuj obsługę sesji Excel i uruchom ponownie Pivot Studio, aby otworzyć skoroszyt w osobnej sesji.'
+                 if state=='missing' else 'Nie można załadować obsługi sesji Excel. Przygotuj ją ponownie i uruchom ponownie Pivot Studio.'
+                 if state=='broken' else 'Sesja wymaga Windows i zainstalowanego Microsoft Excel. Pakiet Python nie zastępuje programu Excel.')
     return {'state':state,'profile':profile,'title':title,'message':message,'details':str(details)[:3500]}
 
 
@@ -148,10 +154,11 @@ def dependency_status(profile, settings=None):
     """
     if profile not in DEPENDENCY_MODULES:
         return {'state':'ready','profile':profile,'title':'','message':'','details':''}
-    module=DEPENDENCY_MODULES[profile]
+    modules=('pythoncom','win32com') if profile=='excel' else (DEPENDENCY_MODULES[profile],)
     try:
-        if importlib.util.find_spec(module) is None:
-            return dependency_problem(profile,'missing', 'Brak pakietu '+module+' w interpreterze używanym przez Pivot Studio.')
+        for module in modules:
+            if importlib.util.find_spec(module) is None:
+                return dependency_problem(profile,'missing', 'Brak pakietu '+module+' w interpreterze używanym przez Pivot Studio.')
     except ModuleNotFoundError as exc:
         state='missing' if exc.name and (module==exc.name or module.startswith(exc.name+'.')) else 'broken'
         return dependency_problem(profile,state,str(exc))
@@ -4328,13 +4335,15 @@ def excel_availability():
     """Discovery only: never start Office, read VBA, or change macro policy."""
     if os.name!='nt':return {'available':False,'reason':'Sesja Excel wymaga Windows i zainstalowanego Microsoft Excel.'}
     import winreg
-    powershell=Path(os.environ.get('SystemRoot',r'C:\Windows'))/'System32/WindowsPowerShell/v1.0/powershell.exe'
-    if not powershell.is_file():return {'available':False,'reason':'Nie znaleziono Windows PowerShell do uruchomienia osobnej sesji Excel.'}
     for view in (winreg.KEY_WOW64_64KEY,winreg.KEY_WOW64_32KEY):
         try:
             with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,r'Excel.Application\CLSID',0,winreg.KEY_READ|view) as key:clsid=winreg.QueryValue(key,None)
             with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,'CLSID\\'+clsid+r'\LocalServer32',0,winreg.KEY_READ|view) as key:server=winreg.QueryValue(key,None)
-            if server:return {'available':True,'reason':'Microsoft Excel jest zarejestrowany. Sesja użyje oddzielnej kopii pliku.','powershell':str(powershell)}
+            if server:
+                dependency=dependency_status('excel')
+                if dependency['state']!='ready':
+                    return {'available':False,'reason':dependency['title']+' '+dependency['message'],'dependency':dependency}
+                return {'available':True,'reason':'Microsoft Excel jest zarejestrowany. Sesja użyje oddzielnej kopii pliku.'}
         except OSError:continue
     return {'available':False,'reason':'Nie znaleziono Microsoft Excel. Podgląd XLSX/XLSM nadal działa; wykonanie makr i wydruk przez Excel wymagają jego instalacji.'}
 
@@ -4409,7 +4418,17 @@ def excel_copy_workbook(source,destination,cancelled,cancel_flag=None):
 
 
 EXCEL_SESSION_MAX_MESSAGE=4*1024*1024
-EXCEL_SESSION_BOOTSTRAP="[Console]::InputEncoding=New-Object Text.UTF8Encoding($false); & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadLine()))))"
+
+
+def excel_worker_command():
+    """Run this installed source with the same environment, using data-only IPC."""
+    interpreter=Path(sys.executable)
+    # pythonw has no dependable stdio. A console interpreter with redirected
+    # pipes supplies the protocol without creating another user-facing window.
+    if os.name=='nt' and interpreter.name.lower()=='pythonw.exe':
+        interpreter=interpreter.with_name('python.exe')
+        if not interpreter.is_file():raise UserError('Nie znaleziono python.exe do obsługi sesji Excel. Napraw środowisko Pivot Studio.')
+    return [str(interpreter),'-u',str(Path(__file__).resolve()),'--excel-worker']
 
 
 def excel_session_foreground(owned,hwnd,cancelled):
@@ -4468,303 +4487,419 @@ def excel_session_edits(edits):
     return result
 
 
-EXCEL_SESSION_POWERSHELL = r'''
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
-[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-$sessionId = ''; $excel = $null; $book = $null; $ownedExcel = $false
-$sheetRefs = @{}; $controlRefs = @{}; $workbookId = ''; $script:revision = 0; $script:applied = 0
-function Send-Session($event) {
-    $event['session_id'] = $sessionId
-    $json = $event | ConvertTo-Json -Compress -Depth 12
-    if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 4000000) { throw 'Snapshot exceeds 4 MB. Read a smaller range.' }
-    [Console]::Out.WriteLine($json)
-    [Console]::Out.Flush()
-}
-function Same-Com($a,$b) {
-    if ($null -eq $a -or $null -eq $b) { return $false }
-    $pa = [Runtime.InteropServices.Marshal]::GetIUnknownForObject($a)
-    try { $pb = [Runtime.InteropServices.Marshal]::GetIUnknownForObject($b); try { return $pa -eq $pb } finally { [void][Runtime.InteropServices.Marshal]::Release($pb) } }
-    finally { [void][Runtime.InteropServices.Marshal]::Release($pa) }
-}
-function Bound-Book {
-    foreach ($candidate in $excel.Workbooks) { if (Same-Com $book $candidate) { return } }
-    throw 'The bound workbook has been closed. Open a new session; writes were not retried.'
-}
-function Sheet-Id($sheet) {
-    foreach ($id in @($sheetRefs.Keys)) { if (Same-Com $sheetRefs[$id] $sheet) { return $id } }
-    $id = [Guid]::NewGuid().ToString('N'); $sheetRefs[$id] = $sheet; return $id
-}
-function Find-Sheet($command) {
-    Bound-Book
-    foreach ($sheet in $book.Worksheets) {
-        if ($command.sheet_id) { if ($sheetRefs.ContainsKey([string]$command.sheet_id) -and (Same-Com $sheetRefs[[string]$command.sheet_id] $sheet)) { return ,$sheet } }
-        elseif ($command.sheet) { if ([string]$sheet.Name -ceq [string]$command.sheet) { return ,$sheet } }
-        elseif (Same-Com $sheet $excel.ActiveSheet) { return ,$sheet }
-    }
-    if (-not $command.sheet_id -and -not $command.sheet -and $book.Worksheets.Count -gt 0) { return ,$book.Worksheets.Item(1) }
-    throw 'The requested worksheet no longer exists in the bound workbook.'
-}
-function Cell-Error($cell,$value) {
-    if ($value -is [Runtime.InteropServices.ErrorWrapper]) { return $true }
-    if ($value -is [int]) { try { return [bool]$excel.WorksheetFunction.IsError($cell) } catch {} }
-    return $false
-}
-function Cell-State($cell) {
-    if ([bool]$cell.HasFormula) {
-        try { $formula = [string]$cell.Formula2 } catch { $formula = [string]$cell.Formula }
-        return @{ kind='formula'; value=$formula }
-    }
-    $value = $cell.Value2
-    if ($null -eq $value) { return @{kind='blank';value=$null} }
-    if (Cell-Error $cell $value) { return @{kind='error';value=[string]$cell.Text} }
-    if ($value -is [bool]) { return @{kind='boolean';value=$value} }
-    if ($value -is [string]) { return @{kind='text';value=$value} }
-    return @{kind='number';value=$value}
-}
-function Check-Expected($cell,$edit) {
-    if ($null -eq $edit.expected) { return }
-    $actual = Cell-State $cell; $expected = $edit.expected
-    if ($actual.kind -cne [string]$expected.kind) { throw ('Cell changed since it was read: '+$edit.sheet+'!'+$edit.address) }
-    if ($actual.kind -eq 'number') { $equal = [double]$actual.value -eq [double]::Parse([string]$expected.value,[Globalization.CultureInfo]::InvariantCulture) }
-    elseif ($actual.kind -eq 'blank') { $equal = $true }
-    else { $equal = [string]$actual.value -ceq [string]$expected.value }
-    if (-not $equal) { throw ('Cell changed since it was read: '+$edit.sheet+'!'+$edit.address) }
-}
-function Apply-Edits($edits) {
-    $script:applied = 0; $targets = @()
-    if (@($edits).Count -gt 1000) { throw 'Too many explicit edits.' }
-    foreach ($edit in @($edits)) {
-        if ([string]$edit.address -notmatch '^[A-Z]{1,3}[1-9][0-9]{0,6}$') { throw 'Expected a single A1 cell address.' }
-        $sheet = Find-Sheet $edit; $cell = $sheet.Range([string]$edit.address)
-        if (($sheet.ProtectContents -and $cell.Locked) -or $cell.HasArray) { throw ('Cell is protected or belongs to an array: '+$edit.address) }
-        if ($cell.MergeCells -and [string]$cell.MergeArea.Cells.Item(1,1).Address() -ne [string]$cell.Address()) { throw 'Edit the anchor of a merged cell.' }
-        Check-Expected $cell $edit; $targets += @{cell=$cell;edit=$edit;sheet=$sheet}
-    }
-    foreach ($target in $targets) {
-        Bound-Book; $cell=$target.cell; $edit=$target.edit; $liveSheet=Find-Sheet $edit
-        if (-not (Same-Com $liveSheet $target.sheet)) { throw 'Worksheet changed during the edit. Inspect the partial result; do not retry automatically.' }
-        Check-Expected $cell $edit
-        switch ([string]$edit.kind) {
-            'blank' { [void]$cell.ClearContents() }
-            'text' { $format=$cell.NumberFormat; try { $cell.NumberFormat='@'; $cell.Value2=[string]$edit.value } finally { $cell.NumberFormat=$format } }
-            'boolean' { $cell.Value2 = [bool]$edit.value }
-            'number' { $cell.Value2 = [double]::Parse([string]$edit.value,[Globalization.CultureInfo]::InvariantCulture) }
-            'formula' { $modern=$false; try { $null=$cell.Formula2; $modern=$true } catch {}; if ($modern) { $cell.Formula2=[string]$edit.value } else { $cell.Formula=[string]$edit.value } }
-            default { throw 'Unsupported explicit edit.' }
-        }
-        $script:applied++; $script:revision++
-    }
-}
-function Macro-Name($action) {
-    $name=[string]$action; $quoted="'"+([string]$book.Name).Replace("'","''")+"'!"; $plain=[string]$book.Name+'!'
-    if ($name.StartsWith($quoted,[StringComparison]::Ordinal)) { $name=$name.Substring($quoted.Length) }
-    elseif ($name.StartsWith($plain,[StringComparison]::Ordinal)) { $name=$name.Substring($plain.Length) }
-    if ($name -cmatch '^[^\W\d]\w*(\.[^\W\d]\w*)?$') { return $name }; return ''
-}
-function Control-State($shape) {
-    $visible=([int]$shape.Visible -eq -1); $enabled=$true
-    if ([int]$shape.Type -eq 8) { try { $enabled=[bool]$shape.ControlFormat.Enabled } catch {$enabled=$null} }
-    if ([int]$shape.Type -eq 12) {$enabled=$null}
-    return @{visible=$visible;enabled=$enabled;enabled_known=($null -ne $enabled)}
-}
-function Controls($sheet,$sheetId) {
-    $result=@(); $count=0
-    foreach ($old in @($controlRefs.Keys)) { if ($controlRefs[$old].sheet_id -ceq $sheetId) {$controlRefs.Remove($old)} }
-    foreach ($shape in $sheet.Shapes) {
-        $count++; if ($count -gt 500) { break }
-        $action=''; try { $action=[string]$shape.OnAction } catch {}
-        $type=[int]$shape.Type
-        if (-not $action -and $type -ne 8 -and $type -ne 12) { continue }
-        $name=[string]$shape.Name
-        $hash=[Security.Cryptography.SHA256]::Create()
-        try { $fingerprint=[BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($name+"`n"+$action+"`n"+$type))).Replace('-','').Substring(0,20) } finally { $hash.Dispose() }
-        $id=$sheetId+':'+[string]$shape.ID+':'+$fingerprint
-        $caption=''; try { $caption=[string]$shape.TextFrame.Characters().Text } catch {}
-        if ($caption.Length -gt 500) { $caption=$caption.Substring(0,500) }
-        $macro=Macro-Name $action
-        $availability=Control-State $shape
-        $controlRefs[$id]=@{shape=$shape;name=$name;action=$action;type=$type;sheet_id=$sheetId}
-        $reason='Application.Run does not emulate a click or Application.Caller.'
-        if ($type -eq 12) {$reason='ActiveX events require the real Excel control; its Object is not invoked by the bridge.'}
-        $result+=@{id=$id;name=$name;type=$type;on_action=$action;caption=$caption;native_only=$true;unsupported_reason=$reason;visible=$availability.visible;enabled=$availability.enabled;enabled_known=$availability.enabled_known;macro_supported=($type -ne 12 -and [bool]$macro -and $availability.visible -and $availability.enabled);macro_name=$macro;top=[double]$shape.Top;left=[double]$shape.Left;width=[double]$shape.Width;height=[double]$shape.Height;anchor_row=[int]$shape.TopLeftCell.Row;anchor_column=[int]$shape.TopLeftCell.Column}
-    }
-    return ,$result
-}
-function Find-Control($command,$sheet) {
-    $id=[string]$command.control_id
-    if (-not $controlRefs.ContainsKey($id)) { throw 'Refresh controls before using this control.' }
-    $known=$controlRefs[$id]
-    if ($known.sheet_id -cne [string]$command.sheet_id) { throw 'Control belongs to another worksheet.' }
-    foreach ($shape in $sheet.Shapes) {
-        if (Same-Com $shape $known.shape) {
-            $action=''; try { $action=[string]$shape.OnAction } catch {}
-            if ([string]$shape.Name -cne $known.name -or $action -cne $known.action -or [int]$shape.Type -ne $known.type) { throw 'Control changed. Refresh before continuing.' }
-            return ,$shape
-        }
-    }
-    throw 'Control has been removed. Refresh the worksheet.'
-}
-function Read-Range($command) {
-    $sheet=Find-Sheet $command; $sid=Sheet-Id $sheet
-    $top=1; $left=1; $rows=30; $cols=12
-    if ($command.top) {$top=[int]$command.top}; if ($command.left) {$left=[int]$command.left}
-    if ($command.rows) {$rows=[int]$command.rows}; if ($command.cols) {$cols=[int]$command.cols}
-    if ($top -lt 1 -or $left -lt 1 -or $rows -lt 1 -or $cols -lt 1 -or $rows -gt 50 -or $cols -gt 30 -or $top+$rows-1 -gt 1048576 -or $left+$cols-1 -gt 16384) { throw 'Invalid viewport bounds.' }
-    $cells=@(); $rd=@(); $cd=@(); $merges=@{}; $budget=0
-    for ($r=$top; $r -lt $top+$rows; $r++) {
-        $row=$sheet.Rows.Item($r); $rd+=@{row=$r;height=[double]$row.RowHeight;hidden=[bool]$row.Hidden}
-        for ($c=$left; $c -lt $left+$cols; $c++) {
-            $cell=$sheet.Cells.Item($r,$c); $raw=$cell.Value2; $state=Cell-State $cell; $text=[string]$cell.Text; $formula=''; $truncated=$false
-            if ($state.kind -eq 'formula') { $formula=[string]$state.value }
-            if (Cell-Error $cell $raw) { $raw=$text }
-            if ($raw -is [string] -and $raw.Length -gt 4000) {$raw=$raw.Substring(0,4000);$truncated=$true}
-            if ($text.Length -gt 4000) {$text=$text.Substring(0,4000);$truncated=$true}
-            $budget+=([string]$raw).Length+$text.Length+$formula.Length
-            if ($budget -gt 500000) { throw 'Viewport text exceeds the limit. Read a smaller range.' }
-            $style=@{}; try {
-                $display=$cell.DisplayFormat
-                $style=@{bold=[bool]$display.Font.Bold;italic=[bool]$display.Font.Italic;font_size=[double]$display.Font.Size;font_color=[int]$display.Font.Color;fill_color=[int]$display.Interior.Color;number_format=[string]$display.NumberFormat;wrap_text=[bool]$cell.WrapText;horizontal_alignment=[int]$cell.HorizontalAlignment}
-            } catch {}
-            $merge=$null; $anchor=$true
-            if ($cell.MergeCells) {
-                $area=$cell.MergeArea; $merge=[string]$area.Address($false,$false); $anchor=($r -eq [int]$area.Row -and $c -eq [int]$area.Column)
-                $merges[$merge]=@{address=$merge;row=[int]$area.Row;column=[int]$area.Column;rows=[int]$area.Rows.Count;columns=[int]$area.Columns.Count}
-            }
-            $cells+=@{row=$r;column=$c;address=[string]$cell.Address($false,$false);value=$raw;text=$text;formula=$formula;kind=$state.kind;style=$style;merge=$merge;truncated=$truncated;editable=($anchor -and -not $truncated -and -not $cell.HasArray -and (-not $sheet.ProtectContents -or -not $cell.Locked))}
-        }
-    }
-    for ($c=$left; $c -lt $left+$cols; $c++) { $column=$sheet.Columns.Item($c); $cd+=@{column=$c;width=[double]$column.Width;hidden=[bool]$column.Hidden} }
-    return @{sheet_id=$sid;sheet=[string]$sheet.Name;top=$top;left=$left;rows=$rows;cols=$cols;cells=$cells;row_dimensions=$rd;column_dimensions=$cd;merges=@($merges.Values);controls=(Controls $sheet $sid);controls_complete=([int]$sheet.Shapes.Count -le 500);read_at=[DateTime]::UtcNow.ToString('o')}
-}
-function Session-Info {
-    $sheet = ''; $workbook = ''
-    try { $sheet = [string]$excel.ActiveSheet.Name; $workbook = [string]$excel.ActiveWorkbook.Name } catch {}
-    $sheets=@(); if ($null -ne $book) { foreach ($ws in $book.Worksheets) { if ($sheets.Count -ge 500) {break}; $sheets+=@{id=(Sheet-Id $ws);name=[string]$ws.Name;visible=[int]$ws.Visible} } }
-    return @{ active_sheet=$sheet; workbook_name=$workbook;workbook_id=$workbookId;sheets=$sheets;sheets_complete=([int]$book.Worksheets.Count -le 500);revision=$revision;applied=$applied }
-}
-try {
-    $request = [Console]::In.ReadLine() | ConvertFrom-Json
-    $sessionId = [string]$request.session_id
-    $workbookId = $sessionId+'-book'
-    if ($request.action -ne 'open') { throw 'First request must open a working copy.' }
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class PivotExcelProcess { [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid); }
-[ComImport, Guid("00000016-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-public interface IPivotOleMessageFilter {
-    [PreserveSig] int HandleInComingCall(int callType, IntPtr caller, int tickCount, IntPtr interfaceInfo);
-    [PreserveSig] int RetryRejectedCall(IntPtr callee, int tickCount, int rejectType);
-    [PreserveSig] int MessagePending(IntPtr callee, int tickCount, int pendingType);
-}
-public sealed class PivotExcelMessageFilter : IPivotOleMessageFilter {
-    [DllImport("ole32.dll")] static extern int CoRegisterMessageFilter(IPivotOleMessageFilter filter, out IPivotOleMessageFilter previous);
-    public static int Register() { IPivotOleMessageFilter previous; return CoRegisterMessageFilter(new PivotExcelMessageFilter(), out previous); }
-    public int HandleInComingCall(int callType, IntPtr caller, int tickCount, IntPtr interfaceInfo) { return 0; }
-    // SERVERCALL_RETRYLATER: Excel edits a cell or shows a modal window. Retry briefly, then report.
-    public int RetryRejectedCall(IntPtr callee, int tickCount, int rejectType) { return rejectType == 2 && tickCount < 15000 ? 250 : -1; }
-    public int MessagePending(IntPtr callee, int tickCount, int pendingType) { return 2; }
-}
-'@
-    [void][PivotExcelMessageFilter]::Register()
-    $previous = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-    Send-Session @{ event='busy'; id=$request.id; operation='open' }
-    $excel = New-Object -ComObject Excel.Application
-    $excelHwnd = [Int64]$excel.Hwnd; [uint32]$excelPid = 0
-    [void][PivotExcelProcess]::GetWindowThreadProcessId([IntPtr]$excelHwnd,[ref]$excelPid)
-    if ($excelPid -eq 0 -or $previous -contains [int]$excelPid) { throw 'Excel did not create a separate process. Existing Excel windows were not changed.' }
-    $ownedExcel = $true
-    Send-Session @{ event='created'; id=$request.id; pid=[int]$excelPid; hwnd=$excelHwnd }
-    $attach = [Console]::In.ReadLine() | ConvertFrom-Json
-    if ($attach.action -ne 'attach' -or $attach.session_id -ne $sessionId) { throw 'Session cancelled before opening the workbook.' }
-    $excel.AutomationSecurity = 2 # msoAutomationSecurityByUI; never lower the user's policy.
-    $excel.EnableEvents = [bool]$request.run_open_events
-    $excel.DisplayAlerts = $true; $excel.Visible = $true
-    $missing = [Type]::Missing
-    $book = $excel.Workbooks.Open([string]$request.path,0,$false,$missing,$missing,$missing,$true,$missing,$missing,$false,$false,$missing,$false)
-    if ($request.run_open_events) { [void]$book.RunAutoMacros(1) }
-    $excel.EnableEvents = $true
-    $initialError=''
-    try { if ($null -ne $request.context.edits -and @($request.context.edits).Count -gt 0) { Apply-Edits $request.context.edits } }
-    catch { $initialError=[string]$_.Exception.Message }
-    if ($request.context.sheet) { $initial=Find-Sheet $request.context; [void]$initial.Activate() }
-    $initialResult=Session-Info
-    try { $initialResult.snapshot=Read-Range $request.context } catch { $initialResult.snapshot_warning=[string]$_.Exception.Message }
-    if ($initialError) { Send-Session @{event='error';id=$request.id;operation='open';result=$initialResult;message=$initialError;applied=$applied;retry_safe=$false} }
-    else { Send-Session @{ event='ready'; id=$request.id; result=$initialResult } }
-    while ($null -ne ($line = [Console]::In.ReadLine())) {
-        $command = $line | ConvertFrom-Json
-        if ($command.session_id -ne $sessionId) { throw 'Wrong session identity.' }
-        if ($command.action -eq 'close') { break }
-        Send-Session @{ event='busy'; id=$command.id; operation=$command.action }
-        try {
-            $excel.AutomationSecurity = 2
-            Bound-Book
-            if ([string]$command.workbook_id -cne $workbookId) { throw 'Wrong workbook identity.' }
-            $script:applied=0; $extra=@{}
-            switch ([string]$command.action) {
-                'run_macro' {
-                    $name = [string]$command.name
-                    if ($name -notmatch '^[^\W\d]\w*(\.[^\W\d]\w*)?$') { throw 'Use a macro name or Module.Macro without workbook qualifiers or arguments.' }
-                    $qualified = "'" + ([string]$book.Name).Replace("'","''") + "'!" + $name
-                    [void]$book.Activate()
-                    [void]$excel.Run($qualified)
-                    $script:revision++
-                }
-                'read_range' { $extra.snapshot=Read-Range $command }
-                'list_sheets' { }
-                'apply_edits' { Apply-Edits $command.edits }
-                'activate_sheet' { $sheet=Find-Sheet $command; [void]$book.Activate(); [void]$sheet.Activate(); $extra.snapshot=Read-Range $command }
-                'reveal_control' {
-                    $sheet=Find-Sheet $command; $shape=Find-Control $command $sheet
-                    if (-not (Control-State $shape).visible) { throw 'This control is hidden in Excel. The bridge does not unhide it.' }
-                    [void]$book.Activate(); [void]$sheet.Activate(); $excel.Visible=$true
-                    [void]$excel.Goto($shape.TopLeftCell,$true)
-                    try { [void]$shape.Select() } catch {}
-                    $extra.native_only=$true
-                    $extra.reveal_hwnd=[Int64]$excel.ActiveWindow.Hwnd
-                }
-                'run_control_macro' {
-                    $sheet=Find-Sheet $command; $shape=Find-Control $command $sheet
-                    $name=Macro-Name ([string]$shape.OnAction)
-                    $availability=Control-State $shape
-                    if ([int]$shape.Type -eq 12 -or -not $name -or -not $availability.visible -or -not $availability.enabled) { throw 'Use the real Excel control. Hidden, disabled or unverified controls are not invoked; Application.Caller and ActiveX events are not emulated.' }
-                    [void]$book.Activate(); [void]$sheet.Activate()
-                    $qualified="'"+([string]$book.Name).Replace("'","''")+"'!"+$name
-                    [void]$excel.Run($qualified); $script:revision++
-                    $extra.caller_emulated=$false
-                }
-                'export_pdf' {
-                    if ($null -eq $excel.ActiveSheet) { throw 'No active sheet to export.' }
-                    [void]$excel.ActiveSheet.ExportAsFixedFormat(0,[string]$command.temp_path,0,$true,$false,$missing,$missing,$false)
-                }
-                'save_copy' { [void]$book.SaveCopyAs([string]$command.temp_path) }
-                'save_working' { [void]$book.SaveCopyAs([string]$command.temp_path) }
-                default { throw 'Unsupported session action.' }
-            }
-            $excel.EnableEvents = $true; $excel.DisplayAlerts = $true
-            $result=Session-Info; foreach ($key in $extra.Keys) {$result[$key]=$extra[$key]}
-            Send-Session @{ event='done'; id=$command.id; operation=$command.action; result=$result }
-        } catch {
-            try { $excel.EnableEvents = $true; $excel.DisplayAlerts = $true } catch {}
-            Send-Session @{ event='error'; id=$command.id; operation=$command.action; applied=$applied; retry_safe=$false; message=([string]$_.Exception.Message).Substring(0,[Math]::Min(1800,([string]$_.Exception.Message).Length)) }
-        }
-    }
-} catch {
-    Send-Session @{ event='fatal'; message=([string]$_.Exception.Message).Substring(0,[Math]::Min(1800,([string]$_.Exception.Message).Length)) }
-} finally {
-    if ($ownedExcel -and $null -ne $excel) {
-        try { $excel.EnableEvents = $false; foreach ($opened in @($excel.Workbooks)) { [void]$opened.Close($false) } } catch {}
-        try { [void]$excel.Quit() } catch {}
-    }
-    if ($null -ne $book) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($book) } catch {} }
-    if ($null -ne $excel) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($excel) } catch {} }
-    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-    Send-Session @{ event='closed' }
-}
-'''
+class _ExcelDispatch:
+    """Late-bound IDispatch only: no type-library generation or executable input."""
+    def __init__(self,ole,pythoncom):
+        object.__setattr__(self,'_ole',ole);object.__setattr__(self,'_com',pythoncom);object.__setattr__(self,'_ids',{})
+    def _wrap(self,value):
+        com=self._com
+        if isinstance(value,com.TypeIIDs[com.IID_IDispatch]):return _ExcelDispatch(value,com)
+        if isinstance(value,com.TypeIIDs[com.IID_IUnknown]):
+            try:return _ExcelDispatch(value.QueryInterface(com.IID_IDispatch),com)
+            except com.com_error:return value
+        if isinstance(value,tuple):return tuple(self._wrap(item) for item in value)
+        return value
+    def _invoke(self,name,flags,*args):
+        if name not in self._ids:self._ids[name]=self._ole.GetIDsOfNames(name)
+        args=tuple(value._ole if isinstance(value,_ExcelDispatch) else value for value in args)
+        return self._wrap(self._ole.Invoke(self._ids[name],0,flags,True,*args))
+    def get(self,name,*args):return self._invoke(name,self._com.DISPATCH_PROPERTYGET,*args)
+    def call(self,name,*args):return self._invoke(name,self._com.DISPATCH_METHOD,*args)
+    def __getattr__(self,name):
+        if name.startswith('_'):raise AttributeError(name)
+        return self.get(name)
+    def __setattr__(self,name,value):
+        if name.startswith('_'):object.__setattr__(self,name,value)
+        else:self._invoke(name,self._com.DISPATCH_PROPERTYPUT,value)
+    def __iter__(self):
+        # Shapes.Item is a method, whereas Worksheets.Item is a property.
+        # The standard collection enumerator avoids either interpretation.
+        com=self._com
+        enum=self._ole.Invoke(com.DISPID_NEWENUM,0,com.DISPATCH_METHOD|com.DISPATCH_PROPERTYGET,True).QueryInterface(com.IID_IEnumVARIANT)
+        while True:
+            values=enum.Next(1)
+            if not values:return
+            yield self._wrap(values[0])
+    def same(self,other):
+        if not isinstance(other,_ExcelDispatch):return False
+        # IUnknown is the COM identity, even when Excel returns a new proxy.
+        return self._ole.QueryInterface(self._com.IID_IUnknown)==other._ole.QueryInterface(self._com.IID_IUnknown)
+
+
+class _ExcelOleMessageFilter:
+    """STA retry policy for calls COM explicitly rejected before execution.
+
+    The native interface is static Python/ctypes code. Failed writes and macros
+    are never replayed by application-level retries.
+    """
+    @staticmethod
+    def retry_delay(tick_count,reject_type):return 250 if reject_type==2 and tick_count<15000 else -1
+    def __init__(self):
+        import ctypes as c
+        self.c=c;self.previous=c.c_void_p();self.registered=False;self.refs=1
+        pointer=c.c_void_p;word=c.c_uint32
+        query_type=c.WINFUNCTYPE(c.c_int32,pointer,pointer,c.POINTER(pointer))
+        ref_type=c.WINFUNCTYPE(word,pointer)
+        incoming_type=c.WINFUNCTYPE(word,pointer,word,pointer,word,pointer)
+        pending_type=c.WINFUNCTYPE(word,pointer,pointer,word,word)
+        supported={uuid.UUID('00000000-0000-0000-c000-000000000046').bytes_le,uuid.UUID('00000016-0000-0000-c000-000000000046').bytes_le}
+        def query(this,iid,out):
+            if not out:return -2147467261  # E_POINTER
+            out[0]=None
+            if iid and c.string_at(iid,16) in supported:out[0]=this;self.refs+=1;return 0
+            return -2147467262  # E_NOINTERFACE
+        def add_ref(this):self.refs+=1;return self.refs
+        def release(this):self.refs=max(0,self.refs-1);return self.refs
+        self.callbacks=(query_type(query),ref_type(add_ref),ref_type(release),
+                        incoming_type(lambda this,kind,caller,ticks,info:0),
+                        pending_type(lambda this,callee,ticks,kind:self.retry_delay(ticks,kind)&0xffffffff),
+                        pending_type(lambda this,callee,ticks,kind:2))
+        self.vtable=(pointer*6)(*(c.cast(callback,pointer).value for callback in self.callbacks))
+        class Interface(c.Structure):_fields_=[('vtable',c.POINTER(pointer))]
+        self.interface=Interface(self.vtable)
+        self.ole=c.WinDLL('ole32');self.ole.CoRegisterMessageFilter.argtypes=[pointer,c.POINTER(pointer)];self.ole.CoRegisterMessageFilter.restype=c.c_int32
+    def register(self):
+        result=self.ole.CoRegisterMessageFilter(self.c.byref(self.interface),self.c.byref(self.previous))
+        if result!=0:raise UserError('Could not register the Excel STA message filter (0x%08X).'%(result&0xffffffff))
+        self.registered=True
+    def _release_pointer(self,pointer):
+        if pointer:
+            c=self.c;vtable=c.cast(pointer,c.POINTER(c.POINTER(c.c_void_p))).contents
+            c.WINFUNCTYPE(c.c_uint32,c.c_void_p)(vtable[2])(pointer)
+    def close(self):
+        if not self.registered:return
+        current=self.c.c_void_p()
+        result=self.ole.CoRegisterMessageFilter(self.previous,self.c.byref(current))
+        if result!=0:raise UserError('Could not restore the previous COM message filter.')
+        self.registered=False
+        self._release_pointer(current);self._release_pointer(self.previous);self.previous=self.c.c_void_p()
+
+
+def excel_worker_error_text(exc):
+    """Keep HRESULTs in JSON errors so the UI can explain Office busy states."""
+    codes=[]
+    for value in (getattr(exc,'hresult',None),(getattr(exc,'excepinfo',None) or (None,)*6)[-1]):
+        if isinstance(value,int) and value:codes.append('0x%08X'%(value&0xffffffff))
+    return (((' '.join(dict.fromkeys(codes)))+' ') if codes else '')+str(exc)[:1800]
+
+
+class ExcelSessionWorker:
+    """One bound workbook in an owned Excel process; all COM stays on its STA."""
+    def __init__(self,pythoncom,output,excel=None,session_id=''):
+        self.pythoncom=pythoncom;self.output=output;self.excel=excel;self.book=None
+        self.session_id=session_id;self.workbook_id=session_id+'-book';self.sheet_refs={};self.control_refs={}
+        self.revision=0;self.applied=0;self.owned_excel=False
+    def send(self,event,**fields):
+        data=dumps(dict(fields,event=event,session_id=self.session_id))
+        if len(data.encode('utf-8'))>EXCEL_SESSION_MAX_MESSAGE:raise UserError('Snapshot exceeds 4 MiB. Read a smaller range.')
+        self.output.write(data+'\n');self.output.flush()
+    @staticmethod
+    def read_request(stream):
+        line=stream.readline(EXCEL_SESSION_MAX_MESSAGE+1)
+        if not line:return None
+        if len(line.encode('utf-8'))>EXCEL_SESSION_MAX_MESSAGE:raise UserError('Excel command exceeds 4 MiB.')
+        def invalid_constant(value):raise ValueError('Invalid JSON number: '+value)
+        value=json.loads(line,parse_constant=invalid_constant)
+        if not isinstance(value,dict):raise UserError('Expected a JSON command object.')
+        return value
+    def validate_open(self,request):
+        sid=request.get('session_id')
+        if not isinstance(sid,str) or not sid or len(sid)>200:raise UserError('Invalid session identity.')
+        self.session_id=sid;self.workbook_id=sid+'-book'
+        if request.get('action')!='open':raise UserError('First request must open a working copy.')
+        path=request.get('path')
+        if not isinstance(path,str) or not path or '\x00' in path:raise UserError('A workbook path is required.')
+        if Path(path).suffix.lower() not in WORKBOOK_SUFFIXES or not Path(path).is_file():raise UserError('The working copy must be an existing XLSX or XLSM file.')
+        if type(request.get('run_open_events',False)) is not bool:raise UserError('Invalid open-event option.')
+        context=request.get('context',{})
+        if not isinstance(context,dict):raise UserError('Invalid workbook context.')
+        if request.get('run_open_events') and context.get('edits'):raise UserError('Open events cannot run before initial edits.')
+    @staticmethod
+    def same_com(a,b):
+        if a is None or b is None:return False
+        if isinstance(a,_ExcelDispatch):return a.same(b)
+        return a is b  # Injected test objects; real COM always uses _ExcelDispatch.
+    def bound_book(self):
+        if self.book is not None:
+            for candidate in self.excel.Workbooks:
+                if self.same_com(self.book,candidate):return
+        raise UserError('The bound workbook has been closed. Open a new session; writes were not retried.')
+    def sheet_id(self,sheet):
+        for identity,known in self.sheet_refs.items():
+            if self.same_com(known,sheet):return identity
+        identity=uid();self.sheet_refs[identity]=sheet;return identity
+    def find_sheet(self,command):
+        self.bound_book();sid=command.get('sheet_id');name=command.get('sheet')
+        for sheet in self.book.Worksheets:
+            if sid:
+                if self.same_com(self.sheet_refs.get(sid),sheet):return sheet
+            elif name:
+                if str(sheet.Name)==name:return sheet
+            elif self.same_com(sheet,self.excel.ActiveSheet):return sheet
+        if not sid and not name and self.book.Worksheets.Count:return self.book.Worksheets.get('Item',1)
+        raise UserError('The requested worksheet no longer exists in the bound workbook.')
+    def cell_error(self,cell,value):
+        # pywin32 exposes VT_ERROR as a signed integer. Value2 numbers normally
+        # arrive as doubles; IsError distinguishes an error from a numeric int.
+        if type(value) is int:return bool(self.excel.WorksheetFunction.call('IsError',cell))
+        return False
+    def cell_state(self,cell):
+        if cell.HasFormula:
+            try:formula=str(cell.Formula2)
+            except Exception:formula=str(cell.Formula)
+            return {'kind':'formula','value':formula}
+        value=cell.Value2
+        if value is None:return {'kind':'blank','value':None}
+        if self.cell_error(cell,value):return {'kind':'error','value':str(cell.Text)}
+        if type(value) is bool:return {'kind':'boolean','value':value}
+        if isinstance(value,str):return {'kind':'text','value':value}
+        return {'kind':'number','value':value}
+    def check_expected(self,cell,edit):
+        expected=edit.get('expected')
+        if expected is None:return
+        actual=self.cell_state(cell);equal=actual['kind']==expected['kind']
+        if equal:
+            if actual['kind']=='number':equal=float(actual['value'])==float(expected['value'])
+            elif actual['kind']!='blank':equal=actual['value']==expected['value']
+        if not equal:raise UserError('Cell changed since it was read: '+edit['sheet']+'!'+edit['address'])
+    def _check_editable(self,sheet,cell):
+        if (sheet.ProtectContents and cell.Locked) or cell.HasArray:raise UserError('Cell is protected or belongs to an array.')
+        if cell.MergeCells and cell.MergeArea.Cells.get('Item',1,1).get('Address')!=cell.get('Address'):raise UserError('Edit the anchor of a merged cell.')
+    def apply_edits(self,edits):
+        self.applied=0;edits=excel_session_edits(edits);targets=[]
+        for edit in edits:
+            sheet=self.find_sheet(edit);cell=sheet.get('Range',edit['address'])
+            self._check_editable(sheet,cell);self.check_expected(cell,edit);targets.append((cell,edit,sheet))
+        for cell,edit,sheet in targets:
+            self.bound_book();live_sheet=self.find_sheet(edit)
+            if not self.same_com(live_sheet,sheet):raise UserError('Worksheet changed during the edit. Inspect the partial result; do not retry automatically.')
+            self._check_editable(sheet,cell);self.check_expected(cell,edit);kind=edit['kind'];value=edit['value']
+            if kind=='text':
+                previous_format=cell.NumberFormat
+                try:
+                    cell.NumberFormat='@';cell.Value2=value
+                    self.applied+=1;self.revision+=1
+                finally:cell.NumberFormat=previous_format
+                continue
+            if kind=='blank':cell.call('ClearContents')
+            elif kind=='boolean':cell.Value2=value
+            elif kind=='number':cell.Value2=float(value)
+            elif kind=='formula':
+                try:cell.Formula2;modern=True
+                except Exception:modern=False
+                if modern:cell.Formula2=value
+                else:cell.Formula=value
+            self.applied+=1;self.revision+=1
+    def macro_name(self,action):
+        name=str(action or '');book_name=str(self.book.Name)
+        for prefix in ("'"+book_name.replace("'","''")+"'!",book_name+'!'):
+            if name.startswith(prefix):name=name[len(prefix):];break
+        return name if re.fullmatch(r'[^\W\d]\w*(?:\.[^\W\d]\w*)?',name) else ''
+    @staticmethod
+    def control_state(shape):
+        visible=int(shape.Visible)==-1;enabled=True;kind=int(shape.Type)
+        if kind==8:
+            try:enabled=bool(shape.ControlFormat.Enabled)
+            except Exception:enabled=None
+        elif kind==12:enabled=None
+        return {'visible':visible,'enabled':enabled,'enabled_known':enabled is not None}
+    def controls(self,sheet,sid):
+        result=[]
+        for identity in list(self.control_refs):
+            if self.control_refs[identity]['sheet_id']==sid:del self.control_refs[identity]
+        for shape in itertools.islice(sheet.Shapes,500):
+            action=''
+            with contextlib.suppress(Exception):action=str(shape.OnAction or '')
+            kind=int(shape.Type)
+            if not action and kind not in (8,12):continue
+            name=str(shape.Name);fingerprint=hashlib.sha256((name+'\n'+action+'\n'+str(kind)).encode('utf-8')).hexdigest().upper()[:20]
+            identity=sid+':'+str(shape.ID)+':'+fingerprint;caption=''
+            with contextlib.suppress(Exception):caption=str(shape.TextFrame.call('Characters').Text or '')[:500]
+            macro=self.macro_name(action);availability=self.control_state(shape)
+            self.control_refs[identity]={'shape':shape,'name':name,'action':action,'type':kind,'sheet_id':sid}
+            reason=('ActiveX events require the real Excel control; its Object is not invoked by the bridge.' if kind==12 else 'Application.Run does not emulate a click or Application.Caller.')
+            result.append(dict(id=identity,name=name,type=kind,on_action=action,caption=caption,native_only=True,unsupported_reason=reason,
+                               macro_supported=bool(kind!=12 and macro and availability['visible'] and availability['enabled']),macro_name=macro,
+                               top=float(shape.Top),left=float(shape.Left),width=float(shape.Width),height=float(shape.Height),
+                               anchor_row=int(shape.TopLeftCell.Row),anchor_column=int(shape.TopLeftCell.Column),**availability))
+        return result
+    def find_control(self,command,sheet):
+        known=self.control_refs.get(command.get('control_id'))
+        if known is None:raise UserError('Refresh controls before using this control.')
+        if known['sheet_id']!=command.get('sheet_id'):raise UserError('Control belongs to another worksheet.')
+        for shape in sheet.Shapes:
+            if self.same_com(shape,known['shape']):
+                action=''
+                with contextlib.suppress(Exception):action=str(shape.OnAction or '')
+                if str(shape.Name)!=known['name'] or action!=known['action'] or int(shape.Type)!=known['type']:raise UserError('Control changed. Refresh before continuing.')
+                return shape
+        raise UserError('Control has been removed. Refresh the worksheet.')
+    def read_range(self,command):
+        sheet=self.find_sheet(command);sid=self.sheet_id(sheet)
+        top,left,rows,cols=(command.get(key,default) for key,default in (('top',1),('left',1),('rows',30),('cols',12)))
+        if any(type(value) is not int or value<1 for value in (top,left,rows,cols)) or rows>50 or cols>30 or top+rows-1>1048576 or left+cols-1>16384:raise UserError('Invalid viewport bounds.')
+        cells=[];rd=[];cd=[];merges={};budget=0
+        for r in range(top,top+rows):
+            row=sheet.Rows.get('Item',r);rd.append({'row':r,'height':float(row.RowHeight),'hidden':bool(row.Hidden)})
+            for c in range(left,left+cols):
+                cell=sheet.Cells.get('Item',r,c);raw=cell.Value2;state=self.cell_state(cell);text=str(cell.Text or '');formula=state['value'] if state['kind']=='formula' else '';truncated=False
+                if self.cell_error(cell,raw):raw=text
+                if isinstance(raw,str) and len(raw)>4000:raw=raw[:4000];truncated=True
+                if len(text)>4000:text=text[:4000];truncated=True
+                budget+=len(str(raw or ''))+len(text)+len(formula)
+                if budget>500000:raise UserError('Viewport text exceeds the limit. Read a smaller range.')
+                style={}
+                with contextlib.suppress(Exception):
+                    display=cell.DisplayFormat
+                    style={'bold':bool(display.Font.Bold),'italic':bool(display.Font.Italic),'font_size':float(display.Font.Size),
+                           'font_color':int(display.Font.Color),'fill_color':int(display.Interior.Color),'number_format':str(display.NumberFormat),
+                           'wrap_text':bool(cell.WrapText),'horizontal_alignment':int(cell.HorizontalAlignment)}
+                merge=None;anchor=True
+                if cell.MergeCells:
+                    area=cell.MergeArea;merge=str(area.get('Address',False,False));anchor=r==int(area.Row) and c==int(area.Column)
+                    merges[merge]={'address':merge,'row':int(area.Row),'column':int(area.Column),'rows':int(area.Rows.Count),'columns':int(area.Columns.Count)}
+                cells.append({'row':r,'column':c,'address':str(cell.get('Address',False,False)),'value':raw,'text':text,'formula':formula,'kind':state['kind'],
+                              'style':style,'merge':merge,'truncated':truncated,'editable':bool(anchor and not truncated and not cell.HasArray and (not sheet.ProtectContents or not cell.Locked))})
+        for c in range(left,left+cols):
+            column=sheet.Columns.get('Item',c);cd.append({'column':c,'width':float(column.Width),'hidden':bool(column.Hidden)})
+        return {'sheet_id':sid,'sheet':str(sheet.Name),'top':top,'left':left,'rows':rows,'cols':cols,'cells':cells,'row_dimensions':rd,'column_dimensions':cd,
+                'merges':list(merges.values()),'controls':self.controls(sheet,sid),'controls_complete':int(sheet.Shapes.Count)<=500,'read_at':utcnow()}
+    def session_info(self):
+        active_sheet='';workbook_name=''
+        with contextlib.suppress(Exception):active_sheet=str(self.excel.ActiveSheet.Name);workbook_name=str(self.excel.ActiveWorkbook.Name)
+        sheets=[]
+        if self.book is not None:
+            for sheet in itertools.islice(self.book.Worksheets,500):sheets.append({'id':self.sheet_id(sheet),'name':str(sheet.Name),'visible':int(sheet.Visible)})
+        return {'active_sheet':active_sheet,'workbook_name':workbook_name,'workbook_id':self.workbook_id,'sheets':sheets,
+                'sheets_complete':self.book is not None and int(self.book.Worksheets.Count)<=500,'revision':self.revision,'applied':self.applied}
+    def open_workbook(self,request):
+        # Invoke (without type information) needs VT_ERROR/DISP_E_PARAMNOTFOUND;
+        # pythoncom.Missing is reserved for the generated InvokeTypes wrappers.
+        context=request.get('context',{});missing=self.pythoncom.ArgNotFound
+        self.excel.AutomationSecurity=2  # msoAutomationSecurityByUI: respect Office/user policy.
+        self.excel.EnableEvents=bool(request.get('run_open_events',False));self.excel.DisplayAlerts=True;self.excel.Visible=True
+        self.book=self.excel.Workbooks.call('Open',request['path'],0,False,missing,missing,missing,True,missing,missing,False,False,missing,False)
+        if self.book is None:raise UserError('Excel did not open the working copy. Check the Excel window.')
+        if request.get('run_open_events'):self.book.call('RunAutoMacros',1)
+        self.excel.EnableEvents=True;initial_error=None
+        try:
+            if context.get('edits'):self.apply_edits(context['edits'])
+        except Exception as exc:initial_error=excel_worker_error_text(exc)
+        if context.get('sheet'):self.find_sheet(context).call('Activate')
+        result=self.session_info()
+        try:result['snapshot']=self.read_range(context)
+        except Exception as exc:result['snapshot_warning']=excel_worker_error_text(exc)
+        if initial_error:self.send('error',id=request.get('id'),operation='open',result=result,message=initial_error,applied=self.applied,retry_safe=False)
+        else:self.send('ready',id=request.get('id'),result=result)
+        return result
+    def handle_command(self,command):
+        if command.get('session_id')!=self.session_id:raise UserError('Wrong session identity.')
+        if command.get('action')=='close':return False
+        action=command.get('action');identity=command.get('id');self.applied=0
+        self.send('busy',id=identity,operation=action)
+        try:
+            self.excel.AutomationSecurity=2;self.bound_book()
+            if command.get('workbook_id')!=self.workbook_id:raise UserError('Wrong workbook identity.')
+            extra={}
+            if action=='run_macro':
+                name=command.get('name','')
+                if not isinstance(name,str) or not re.fullmatch(r'[^\W\d]\w*(?:\.[^\W\d]\w*)?',name):raise UserError('Use a macro name or Module.Macro without workbook qualifiers or arguments.')
+                self.book.call('Activate');self.excel.call('Run',"'"+str(self.book.Name).replace("'","''")+"'!"+name);self.revision+=1
+            elif action=='read_range':extra['snapshot']=self.read_range(command)
+            elif action=='list_sheets':pass
+            elif action=='apply_edits':self.apply_edits(command.get('edits'))
+            elif action=='activate_sheet':
+                sheet=self.find_sheet(command);self.book.call('Activate');sheet.call('Activate');extra['snapshot']=self.read_range(command)
+            elif action=='reveal_control':
+                sheet=self.find_sheet(command);shape=self.find_control(command,sheet)
+                if not self.control_state(shape)['visible']:raise UserError('This control is hidden in Excel. The bridge does not unhide it.')
+                self.book.call('Activate');sheet.call('Activate');self.excel.Visible=True;self.excel.call('Goto',shape.TopLeftCell,True)
+                with contextlib.suppress(Exception):shape.call('Select')
+                extra.update(native_only=True,reveal_hwnd=int(self.excel.ActiveWindow.Hwnd))
+            elif action=='run_control_macro':
+                sheet=self.find_sheet(command);shape=self.find_control(command,sheet);name=self.macro_name(shape.OnAction);availability=self.control_state(shape)
+                if int(shape.Type)==12 or not name or not availability['visible'] or not availability['enabled']:raise UserError('Use the real Excel control. Hidden, disabled or unverified controls are not invoked; Application.Caller and ActiveX events are not emulated.')
+                self.book.call('Activate');sheet.call('Activate');self.excel.call('Run',"'"+str(self.book.Name).replace("'","''")+"'!"+name);self.revision+=1;extra['caller_emulated']=False
+            elif action=='export_pdf':
+                sheet=self.excel.ActiveSheet
+                if sheet is None:raise UserError('No active sheet to export.')
+                missing=self.pythoncom.ArgNotFound;sheet.call('ExportAsFixedFormat',0,command['temp_path'],0,True,False,missing,missing,False)
+            elif action in ('save_copy','save_working'):self.book.call('SaveCopyAs',command['temp_path'])
+            else:raise UserError('Unsupported session action.')
+            self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
+            result=self.session_info();result.update(extra);self.send('done',id=identity,operation=action,result=result)
+        except Exception as exc:
+            with contextlib.suppress(Exception):self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
+            self.send('error',id=identity,operation=action,applied=self.applied,retry_safe=False,message=excel_worker_error_text(exc))
+        return True
+    def close(self):
+        if self.owned_excel and self.excel is not None:
+            with contextlib.suppress(Exception):
+                self.excel.EnableEvents=False
+                for opened in list(self.excel.Workbooks):
+                    with contextlib.suppress(Exception):opened.call('Close',False)
+            with contextlib.suppress(Exception):self.excel.call('Quit')
+        self.control_refs.clear();self.sheet_refs.clear();self.book=None;self.excel=None;self.owned_excel=False
+    def run(self,stdin,request=None,process_ids=None,window_pid=None):
+        try:
+            request=request if request is not None else self.read_request(stdin)
+            if request is None:return 0
+            self.validate_open(request)
+            previous=(process_ids or excel_process_ids)()
+            self.send('busy',id=request.get('id'),operation='open')
+            if self.excel is None:
+                com=self.pythoncom
+                self.excel=_ExcelDispatch(com.CoCreateInstance('Excel.Application',None,com.CLSCTX_LOCAL_SERVER,com.IID_IDispatch),com)
+            hwnd=int(self.excel.Hwnd);pid=int((window_pid or _ExcelNativeWindows().pid)(hwnd))
+            if hwnd<=0 or pid<=0 or pid in previous:raise UserError('Excel did not create a separate process. Existing Excel windows were not changed.')
+            self.owned_excel=True
+            self.send('created',id=request.get('id'),pid=pid,hwnd=hwnd)
+            attach=self.read_request(stdin)
+            if not attach or attach.get('action')!='attach' or attach.get('session_id')!=self.session_id:raise UserError('Session cancelled before opening the workbook.')
+            self.open_workbook(request)
+            while True:
+                command=self.read_request(stdin)
+                if command is None or not self.handle_command(command):break
+            return 0
+        except Exception as exc:
+            fields={'message':excel_worker_error_text(exc)}
+            if isinstance(exc,DependencyError):fields['dependency']=exc.dependency
+            with contextlib.suppress(Exception):self.send('fatal',**fields)
+            return 1
+        finally:
+            self.close()
+            with contextlib.suppress(Exception):self.send('closed')
+
+
+def excel_session_worker_main(stdin=None,stdout=None):
+    """Run the fixed worker entry point; stdin carries bounded JSON data only."""
+    stdin=stdin if stdin is not None else sys.stdin;stdout=stdout if stdout is not None else sys.stdout
+    for stream in (stdin,stdout):
+        if hasattr(stream,'reconfigure'):stream.reconfigure(encoding='utf-8',errors='strict',newline='\n')
+    worker=ExcelSessionWorker(None,stdout);com=None;message_filter=None;initialized=False;running=False
+    try:
+        request=worker.read_request(stdin)
+        if request is None:return 0
+        worker.validate_open(request)  # No COM import, registration or Office launch for invalid/empty input.
+        if os.name!='nt':raise UserError('Sesja Excel wymaga Windows.')
+        sys.coinit_flags=2  # pythoncom's first import also initializes the main thread as STA.
+        com=require_module('pythoncom','excel')
+        com.CoInitializeEx(com.COINIT_APARTMENTTHREADED);initialized=True;worker.pythoncom=com
+        message_filter=_ExcelOleMessageFilter();message_filter.register()
+        running=True
+        return worker.run(stdin,request=request)
+    except Exception as exc:
+        fields={'message':excel_worker_error_text(exc)}
+        if isinstance(exc,DependencyError):fields['dependency']=exc.dependency
+        with contextlib.suppress(Exception):worker.send('fatal',**fields)
+        return 1
+    finally:
+        if not running:
+            worker.close()
+            with contextlib.suppress(Exception):worker.send('closed')
+        if message_filter is not None:
+            with contextlib.suppress(Exception):message_filter.close()
+        if initialized:com.CoUninitialize()
 
 
 def excel_session_error_text(message):
@@ -4814,15 +4949,20 @@ class ExcelSessionController:
         return self.session_id
     def _send(self,document):
         document=dict(document,session_id=self.session_id)
+        serialized=dumps(document)+'\n'
+        if len(serialized.encode('utf-8'))>EXCEL_SESSION_MAX_MESSAGE:raise UserError('Polecenie Excel przekracza limit. Przenieś mniejszy zakres komórek.')
         with self.write_lock:
             process=self.process
             if process is None or process.poll() is not None:raise UserError('Proces sesji Excel nie działa.')
             if self.cancelled.is_set() and document.get('action') not in ('close','attach','open'):raise Cancelled('Sesja została zamknięta.')
-            process.stdin.write(dumps(document)+'\n');process.stdin.flush()
+            process.stdin.write(serialized);process.stdin.flush()
     def _run(self,run_open_events,context):
         try:
             available=excel_availability()
-            if not available['available']:raise UserError(available['reason'])
+            if not available['available']:
+                issue=available.get('dependency')
+                if issue:raise DependencyError(issue['profile'],issue['state'],issue.get('details',''))
+                raise UserError(available['reason'])
             self.original=self.original.resolve();self.root=self.root.resolve()
             if self.original.suffix.lower() not in ('.xlsx','.xlsm') or not self.original.is_file():raise UserError('Wybierz istniejący skoroszyt .xlsx lub .xlsm.')
             self.root.mkdir(parents=True,exist_ok=True);self.temp_root=Path(tempfile.mkdtemp(prefix='session-',dir=self.root));self.staged=self.temp_root/self.original.name
@@ -4854,14 +4994,12 @@ class ExcelSessionController:
                 after=candidate.stat()
                 if (info.st_size,info.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):raise UserError('Plik towarzyszący zmienił się podczas kopiowania: '+candidate.name)
             (self.temp_root/'session.json').write_text(dumps({'session_id':self.session_id,'original_path':str(self.original),'working_copy':str(self.staged),'source_revision':revision,'companions':[p.name for p,_ in companions],'created_at':utcnow(),'retained':True}),encoding='utf-8')
-            import base64
-            encoded=base64.b64encode(EXCEL_SESSION_BOOTSTRAP.encode('utf-16-le')).decode('ascii')
             self.previous=excel_process_ids()
             if self.cancelled.is_set():raise Cancelled('Anulowano otwieranie sesji.')
-            self.process=subprocess.Popen([available['powershell'],'-NoLogo','-NoProfile','-NonInteractive','-Sta','-EncodedCommand',encoded],
-                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',bufsize=1,creationflags=CREATE_NO_WINDOW,cwd=str(self.temp_root))
+            env=dict(os.environ);env.update(PYTHONIOENCODING='utf-8',PYTHONUNBUFFERED='1')
+            self.process=subprocess.Popen(excel_worker_command(),
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',bufsize=1,creationflags=CREATE_NO_WINDOW,cwd=str(self.temp_root),env=env)
             threading.Thread(target=self._stderr,name='pivot-excel-errors',daemon=True).start()
-            self.process.stdin.write(base64.b64encode(EXCEL_SESSION_POWERSHELL.encode('utf-8')).decode('ascii')+'\n');self.process.stdin.flush()
             self._send({'action':'open','id':self.state['job_id'],'path':str(self.staged),'run_open_events':run_open_events,'context':context})
             while True:
                 line=self.process.stdout.readline(EXCEL_SESSION_MAX_MESSAGE+1)
@@ -4870,10 +5008,14 @@ class ExcelSessionController:
                 try:value=json.loads(line.lstrip('\ufeff'))
                 except ValueError:continue
                 self._consume(value)
-            if self.process.wait(timeout=2)!=0 and not self.cancelled.is_set():raise UserError('Proces obsługi Excel zakończył się nieoczekiwanie.')
+            if self.process.wait(timeout=2)!=0 and not self.cancelled.is_set():
+                with self.lock:reported=self.state.get('state')=='error' and bool(self.state.get('error'))
+                if not reported:raise UserError('Proces obsługi Excel zakończył się nieoczekiwanie. Sprawdź historię sesji oraz dzienniki zabezpieczeń systemu.')
         except Exception as exc:
             if not self.cancelled.is_set():
-                with self.lock:self.state.update(state='error',error=safe_error(exc),error_operation='open',job_id='')
+                with self.lock:
+                    self.state.update(state='error',error=safe_error(exc),error_operation='open',job_id='')
+                    if isinstance(exc,DependencyError):self.state['dependency']=clone(exc.dependency)
                 self._event('error',message=safe_error(exc))
         finally:
             self._finish()
@@ -4899,7 +5041,11 @@ class ExcelSessionController:
             self._send({'action':'close' if self.cancelled.is_set() else 'attach'});return
         if event=='fatal':
             message=str(value.get('message','Nie ukończono otwierania sesji Excel.'))[:1800]
-            with self.lock:self.state.update(state='error',error=excel_session_error_text(message),error_operation='open',job_id='')
+            with self.lock:
+                self.state.update(state='error',error=excel_session_error_text(message),error_operation='open',job_id='')
+                issue=value.get('dependency')
+                if isinstance(issue,dict) and issue.get('profile')=='excel' and issue.get('state') in ('missing','broken'):
+                    self.state['dependency']=dependency_problem('excel',issue['state'],issue.get('details',''))
             self._event('error',message=message);return
         if event=='closed':return
         with self.lock:
@@ -5538,14 +5684,15 @@ def sheet_view_colors(style, overrides=None, theme='dark', *, selected=False, cu
 PUBLIC_INDEX = 'https://pypi.org/simple'
 _BOOTSTRAP_ACTIVE = False
 INSTALL_PROFILE_LABELS = {'desktop':'Pivot Studio','oracle':'Oracle','firebird':'Firebird','h2':'H2',
-                          'secrets':'magazynu poświadczeń','drivers':'baz danych','all':'wszystkich funkcji'}
-OPTIONAL_INSTALL_PROFILES = ('oracle','firebird','h2','secrets')
+                          'secrets':'magazynu poświadczeń','excel':'sesji Excel','drivers':'baz danych','all':'wszystkich funkcji'}
+OPTIONAL_INSTALL_PROFILES = ('oracle','firebird','h2','secrets')+(('excel',) if os.name=='nt' else ())
 
 
 def installer_profile_problem(profile,version=None):
     if profile not in INSTALL_PROFILE_LABELS:return 'Nieznany profil instalacji.'
     version=tuple(version or sys.version_info[:2])
     if not (3,10)<=version<(3,15) or sys.maxsize<=2**32:return 'Wymagany Python 3.10–3.14, 64-bit.'
+    if profile=='excel' and os.name!='nt':return 'Obsługa sesji Microsoft Excel jest dostępna tylko w Windows.'
     if profile=='firebird' and version<(3,11):
         return 'Sterownik Firebird wymaga Pythona 3.11 lub nowszego. Pozostałe funkcje mogą działać bez niego.'
     return ''
@@ -5791,7 +5938,7 @@ def install_environment(profile,root=None,wheelhouse=None,progress=print,*,sourc
     """
     problem=installer_profile_problem(profile)
     if problem:raise UserError(problem)
-    requested=set(OPTIONAL_INSTALL_PROFILES) if profile=='drivers' else set(REQUIREMENTS) if profile=='all' else {profile}
+    requested=set(OPTIONAL_INSTALL_PROFILES)-{'excel'} if profile=='drivers' else {'desktop',*OPTIONAL_INSTALL_PROFILES} if profile=='all' else {profile}
     for key in requested:
         problem=installer_profile_problem(key)
         if problem:raise UserError(problem)
@@ -5889,7 +6036,8 @@ def install_environment(profile,root=None,wheelhouse=None,progress=print,*,sourc
             run([py,'-I','-c',desktop_imports+"; print('Importy interfejsu: OK')"],timeout=90)
             # Drivers run in isolated workers. Qt's import hook must not participate
             # in their probes (notably dateutil/six imported by Firebird on Windows).
-            for key,code in [('oracle','import oracledb'),('firebird','import firebird.driver'),('h2','import jpype')]:
+            for key,code in [('oracle','import oracledb'),('firebird','import firebird.driver'),('h2','import jpype'),
+                             ('excel','import pythoncom; import win32com.client.dynamic')]:
                 if key in profiles:run([py,'-I','-c',code+f"; print('Import {key}: OK')"],timeout=90)
             check();marker={'python':str(py),'profiles':sorted(profiles),'version':APP_VERSION,'installed':utcnow(),
                 'platform':platform.platform(),'python_version':list(sys.version_info[:2]),
@@ -6616,7 +6764,7 @@ class ApplicationService:
                         with contextlib.suppress(OSError):output.unlink()
             self.finalized.add(jid)
     def start_install(self,profile):
-        if profile not in ('desktop','drivers','all','oracle','firebird','h2','secrets'): raise UserError('Nieznany profil.')
+        if profile not in INSTALL_PROFILE_LABELS: raise UserError('Nieznany profil.')
         if any(j['status']=='running' for j in self.local_jobs.values()): raise UserError('Instalacja już trwa.')
         jid=uid(); job={'id':jid,'status':'running','stage':'Przygotowanie instalatora','operation':'install','log':[]}; self.local_jobs[jid]=job
         def install():
@@ -8713,6 +8861,7 @@ _LICENSE_RULES = {
     'Apache-2.0': ('Tak · warunki Apache', 'Zachowaj licencję, atrybucje i wymagane NOTICE; oznacz zmiany. Uwzględnij warunki patentowe. Licencja nie udziela praw do znaków towarowych.', 'https://www.apache.org/licenses/LICENSE-2.0'),
     'UPL-1.0 OR Apache-2.0': ('Tak · wybierz wariant', 'Wybierz UPL-1.0 albo Apache-2.0 i spełnij jego warunki, w tym zachowanie odpowiednich not. Sterownik nie udziela licencji na serwer Oracle ani Oracle Client. Składniki zewnętrzne mają osobne noty.', 'https://github.com/oracle/python-oracledb/blob/main/LICENSE.txt'),
     'LGPL-3.0-only': ('Tak · warunki LGPLv3', _LICENSE_LGPL_TERMS, 'https://doc.qt.io/qt-6/lgpl.html'),
+    'PSF + licencje składników': ('Zależnie od składnika', 'Metadane pywin32 deklarują PSF. Wydawca wskazuje różne licencje składników; sprawdź dołączone teksty licencji i noty dla przekazywanych plików.', 'https://github.com/mhammond/pywin32/tree/b312#licenses'),
 }
 # Each entry describes the publisher declaration for this exact release, NOT a
 # hash-verified compliance judgement for every wheel/platform/transitive library.
@@ -8723,6 +8872,7 @@ _LICENSE_PACKAGES = {
     'firebird-driver': ('firebird-driver','2.0.3','MIT','Opcjonalny sterownik Firebird. Wymaga osobnej biblioteki fbclient; ta wersja pakietu wymaga Python >= 3.11.'),
     'jpype1': ('JPype1','1.7.1','Apache-2.0','Opcjonalny most do Javy/JDBC dla H2; Java i H2 mają własne warunki.'),
     'keyring': ('keyring','25.6.0','MIT','Opcjonalny dostęp do systemowego magazynu haseł. Wykaz nie inicjalizuje magazynu.'),
+    'pywin32': ('pywin32','312','PSF + licencje składników','Opcjonalna obsługa COM w osobnym procesie sesji Microsoft Excel na Windows. Microsoft Excel wymaga osobnej instalacji i licencji.'),
 }
 _LICENSE_NOTICE_NAME = re.compile(r'^(?:licen[cs]e|copying\d*|notice|notices|copyright)(?:$|[._-])|^runtime\.library\.exception$',re.I)
 _LICENSE_DENIED_EXT = {'.py','.pyc','.pyd','.exe','.dll','.so','.dylib','.sh','.bat','.cmd','.ps1','.lnk','.url','.msi','.com','.html','.htm','.js'}
@@ -8835,6 +8985,7 @@ def _license_package_row(dist, expected=None):
         # declaration (e.g. a differently packaged internal distribution).
         normalized=' '.join(declared.lower().split())
         accepted={'MIT':{'mit','mit license','mit license (mit license)','osi approved :: mit license'},
+            'PSF + licencje składników':{'psf','python software foundation license','osi approved :: python software foundation license'},
             'Apache-2.0':{'apache-2.0','apache 2.0','apache license 2.0','apache software license'},
             'UPL-1.0 OR Apache-2.0':{'upl-1.0 or apache-2.0','apache-2.0 or upl-1.0'},
             'LGPL-3.0-only':{'lgpl-3.0-only','lgpl-3.0','lgplv3','lgpl-3.0-only or gpl-3.0-only','licenseref-qt-commercial or lgpl-3.0-only or gpl-3.0-only'},
@@ -10515,6 +10666,7 @@ def native_ui_types():
             self.body_tabs=QW.QTabWidget();outer.addWidget(self.body_tabs,1);self._prompt_tab_key=None
             self.options_frame=QW.QWidget();options=QW.QVBoxLayout(self.options_frame);options.setContentsMargins(10,10,10,10)
             options.addWidget(label('Uruchom sesję Excela, a potem wybierz przycisk skoroszytu i kliknij „Uruchom”. Excel pracuje na osobnej kopii pliku.',True,True))
+            self.dependency_card=DependencyCard(window,self);options.addWidget(self.dependency_card)
             self.file=PathField(path,'Skoroszyty Excel (*.xlsx *.xlsm)');options.addWidget(self.file)
             self.open_events=QW.QCheckBox('Uruchom także makra otwarcia');self.open_events.setToolTip('Dotyczy tylko tej zewnętrznej sesji. Excel stosuje własne ustawienia zabezpieczeń makr.');options.addWidget(self.open_events)
             self.companion_button=button('Dodaj pliki powiązane…',self.choose_companions);options.addWidget(self.companion_button,0,Qt.AlignmentFlag.AlignLeft)
@@ -10558,6 +10710,7 @@ def native_ui_types():
             self.file.edit.textChanged.connect(self.update_controls);self.macro_name.textChanged.connect(self.update_controls);self.body_tabs.currentChanged.connect(self.update_controls)
             try:self._availability=excel_availability()
             except Exception as exc:self._availability={'available':False,'reason':safe_error(exc)}
+            self.dependency_card.set_issue(self._availability.get('dependency'))
             self.state_note.setText('Wybierz skoroszyt i otwórz własną sesję Excela.' if self._availability.get('available') else self._availability.get('reason','Excel nie jest dostępny.'))
             if not self._availability.get('available'):self.message.setText(self.state_note.text())
             self.render_prompts([]);self.update_controls();self.resize(900,700);self.fit_to_screen();self._timer.start()
@@ -10776,6 +10929,9 @@ def native_ui_types():
             try:snapshot=self._controller.poll()
             except Exception as exc:self.message.setText(safe_error(exc));return
             previous=self.session_identity();self._snapshot=snapshot;identity=self.session_identity();state=snapshot.get('state')
+            if snapshot.get('dependency') and self.dependency_card.issue!=snapshot['dependency']:
+                self._availability.update(available=False,dependency=clone(snapshot['dependency']))
+                self.dependency_card.set_issue(snapshot['dependency']);self.body_tabs.setCurrentWidget(self.options_scroll)
             if self._auto_read and state!='busy' and not self._command_pending:
                 # The automatic read has ended. Its failure is shown under the sheet, not as a command error.
                 self._auto_read=False;self._quiet_read_error=bool(snapshot.get('error')) and snapshot.get('error_operation')=='read_range'
@@ -11915,10 +12071,11 @@ def native_ui_types():
         def refresh(self):
             if not self.issue:self.hide();return
             self.show();coordinator=self._host.dependencies;state=self.issue['state'];profile=self.issue.get('profile','')
-            applies=coordinator.profile in (profile,'drivers','all')
+            applies=coordinator.profile in ((profile,'all') if profile=='excel' else (profile,'drivers','all'))
             self.heading.setText(self.issue.get('title','Sterownik bazy danych'))
             self.explanation.setText(self.issue.get('message',''))
             self.prepare_button.setText('Napraw sterownik' if state=='broken' else 'Ustawienia klienta' if state=='external' else 'Połącz' if state=='ready' else 'Przygotuj sterownik')
+            if profile=='excel':self.prepare_button.setText('Napraw obsługę Excela' if state=='broken' else 'Przygotuj obsługę Excela')
             self.prepare_button.setEnabled(not coordinator.busy)
             if coordinator.busy:
                 self.explanation.setText(self.issue.get('message','')+'\n'+coordinator.message)
@@ -11931,7 +12088,8 @@ def native_ui_types():
             if not self.issue:return
             coordinator=self._host.dependencies
             if coordinator.busy:return
-            if coordinator.state=='restart' and coordinator.profile in (self.issue.get('profile'),'drivers','all'):
+            profile=self.issue.get('profile')
+            if coordinator.state=='restart' and coordinator.profile in ((profile,'all') if profile=='excel' else (profile,'drivers','all')):
                 self._host.restart_after_preparation();return
             if self.issue['state']=='external':self._host.settings();return
             if self.issue['state']=='ready':
@@ -11949,7 +12107,7 @@ def native_ui_types():
             coordinator.start(self.issue['profile'],self.issue['state']=='broken',self.source)
         def show_details(self):
             if not self.issue:return
-            dialog=FormDialog('Sterownik — szczegóły',self._host);text=QW.QPlainTextEdit();text.setReadOnly(True)
+            dialog=FormDialog('Obsługa Excela — szczegóły' if self.issue.get('profile')=='excel' else 'Sterownik — szczegóły',self._host);text=QW.QPlainTextEdit();text.setReadOnly(True)
             text.setPlainText(str(self.issue.get('details',''))+'\n\n'+self._host.dependencies.details)
             dialog.add_widget(text);dialog.buttons.button(QW.QDialogButtonBox.StandardButton.Cancel).hide();limited_dialog_size(dialog,660,390)
             try:dialog.exec()
@@ -11969,7 +12127,7 @@ def native_ui_types():
                 src=load_package_source();text=('Publiczne PyPI' if src['mode']=='pypi' else 'Offline: '+src['wheel_dir'] if src['mode']=='offline' else 'Artifactory: '+src['index_url']) if src else 'Źródło nie zostało jeszcze wybrane.'
             except UserError as exc:text=str(exc)
             self.source_note=label(text,True,True);self.add_widget(self.source_note)
-            self.profile=combo({'drivers':'Sterowniki baz danych','desktop':'Interfejs PySide6','oracle':'Sterownik Oracle','firebird':'Sterownik Firebird','h2':'Sterownik H2 / JPype','secrets':'Magazyn haseł','all':'Wszystkie biblioteki'},'drivers')
+            self.profile=combo({'drivers':'Sterowniki baz danych','desktop':'Interfejs PySide6','oracle':'Sterownik Oracle','firebird':'Sterownik Firebird','h2':'Sterownik H2 / JPype','secrets':'Magazyn haseł',**({'excel':'Sesja Microsoft Excel'} if os.name=='nt' else {}),'all':'Wszystkie biblioteki'},'drivers')
             self.install_button=button('Wybierz źródło i przygotuj…',self.install,True);self.add_widget(horizontal(self.profile,self.install_button))
             self.note=label('Otworzy się osobne okno Tkinter: PyPI albo Twój adres Artifactory. Hasło podajesz tylko na czas instalacji. Po przygotowaniu uruchom Pivot ponownie.',True,True);self.add_widget(self.note)
             diag=diagnostics(settings)
@@ -18634,13 +18792,15 @@ def excel_session_test_suite():
     import unittest
     from unittest.mock import patch
     fake_processor=r'''
-import json,sys,time,shutil,base64,pathlib
+import json,sys,time,shutil,pathlib
 sys.stdin.reconfigure(encoding='utf-8');sys.stdout.reconfigure(encoding='utf-8')
 def send(event,**kw):
  print(json.dumps(dict(kw,event=event,session_id=session),ensure_ascii=True),flush=True)
-script=base64.b64decode(sys.stdin.readline()).decode('utf-8')
 request=json.loads(sys.stdin.readline());session=request['session_id'];original=request['path']
 pathlib.Path('opened.json').write_text(json.dumps(request),encoding='utf-8')
+if 'Brak bridge' in pathlib.Path(original).name:
+ send('fatal',message='Brak syntetycznego mostka COM.',dependency={'profile':'excel','state':'missing','details':'pythoncom fixture'})
+ raise SystemExit(7)
 def result(command=None):
  value={'active_sheet':'Raport','workbook_name':'copy.xlsm','workbook_id':session+'-book','sheets':[{'id':'native-sheet','name':'Raport','visible':-1}]}
  if command is None or command['action'] in ('read_range','activate_sheet'):
@@ -18677,7 +18837,7 @@ send('closed')
                 def close(inner):inner.running=False
             original_popen=subprocess.Popen;self.original_popen=original_popen
             def launch(command,**kwargs):self.launches.append(command);return original_popen([sys.executable,'-u','-c',fake_processor],**kwargs)
-            for target,replacement in [('excel_availability',lambda:{'available':True,'powershell':'synthetic'}),('excel_process_ids',lambda:{7,8}),('ExcelOwnedProcess',Owned)]:
+            for target,replacement in [('excel_availability',lambda:{'available':True}),('excel_process_ids',lambda:{7,8}),('ExcelOwnedProcess',Owned)]:
                 mocked=patch(__name__+'.'+target,replacement);mocked.start();self.addCleanup(mocked.stop)
             mocked=patch.object(subprocess,'Popen',side_effect=launch);mocked.start();self.addCleanup(mocked.stop)
             self.addCleanup(self.cleanup_sessions)
@@ -18702,8 +18862,9 @@ send('closed')
         def test_ctor_is_lazy_and_copy_is_private(self):
             controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller);self.assertFalse(self.private.exists());controller.start()
             state=self.wait(controller,lambda s:s['state']=='ready');self.assertTrue(state['owned']);self.assertEqual(Path(state['staged_path']).read_bytes(),self.before);self.assertNotEqual(state['staged_path'],str(self.original));self.assertEqual(self.original.read_bytes(),self.before)
-            import base64
-            command=self.launches[0];self.assertNotIn('-ExecutionPolicy',command);self.assertIn('-EncodedCommand',command);self.assertEqual(base64.b64decode(command[-1]).decode('utf-16-le'),EXCEL_SESSION_BOOTSTRAP);self.assertLess(sum(map(len,command)),32760)
+            command=self.launches[0];self.assertEqual(command[1:],['-u',str(Path(__file__).resolve()),'--excel-worker'])
+            self.assertIn(Path(command[0]).name.lower(),('python','python.exe','python3','python3.exe'))
+            request=json.loads((Path(state['workspace_path'])/'opened.json').read_text('utf-8'));self.assertEqual(request['path'],state['staged_path']);self.assertFalse(request['run_open_events'])
         def test_macro_errors_leave_session_ready_for_direct_pdf(self):
             controller=self.start();self.assertEqual(controller.poll()['last_operation'],'open');controller.submit('run_macro',{'name':'Fail'});state=self.wait(controller,lambda s:s['state']=='ready' and bool(s['error']));self.assertIn('synthetic',state['error']);self.assertEqual(state['error_operation'],'run_macro')
             out=self.root/'report.pdf';out.write_bytes(b'previous');controller.submit('export_pdf',{'destination':str(out)});state=self.wait(controller,lambda s:s['state']=='ready' and s['last_result'].get('destination')==str(out));self.assertTrue(out.read_bytes().startswith(b'%PDF-'));self.assertEqual(state['active_sheet'],'Raport');self.assertEqual(self.original.read_bytes(),self.before)
@@ -18712,8 +18873,6 @@ send('closed')
             for raw in ('Exception from HRESULT: 0x800AC472','Wywołanie zostało odrzucone przez wywoływanego. (Wyjątek od HRESULT: 0x80010001 (RPC_E_CALL_REJECTED))','(Exception from HRESULT: 0x8001010A (RPC_E_SERVERCALL_RETRYLATER))'):
                 self.assertIn('Excel jest zajęty',excel_session_error_text(raw))
             self.assertEqual(excel_session_error_text('synthetic macro failure'),'synthetic macro failure')
-            text=EXCEL_SESSION_POWERSHELL;self.assertIn('CoRegisterMessageFilter',text);self.assertIn('rejectType == 2 && tickCount < 15000',text)
-            self.assertLess(text.index('[PivotExcelMessageFilter]::Register()'),text.index('New-Object -ComObject Excel.Application'))
         def test_save_copy_preserves_macro_container(self):
             controller=self.start();out=self.root/'saved.xlsm';controller.submit('save_copy',{'destination':str(out)});self.wait(controller,lambda s:s['state']=='ready' and bool(s['last_result'].get('destination')))
             self.assertEqual(out.read_bytes(),self.before);self.assertEqual(self.original.read_bytes(),self.before)
@@ -18744,6 +18903,18 @@ send('closed')
             with patch(__name__+'.excel_availability',return_value={'available':False,'reason':'Brak Microsoft Excel.'}):
                 controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller);controller.start();self.assertTrue(controller.finished.wait(2))
             self.assertIn('Brak Microsoft Excel',controller.poll()['error']);self.assertFalse(self.launches);self.assertFalse(self.private.exists())
+        def test_worker_fatal_keeps_dependency_detail_instead_of_exit_code(self):
+            self.original=self.root/'Brak bridge żółć.xlsm';self.workbook(self.original)
+            controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller);controller.start();self.assertTrue(controller.finished.wait(4))
+            state=controller.poll();self.assertEqual(state['state'],'error');self.assertEqual(state['error'],'Brak syntetycznego mostka COM.')
+            self.assertEqual(state['dependency']['profile'],'excel');self.assertEqual(state['dependency']['state'],'missing');self.assertIn('pythoncom fixture',state['dependency']['details']);self.assertFalse(self.handles)
+        @unittest.skipUnless(os.name=='nt','Windows interpreter names')
+        def test_worker_uses_sibling_console_python_with_unicode_path(self):
+            folder=self.root/'Python żółć';folder.mkdir();console=folder/'python.exe';console.write_bytes(b'fixture executable name')
+            with patch.object(sys,'executable',str(folder/'pythonw.exe')):
+                command=excel_worker_command();self.assertEqual(command[0],str(console));self.assertEqual(command[1:],['-u',str(Path(__file__).resolve()),'--excel-worker'])
+                console.unlink()
+                with self.assertRaises(UserError):excel_worker_command()
         def test_stale_event_cannot_change_session_or_publish(self):
             controller=self.start();before=controller.poll();controller._consume({'session_id':'wrong','event':'done','id':before['job_id'],'result':{'active_sheet':'wrong'}});self.assertEqual(controller.poll()['active_sheet'],'Raport')
             controller._consume({'session_id':controller.session_id,'event':'done','id':'old','result':{'active_sheet':'wrong'}});self.assertEqual(controller.poll()['active_sheet'],'Raport')
@@ -18767,9 +18938,9 @@ send('closed')
             os.chmod(self.original,0o400);self.addCleanup(lambda:os.chmod(self.original,0o600));controller=self.start();copy=Path(controller.poll()['staged_path'])
             with copy.open('ab') as stream:stream.write(b'')
             controller.close();self.assertTrue(controller.finished.wait(4));self.assertTrue(copy.exists());self.assertEqual(self.original.read_bytes(),self.before)
-        def test_static_script_keeps_macro_policy_and_only_explicit_open_events(self):
-            text=EXCEL_SESSION_POWERSHELL;self.assertIn('$excel.AutomationSecurity = 2',text);self.assertNotIn('AutomationSecurity = 1',text);self.assertNotIn('VBProject',text);self.assertIn('$excel.EnableEvents = [bool]$request.run_open_events',text);self.assertIn('$excel.EnableEvents = $true',text);self.assertNotIn('IgnoreRemoteRequests',text)
-            self.assertIn('.RunAutoMacros(1)',text);self.assertIn('$excel.ActiveSheet.ExportAsFixedFormat',text);self.assertIn('$book.SaveCopyAs',text);self.assertIn('Session cancelled before opening',text)
+        def test_open_events_require_explicit_opt_in(self):
+            controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller);controller.start(run_open_events=True)
+            state=self.wait(controller,lambda s:s['state']=='ready');request=json.loads((Path(state['workspace_path'])/'opened.json').read_text('utf-8'));self.assertIs(request['run_open_events'],True)
         def test_initial_context_is_checked_and_sent_before_ready(self):
             controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller)
             context={'source_revision':hashlib.sha256(self.before).hexdigest(),'sheet':'Raport','sheet_id':'local-id','control':{'id':'local-control'},'edits':[{'sheet':'Raport','address':'a1','kind':'number','value':'42','expected':{'kind':'formula','value':'=SUM(20,22)'}}]}
@@ -18832,93 +19003,227 @@ send('closed')
                 controller._consume({'event':'done','session_id':controller.session_id,'id':'stale','operation':'reveal_control','result':{'reveal_hwnd':848484}});foreground.assert_not_called()
                 controller._consume({'event':'done','session_id':controller.session_id,'id':'reveal','operation':'reveal_control','result':{'reveal_hwnd':848484}});foreground.assert_called_once_with(controller.owned_process,848484,controller.cancelled)
                 self.assertTrue(controller.poll()['last_result']['foreground'])
-        @unittest.skipUnless(os.name=='nt','Windows PowerShell helper execution')
-        def test_powershell_edit_preflight_partial_state_and_macro_identity(self):
-            import base64
-            powershell=Path(os.environ.get('SystemRoot',r'C:\Windows'))/'System32/WindowsPowerShell/v1.0/powershell.exe'
-            if not powershell.is_file():self.skipTest('No Windows PowerShell')
-            helpers=EXCEL_SESSION_POWERSHELL.split('\ntry {\n    $request =',1)[0]
-            harness=r'''
-$script:fakeCells=@{}
-foreach ($address in @('A1','A2')) {$script:fakeCells[$address]=[pscustomobject]@{Value2=1.0;HasFormula=$false;HasArray=$false;MergeCells=$false;Locked=$false;NumberFormat='General';Formula='';Formula2=''}}
-$script:fakeSheet=[pscustomobject]@{ProtectContents=$false}
-$script:fakeSheet | Add-Member ScriptMethod Range {param($address);return ,$script:fakeCells[$address]}
-$actualFind=${function:Find-Sheet}
-function Find-Sheet($command) {return ,$script:fakeSheet}
-function Bound-Book {}
-$oldSheet=[pscustomobject]@{Name='Renamed'};$replacement=[pscustomobject]@{Name='S'}
-$sheetRefs['old-id']=$oldSheet;$book=[pscustomobject]@{Worksheets=@($oldSheet,$replacement)}
-$found=& $actualFind ([pscustomobject]@{sheet_id='old-id';sheet='S'})
-if (-not (Same-Com $found $oldSheet)) {throw 'A renamed sheet lost its stable identity'}
-$book.Worksheets=@($replacement);$failed=$false
-try {$null=& $actualFind ([pscustomobject]@{sheet_id='old-id';sheet='S'})} catch {$failed=$true}
-if (-not $failed) {throw 'A deleted sheet was silently replaced by a new namesake'}
-$edits=@([pscustomobject]@{sheet='S';address='A1';kind='number';value='2.5';expected=[pscustomobject]@{kind='number';value='1'}},[pscustomobject]@{sheet='S';address='A2';kind='text';value='=literal';expected=[pscustomobject]@{kind='number';value='99'}})
-$failed=$false;try {Apply-Edits $edits} catch {$failed=$true}
-if (-not $failed -or $applied -ne 0 -or $fakeCells.A1.Value2 -ne 1) {throw 'Preflight modified a cell'}
-$edits[1].expected.value='1';Apply-Edits $edits
-if ($applied -ne 2 -or $fakeCells.A1.Value2 -ne 2.5 -or $fakeCells.A2.Value2 -cne '=literal' -or $fakeCells.A2.NumberFormat -cne 'General') {throw 'Typed edits failed'}
-Apply-Edits @([pscustomobject]@{sheet='S';address='A1';kind='formula';value='=SEQUENCE(2)'})
-if ($fakeCells.A1.Formula2 -cne '=SEQUENCE(2)' -or $fakeCells.A1.Formula -ne '') {throw 'Wrong formula setter'}
-$book=[pscustomobject]@{Name='Sample.xlsm'}
-if ((Macro-Name "'Sample.xlsm'!Module.Print") -cne 'Module.Print' -or (Macro-Name "'Other.xlsm'!Print") -ne '' -or (Macro-Name 'Print(1)') -ne '') {throw 'Unsafe assigned macro accepted'}
-$script:originalCheck=${function:Check-Expected}
-function Check-Expected($cell,$edit) {if ($script:applied -eq 1 -and $edit.address -eq 'A2') {$cell.Value2=999}; & $script:originalCheck $cell $edit}
-$fakeCells.A1.Value2=1;$fakeCells.A2.Value2=1;$failed=$false
-try {Apply-Edits $edits} catch {$failed=$true}
-if (-not $failed -or $applied -ne 1 -or $fakeCells.A1.Value2 -ne 2.5) {throw 'Partial state or immediate recheck was lost'}
-$script:nativeCell=[pscustomobject]@{Value2=3.0;HasFormula=$true;Formula2='=1+2';Text='3,00';HasArray=$false;MergeCells=$true;Locked=$false;WrapText=$true;HorizontalAlignment=-4131;DisplayFormat=[pscustomobject]@{Font=[pscustomobject]@{Bold=$true;Italic=$false;Size=11.0;Color=255};Interior=[pscustomobject]@{Color=65535};NumberFormat='0.00'}}
-$script:nativeCell | Add-Member ScriptMethod Address {param($a,$b);return 'A1'}
-$merge=[pscustomobject]@{Row=1;Column=1;Rows=@(1,2);Columns=@(1,2)}
-$merge | Add-Member ScriptMethod Address {param($a,$b);return 'A1:B2'}
-$script:nativeCell | Add-Member NoteProperty MergeArea $merge
-$cellCollection=[pscustomobject]@{};$cellCollection | Add-Member ScriptMethod Item {param($r,$c);return ,$script:nativeCell}
-$rowCollection=[pscustomobject]@{};$rowCollection | Add-Member ScriptMethod Item {param($r);return [pscustomobject]@{RowHeight=13.0;Hidden=$false}}
-$columnCollection=[pscustomobject]@{};$columnCollection | Add-Member ScriptMethod Item {param($c);return [pscustomobject]@{Width=88.0;Hidden=$true}}
-$script:fakeSheet=[pscustomobject]@{Name='Native';ProtectContents=$false;Cells=$cellCollection;Rows=$rowCollection;Columns=$columnCollection;Shapes=@()}
-function Sheet-Id($sheet) {return 'stable-sheet'}
-$snapshot=Read-Range ([pscustomobject]@{top=1;left=1;rows=1;cols=1})
-if ($snapshot.cells[0].formula -cne '=1+2' -or $snapshot.cells[0].value -ne 3 -or $snapshot.cells[0].text -cne '3,00' -or -not $snapshot.cells[0].style.bold -or $snapshot.merges[0].rows -ne 2 -or $snapshot.column_dimensions[0].width -ne 88 -or -not $snapshot.column_dimensions[0].hidden) {throw 'Native snapshot lost formula, displayed format, dimensions or merge'}
-$errors=[pscustomobject]@{};$errors | Add-Member ScriptMethod IsError {param($range);return $range.Text -eq '#N/A'}
-$excel=[pscustomobject]@{WorksheetFunction=$errors};$script:nativeCell.HasFormula=$false;$script:nativeCell.Value2=[int]-2146826246;$script:nativeCell.Text='#N/A'
-if ((Cell-State $script:nativeCell).kind -ne 'error') {throw 'VT_ERROR integer was classified as a number'}
-$shape=[pscustomobject]@{ID=7;Name='Print';Type=8;OnAction="'Sample.xlsm'!Module.Print";Visible=-1;ControlFormat=[pscustomobject]@{Enabled=$true};Top=10.0;Left=20.0;Width=50.0;Height=18.0;TopLeftCell=[pscustomobject]@{Row=2;Column=3}}
-$fakeSheet.Shapes=@($shape);$controls=Controls $fakeSheet 'stable-sheet';$control=$controls[0]
-if (-not $control.macro_supported -or $control.macro_name -cne 'Module.Print' -or $control.anchor_column -ne 3) {throw 'Assigned control metadata lost'}
-$command=[pscustomobject]@{sheet_id='stable-sheet';control_id=$control.id}
-$null=Find-Control $command $fakeSheet
-$shape.OnAction='Different';$failed=$false;try {$null=Find-Control $command $fakeSheet} catch {$failed=$true}
-if (-not $failed) {throw 'Stale OnAction was accepted'}
-$shape.ControlFormat.Enabled=$false;$controls=Controls $fakeSheet 'stable-sheet'
-if ($controls[0].macro_supported -or $controls[0].enabled -or $controls[0].id -ceq $control.id) {throw 'Disabled or changed control became callable'}
-$shape.Type=12;$controls=Controls $fakeSheet 'stable-sheet'
-if ($controls[0].macro_supported -or $controls[0].enabled_known -or -not $controls[0].native_only) {throw 'ActiveX was treated as a normal macro'}
-'BRIDGE_HELPERS_OK'
-'''
-            script=base64.b64encode((helpers+harness).encode('utf-8')).decode('ascii')+'\n';bootstrap=base64.b64encode(EXCEL_SESSION_BOOTSTRAP.encode('utf-16-le')).decode('ascii')
-            with patch.object(subprocess,'Popen',self.original_popen):result=subprocess.run([str(powershell),'-NoProfile','-NonInteractive','-Sta','-EncodedCommand',bootstrap],input=script.encode('ascii'),capture_output=True,timeout=20,creationflags=CREATE_NO_WINDOW)
-            self.assertEqual(result.returncode,0,(result.stdout+result.stderr).decode('utf-8','replace'));self.assertIn(b'BRIDGE_HELPERS_OK',result.stdout)
-        @unittest.skipUnless(os.name=='nt','Windows PowerShell parser')
-        def test_powershell_parses_static_worker_without_running_excel(self):
-            import base64
-            powershell=Path(os.environ.get('SystemRoot',r'C:\Windows'))/'System32/WindowsPowerShell/v1.0/powershell.exe'
-            if not powershell.is_file():self.skipTest('No Windows PowerShell')
-            script='$tokens=$null; $errors=$null; $null=[System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(),[ref]$tokens,[ref]$errors); if($errors.Count){$errors|Out-String|Write-Output;exit 1};exit 0'
-            encoded=base64.b64encode(script.encode('utf-16-le')).decode('ascii')
-            with patch.object(subprocess,'Popen',self.original_popen):result=subprocess.run([str(powershell),'-NoProfile','-NonInteractive','-EncodedCommand',encoded],input=EXCEL_SESSION_POWERSHELL.encode('utf-8'),capture_output=True,timeout=20,creationflags=CREATE_NO_WINDOW)
-            self.assertEqual(result.returncode,0,(result.stdout+result.stderr).decode('utf-8','replace'))
-        @unittest.skipUnless(os.name=='nt','Windows PowerShell and COM')
-        def test_message_filter_compiles_and_registers_on_the_sta_thread(self):
-            import base64
-            powershell=Path(os.environ.get('SystemRoot',r'C:\Windows'))/'System32/WindowsPowerShell/v1.0/powershell.exe'
-            if not powershell.is_file():self.skipTest('No Windows PowerShell')
-            block=re.search(r"Add-Type -TypeDefinition @'\n.*?\n'@\n",EXCEL_SESSION_POWERSHELL,re.S).group(0)
-            probe=block+'[PivotExcelMessageFilter]::Register();$f=New-Object PivotExcelMessageFilter;$f.RetryRejectedCall([IntPtr]::Zero,0,2);$f.RetryRejectedCall([IntPtr]::Zero,15000,2);$f.RetryRejectedCall([IntPtr]::Zero,0,1)'
-            encoded=base64.b64encode(probe.encode('utf-16-le')).decode('ascii')
-            with patch.object(subprocess,'Popen',self.original_popen):result=subprocess.run([str(powershell),'-NoProfile','-NonInteractive','-Sta','-EncodedCommand',encoded],capture_output=True,timeout=60,creationflags=CREATE_NO_WINDOW)
-            self.assertEqual(result.returncode,0,(result.stdout+result.stderr).decode('utf-8','replace'))
-            self.assertEqual(result.stdout.decode('utf-8','replace').split(),['0','250','-1','-1'])
-    return unittest.defaultTestLoader.loadTestsFromTestCase(ExcelSessionTests)
+    class FakeCom:
+        def __init__(self,handlers=None,**values):
+            self.handlers=handlers or {};self.calls=[];self.__dict__.update(values)
+        def get(self,name,*args):
+            value=self.handlers[name] if name in self.handlers else getattr(self,name)
+            return value(*args) if callable(value) else value
+        def call(self,name,*args):
+            self.calls.append((name,args));return self.get(name,*args)
+    class FakeCollection(FakeCom):
+        def __init__(self,values=(),**handlers):
+            super().__init__(handlers);self.values=list(values)
+        @property
+        def Count(self):return len(self.values)
+        def __iter__(self):return iter(self.values)
+        def items(self):return iter(self.values)
+        def get(self,name,*args):
+            if name=='Item':return self.values[args[0]-1]
+            return super().get(name,*args)
+    class FakeCell(FakeCom):
+        def __init__(self,address='A1',value=1.0):
+            super().__init__(Value2=value,HasFormula=False,HasArray=False,MergeCells=False,Locked=False,
+                NumberFormat='General',Formula='',Formula2='',Text=str(value),WrapText=True,HorizontalAlignment=-4131,
+                DisplayFormat=FakeCom(Font=FakeCom(Bold=True,Italic=False,Size=11.0,Color=255),Interior=FakeCom(Color=65535),NumberFormat='0.00'))
+            self.handlers.update(Address=lambda *_:address,ClearContents=lambda:setattr(self,'Value2',None));self.writes=[];self.on_write=None
+        def __setattr__(self,name,value):
+            if name in ('Value2','Formula','Formula2') and 'writes' in self.__dict__:
+                if self.on_write:self.on_write(name,value)
+                self.writes.append((name,value))
+            object.__setattr__(self,name,value)
+    class ExcelWorkerTests(unittest.TestCase):
+        def setUp(self):
+            import io
+            self.output=io.StringIO();self.cells={name:FakeCell(name) for name in ('A1','A2')}
+            self.sheet=FakeCom(Name='Raport',Visible=-1,ProtectContents=False,Shapes=FakeCollection(),
+                Cells=FakeCom({'Item':lambda row,col:self.cells[sheet_col_name(col-1)+str(row)]}),
+                Rows=FakeCom({'Item':lambda row:FakeCom(RowHeight=13.0,Hidden=False)}),
+                Columns=FakeCom({'Item':lambda col:FakeCom(Width=88.0,Hidden=True)}))
+            self.sheet.handlers['Range']=lambda address:self.cells[address]
+            self.book=FakeCom(Name="Dane 'żółć'.xlsm",Worksheets=FakeCollection([self.sheet]))
+            self.excel=FakeCom(Workbooks=FakeCollection([self.book]),ActiveWorkbook=self.book,ActiveSheet=self.sheet,
+                WorksheetFunction=FakeCom({'IsError':lambda cell:cell.Text=='#N/A'}))
+            self.worker=ExcelSessionWorker(FakeCom(ArgNotFound=object()),self.output,excel=self.excel,session_id='fixture')
+            self.worker.book=self.book
+            self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.path=Path(self.temp.name)/"Dane 'żółć'.xlsm";self.path.write_bytes(b'inert fake COM workbook')
+        def open_request(self,events=False):
+            self.open_calls=[];self.excel.Hwnd=848484
+            def opened(*args):
+                self.open_calls.append((args,self.excel.AutomationSecurity,self.excel.EnableEvents));return self.book
+            self.excel.Workbooks.handlers['Open']=opened
+            self.book.handlers.update(Activate=lambda:None,RunAutoMacros=lambda *_:None,Close=lambda *_:None)
+            self.sheet.handlers['Activate']=lambda:None;self.excel.handlers['Quit']=lambda:None
+            return {'action':'open','id':'open-fixture','session_id':'fixture','path':str(self.path),'run_open_events':events,
+                'context':{'sheet':'Raport','top':1,'left':1,'rows':1,'cols':1}}
+        def edit(self,address='A1',kind='number',value='2.5',expected='1'):
+            result={'sheet':'Raport','address':address,'kind':kind,'value':value}
+            if expected is not None:result['expected']={'kind':'number','value':expected}
+            return result
+        def test_sheet_identity_survives_rename_and_rejects_namesake_replacement(self):
+            sid=self.worker.sheet_id(self.sheet);self.sheet.Name='Zmieniona'
+            replacement=FakeCom(Name='Raport');self.book.Worksheets.values.append(replacement)
+            self.assertIs(self.worker.find_sheet({'sheet_id':sid,'sheet':'Raport'}),self.sheet)
+            self.book.Worksheets.values.remove(self.sheet)
+            with self.assertRaises(UserError):self.worker.find_sheet({'sheet_id':sid,'sheet':'Raport'})
+        def test_closed_bound_book_cannot_redirect_edits_to_another_workbook(self):
+            self.excel.Workbooks.values=[FakeCom(Name=self.book.Name,Worksheets=FakeCollection([self.sheet]))]
+            with self.assertRaises(UserError):self.worker.apply_edits([self.edit()])
+            self.assertEqual(self.cells['A1'].writes,[])
+        def test_edit_preflight_checks_every_expected_value_before_writing(self):
+            edits=[self.edit(),self.edit('A2','text','=literal','99')]
+            with self.assertRaises(UserError):self.worker.apply_edits(edits)
+            self.assertEqual(self.worker.applied,0);self.assertEqual(self.cells['A1'].Value2,1);self.assertEqual(self.cells['A1'].writes,[])
+        def test_typed_edits_keep_literal_text_boolean_blank_and_modern_formula(self):
+            self.worker.apply_edits([self.edit(),self.edit('A2','text','=literal')])
+            self.assertEqual(self.worker.applied,2);self.assertEqual(self.cells['A1'].Value2,2.5)
+            self.assertEqual(self.cells['A2'].Value2,'=literal');self.assertEqual(self.cells['A2'].NumberFormat,'General')
+            self.worker.apply_edits([self.edit(kind='boolean',value=False,expected=None)])
+            self.assertIs(self.cells['A1'].Value2,False)
+            self.worker.apply_edits([self.edit(kind='blank',value=None,expected=None)])
+            self.assertIsNone(self.cells['A1'].Value2)
+            self.worker.apply_edits([self.edit(kind='formula',value='=SEQUENCE(2)',expected=None)])
+            self.assertEqual(self.cells['A1'].Formula2,'=SEQUENCE(2)');self.assertEqual(self.cells['A1'].Formula,'')
+        def test_mid_batch_conflict_preserves_partial_count_and_does_not_retry(self):
+            def after_first_write(name,value):self.cells['A2'].Value2=999
+            self.cells['A1'].on_write=after_first_write
+            with self.assertRaises(UserError):self.worker.apply_edits([self.edit(),self.edit('A2')])
+            self.assertEqual(self.worker.applied,1);self.assertEqual(self.cells['A1'].writes,[('Value2',2.5)])
+            self.assertEqual(self.cells['A2'].Value2,999)
+        def test_busy_error_after_first_write_does_not_replay_completed_edits(self):
+            calls=[]
+            def reject(name,value):
+                calls.append((name,value));raise RuntimeError('0x8001010A RPC_E_SERVERCALL_RETRYLATER')
+            self.cells['A2'].on_write=reject
+            self.worker.handle_command({'session_id':'fixture','workbook_id':'fixture-book','id':'busy-write','action':'apply_edits','edits':[self.edit(),self.edit('A2')]})
+            self.assertEqual(self.worker.applied,1);self.assertEqual(self.cells['A1'].writes,[('Value2',2.5)]);self.assertEqual(len(calls),1)
+            result=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(result['event'],'error');self.assertEqual(result['applied'],1);self.assertFalse(result['retry_safe']);self.assertIn('8001010A',result['message'])
+        def test_protected_array_and_nonanchor_merge_are_not_written(self):
+            cell=self.cells['A1']
+            for protected,array,merged in ((True,False,False),(False,True,False),(False,False,True)):
+                with self.subTest(protected=protected,array=array,merged=merged):
+                    self.sheet.ProtectContents=protected;cell.Locked=protected;cell.HasArray=array;cell.MergeCells=merged
+                    cell.MergeArea=FakeCom(Cells=FakeCom({'Item':lambda *_:FakeCell('B1')}))
+                    with self.assertRaises(UserError):self.worker.apply_edits([self.edit()])
+                    self.assertEqual(cell.writes,[])
+        def test_cell_state_distinguishes_error_boolean_and_negative_number(self):
+            cell=self.cells['A1'];cell.Value2=-2146826246;cell.Text='#N/A'
+            self.assertEqual(self.worker.cell_state(cell),{'kind':'error','value':'#N/A'})
+            cell.Value2=False;cell.Text='FALSE';self.assertEqual(self.worker.cell_state(cell),{'kind':'boolean','value':False})
+            cell.Value2=-42;cell.Text='-42';self.assertEqual(self.worker.cell_state(cell),{'kind':'number','value':-42})
+        def test_native_snapshot_keeps_formula_display_merge_and_dimensions(self):
+            cell=self.cells['A1'];cell.Value2=3.0;cell.HasFormula=True;cell.Formula2='=1+2';cell.Text='3,00';cell.MergeCells=True
+            cell.MergeArea=FakeCom({'Address':lambda *_:'A1:B2'},Row=1,Column=1,Rows=FakeCollection([1,2]),Columns=FakeCollection([1,2]))
+            result=self.worker.read_range({'sheet':'Raport','top':1,'left':1,'rows':1,'cols':1})
+            actual=result['cells'][0];self.assertEqual((actual['formula'],actual['value'],actual['text']),('=1+2',3.0,'3,00'))
+            self.assertTrue(actual['style']['bold']);self.assertEqual(result['merges'][0]['rows'],2)
+            self.assertEqual(result['column_dimensions'][0]['width'],88);self.assertTrue(result['column_dimensions'][0]['hidden'])
+        def test_macro_identity_never_accepts_another_workbook_or_arguments(self):
+            quoted="'"+self.book.Name.replace("'","''")+"'!"
+            self.assertEqual(self.worker.macro_name(quoted+'Moduł.Drukuj'),'Moduł.Drukuj')
+            for value in ("'Other.xlsm'!Print",'Print(1)','A.B.C'):
+                self.assertEqual(self.worker.macro_name(value),'')
+        def test_control_identity_and_activex_cannot_become_an_unchecked_macro(self):
+            shape=FakeCom(ID=7,Name='Drukuj',Type=8,OnAction='Moduł.Drukuj',Visible=-1,
+                ControlFormat=FakeCom(Enabled=True),Top=10.0,Left=20.0,Width=50.0,Height=18.0,TopLeftCell=FakeCom(Row=2,Column=3))
+            self.sheet.Shapes.values=[shape];sid=self.worker.sheet_id(self.sheet);control=self.worker.controls(self.sheet,sid)[0]
+            self.assertTrue(control['macro_supported']);self.assertEqual(control['anchor_column'],3)
+            command={'sheet_id':sid,'control_id':control['id']};self.assertIs(self.worker.find_control(command,self.sheet),shape)
+            shape.OnAction='Different'
+            with self.assertRaises(UserError):self.worker.find_control(command,self.sheet)
+            shape.ControlFormat.Enabled=False;disabled=self.worker.controls(self.sheet,sid)[0]
+            self.assertFalse(disabled['macro_supported']);self.assertFalse(disabled['enabled']);self.assertNotEqual(disabled['id'],control['id'])
+            shape.Type=12;activex=self.worker.controls(self.sheet,sid)[0]
+            self.assertFalse(activex['macro_supported']);self.assertFalse(activex['enabled_known']);self.assertTrue(activex['native_only'])
+        def test_message_filter_retries_only_temporary_rejection_with_a_deadline(self):
+            for tick,reject,expected in ((0,2,250),(14999,2,250),(15000,2,-1),(0,1,-1),(0,0,-1)):
+                with self.subTest(tick=tick,reject=reject):self.assertEqual(_ExcelOleMessageFilter.retry_delay(tick,reject),expected)
+        def test_open_keeps_user_macro_policy_and_disables_automatic_events_by_default(self):
+            request=self.open_request();self.worker.open_workbook(request)
+            self.assertEqual(len(self.open_calls),1);args,policy,events=self.open_calls[0]
+            self.assertEqual(args[0],request['path']);self.assertEqual(args[1:3],(0,False));self.assertEqual(policy,2);self.assertIs(events,False)
+            self.assertNotIn('RunAutoMacros',[name for name,_ in self.book.calls]);self.assertTrue(self.excel.EnableEvents)
+            messages=[json.loads(line) for line in self.output.getvalue().splitlines()]
+            self.assertEqual(messages[-1]['event'],'ready');self.assertEqual(messages[-1]['session_id'],'fixture')
+        def test_open_runs_legacy_auto_macro_only_after_explicit_opt_in(self):
+            self.worker.open_workbook(self.open_request(True));self.assertIs(self.open_calls[0][2],True)
+            self.assertEqual([args for name,args in self.book.calls if name=='RunAutoMacros'],[(1,)])
+        def run_protocol(self,request,commands,previous=()):
+            import io
+            stream=io.StringIO(''.join(dumps(dict(command,session_id=command.get('session_id','fixture')))+'\n' for command in commands))
+            status=self.worker.run(stream,request=request,process_ids=lambda:set(previous),window_pid=lambda hwnd:424242)
+            return status,[json.loads(line) for line in self.output.getvalue().splitlines()]
+        def test_json_protocol_opens_after_attach_and_closes_only_owned_excel(self):
+            request=self.open_request();status,messages=self.run_protocol(request,[{'action':'attach'},{'action':'list_sheets','id':'list','workbook_id':'fixture-book'},{'action':'close'}],[7,8])
+            self.assertEqual(status,0);self.assertEqual([m['event'] for m in messages],['busy','created','ready','busy','done','closed'])
+            self.assertTrue(all(m['session_id']=='fixture' for m in messages));self.assertEqual(len(self.open_calls),1)
+            self.assertEqual([args for name,args in self.book.calls if name=='Close'],[(False,)])
+            self.assertEqual([name for name,_ in self.excel.calls].count('Quit'),1)
+        def test_preexisting_excel_is_not_opened_modified_or_closed(self):
+            request=self.open_request();status,messages=self.run_protocol(request,[{'action':'attach'}],[424242])
+            self.assertEqual(status,1);self.assertIn('fatal',[m['event'] for m in messages]);self.assertEqual(self.open_calls,[])
+            self.assertFalse(hasattr(self.excel,'AutomationSecurity'));self.assertEqual(self.excel.calls,[]);self.assertEqual(self.book.calls,[])
+        def test_rejected_attach_closes_owned_empty_instance_without_opening_workbook(self):
+            request=self.open_request();self.excel.Workbooks.values=[]
+            status,messages=self.run_protocol(request,[{'action':'attach','session_id':'foreign'}])
+            self.assertEqual(status,1);self.assertEqual(self.open_calls,[]);self.assertFalse(hasattr(self.excel,'AutomationSecurity'))
+            self.assertEqual([name for name,_ in self.excel.calls],['Quit']);self.assertEqual(self.book.calls,[])
+        def test_command_cannot_target_another_workbook(self):
+            self.worker.handle_command({'action':'apply_edits','session_id':'fixture','workbook_id':'foreign','id':'edit','edits':[self.edit()]})
+            messages=[json.loads(line) for line in self.output.getvalue().splitlines()]
+            self.assertEqual(messages[-1]['event'],'error');self.assertEqual(self.cells['A1'].writes,[])
+        def test_worker_entry_rejects_invalid_json_before_importing_com(self):
+            import builtins,io
+            original_import=builtins.__import__;imports=[]
+            def guarded(name,*args,**kwargs):
+                if name=='pythoncom':imports.append(name);raise AssertionError('COM must not load for invalid input')
+                return original_import(name,*args,**kwargs)
+            for raw in ('not executable code\n','[]\n',dumps({'action':'run_macro'})+'\n',dumps({'action':'open','session_id':'fixture','path':'x\0.xlsm'})+'\n'):
+                with self.subTest(raw=raw):
+                    output=io.StringIO()
+                    with patch.object(builtins,'__import__',side_effect=guarded):status=excel_session_worker_main(io.StringIO(raw),output)
+                    self.assertEqual(status,1);self.assertEqual([json.loads(line)['event'] for line in output.getvalue().splitlines()],['fatal','closed'])
+            self.assertEqual(imports,[])
+        @unittest.skipUnless(os.name=='nt','Windows COM worker entry point')
+        def test_entry_initializes_sta_and_restores_filter_before_uninitializing(self):
+            import io
+            from unittest.mock import MagicMock
+            order=[];com=FakeCom(COINIT_APARTMENTTHREADED=2,CoInitializeEx=lambda value:order.append(('sta',value)),CoUninitialize=lambda:order.append(('uninitialize',)))
+            message_filter=MagicMock();message_filter.register.side_effect=lambda:order.append(('register',));message_filter.close.side_effect=lambda:order.append(('restore',))
+            def run(worker,stdin,request=None):order.append(('run',));return 0
+            with patch.dict(sys.modules,pythoncom=com),patch(__name__+'._ExcelOleMessageFilter',return_value=message_filter),patch.object(ExcelSessionWorker,'run',run):
+                status=excel_session_worker_main(io.StringIO(dumps(self.open_request())+'\n'),io.StringIO())
+            self.assertEqual(status,0);self.assertEqual(order,[('sta',2),('register',),('run',),('restore',),('uninitialize',)])
+        def dispatch_fixture(self):
+            class Unknown:
+                def __init__(self,target):self.target=target
+                def QueryInterface(self,iid):return self.target
+            class Dispatch:
+                def __init__(self,identity=None):self.identity=identity or object();self.names=[];self.calls=[];self.responses={}
+                def GetIDsOfNames(self,name):self.names.append(name);return name
+                def Invoke(self,*args):self.calls.append(args);return self.responses.get(args[0])
+                def QueryInterface(self,iid):return self.identity if iid=='unknown' else self
+            com=FakeCom(IID_IDispatch='dispatch',IID_IUnknown='unknown',IID_IEnumVARIANT='enum',DISPID_NEWENUM=-4,
+                TypeIIDs={'dispatch':Dispatch,'unknown':Unknown},DISPATCH_METHOD=1,DISPATCH_PROPERTYGET=2,DISPATCH_PROPERTYPUT=4,com_error=RuntimeError)
+            ole=Dispatch();return _ExcelDispatch(ole,com),ole,com,Dispatch,Unknown
+        def test_dispatch_preserves_get_call_put_flags_argument_order_and_identity(self):
+            dispatch,ole,com,Dispatch,Unknown=self.dispatch_fixture();cell=Dispatch();ole.responses.update(Name='Raport',Range=cell,Wrapped=Unknown(cell))
+            self.assertEqual(dispatch.Name,'Raport');self.assertEqual(dispatch.Name,'Raport');self.assertEqual(ole.names.count('Name'),1)
+            native_range=dispatch.get('Range','A1');self.assertIsInstance(native_range,_ExcelDispatch)
+            dispatch.call('Goto',native_range,True);dispatch.AutomationSecurity=2
+            self.assertEqual(ole.calls[:5],[('Name',0,2,True),('Name',0,2,True),('Range',0,2,True,'A1'),('Goto',0,1,True,cell,True),('AutomationSecurity',0,4,True,2)])
+            self.assertTrue(native_range.same(dispatch.Wrapped));self.assertTrue(native_range.same(_ExcelDispatch(Dispatch(cell.identity),com)))
+            self.assertFalse(native_range.same(_ExcelDispatch(Dispatch(),com)))
+        def test_dispatch_enumerates_shapes_and_worksheets_through_ienumvariant(self):
+            dispatch,ole,com,Dispatch,_=self.dispatch_fixture();items=[Dispatch(),Dispatch()];interfaces=[];requests=[]
+            class Enumerator:
+                def QueryInterface(inner,iid):interfaces.append(iid);return inner
+                def Next(inner,count):requests.append(count);return (items.pop(0),) if items else ()
+            ole.responses[com.DISPID_NEWENUM]=Enumerator();values=list(dispatch)
+            self.assertEqual(len(values),2);self.assertTrue(all(isinstance(value,_ExcelDispatch) for value in values))
+            self.assertEqual(interfaces,['enum']);self.assertEqual(requests,[1,1,1]);self.assertEqual(ole.names,[])
+            self.assertEqual(ole.calls,[(com.DISPID_NEWENUM,0,3,True)])
+    return unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case) for case in (ExcelSessionTests,ExcelWorkerTests))
 
 
 def database_cell_test_suite():
@@ -19732,6 +20037,11 @@ def technology_license_test_suite():
         def test_known_exact_version_has_dated_publisher_declaration(self):
             row=_license_package_row(self.package(),_LICENSE_PACKAGES['keyring'])
             self.assertEqual(row['status'],'Deklaracja wydawcy · ta wersja');self.assertEqual(row['review_date'],LICENSE_CATALOG_DATE)
+        def test_pywin32_inventory_preserves_component_license_scope(self):
+            row=_license_package_row(self.package(name='pywin32',version='312',license_name='PSF'),_LICENSE_PACKAGES['pywin32'])
+            self.assertEqual(row['status'],'Deklaracja wydawcy · ta wersja')
+            self.assertEqual(row['commercial'],'Zależnie od składnika');self.assertIn('COM',row['role'])
+            self.assertNotIn('Qt',row['terms']);self.assertIn('pywin32',row['terms'])
         def test_different_version_not_auto_approved(self):
             row=_license_package_row(self.package(version='999.1'),_LICENSE_PACKAGES['keyring'])
             self.assertEqual(row['commercial'],'Do weryfikacji wersji')
@@ -20149,6 +20459,28 @@ def dependency_restart_test_suite():
         def test_discovery_absent_parent_is_missing_not_broken(self):
             with patch('importlib.util.find_spec',side_effect=ModuleNotFoundError('missing',name='firebird')):
                 self.assertEqual(dependency_status('firebird')['state'],'missing')
+        def test_excel_discovery_checks_both_com_packages_without_importing_office(self):
+            for missing in ('pythoncom','win32com'):
+                with self.subTest(module=missing),patch('importlib.util.find_spec',side_effect=lambda name:None if name==missing else object()),patch.object(subprocess,'Popen') as launch:
+                    problem=dependency_status('excel');launch.assert_not_called()
+                self.assertEqual(problem['state'],'missing');self.assertEqual(problem['profile'],'excel')
+                self.assertIn(missing,problem['details']);self.assertIn('sesji Excel',problem['title']);self.assertNotIn('bazą',problem['message'])
+        def test_excel_availability_reports_preparation_without_launching_office(self):
+            from unittest.mock import MagicMock
+            registry=MagicMock();registry.KEY_WOW64_64KEY=256;registry.KEY_WOW64_32KEY=512;registry.KEY_READ=1
+            for installed in (False,True):
+                registry.QueryValue.side_effect=['{Excel-Class}',r'C:\Office\EXCEL.EXE /automation']
+                with self.subTest(installed=installed),patch.dict(sys.modules,winreg=registry),patch.object(os,'name','nt'),patch('importlib.util.find_spec',return_value=object() if installed else None),patch.object(subprocess,'Popen') as launch:
+                    available=excel_availability();launch.assert_not_called()
+                self.assertEqual(available['available'],installed)
+                if not installed:self.assertEqual(available['dependency']['profile'],'excel')
+                self.assertNotIn('powershell',available)
+        def test_excel_without_office_does_not_offer_python_as_a_replacement(self):
+            from unittest.mock import MagicMock
+            registry=MagicMock();registry.KEY_WOW64_64KEY=256;registry.KEY_WOW64_32KEY=512;registry.KEY_READ=1;registry.OpenKey.side_effect=OSError('no Excel registration')
+            with patch.dict(sys.modules,winreg=registry),patch.object(os,'name','nt'),patch('importlib.util.find_spec') as packages:
+                available=excel_availability();packages.assert_not_called()
+            self.assertFalse(available['available']);self.assertNotIn('dependency',available)
         def test_arbitrary_install_profile_cannot_enter_problem_payload(self):
             with self.assertRaises(UserError):dependency_problem('random-package','missing')
         def test_restart_restores_unsaved_document_without_secrets_or_trust(self):
@@ -22300,7 +22632,7 @@ def ui_test():
             path,book=self.office_handoff_fixture();before=clone(book)
             self.window._excel_session_finished(types.SimpleNamespace(saved_copy_path=str(path)),book,self.service.generation,book['revision'])
             self.assertEqual(book,before);self.assertFalse(self.window.tasks.pending)
-        def excel_session_fixture(self,available=True,prompts=None):
+        def excel_session_fixture(self,available=True,prompts=None,dependency=None):
             from unittest import mock
             instances=[];path=self.root/'session.xlsm';path.write_bytes(b'INERT GUI FIXTURE; no Excel is started')
             class FakeController:
@@ -22311,7 +22643,9 @@ def ui_test():
                 def submit(inner,action,args):inner.calls.append((action,clone(args)));inner.snapshot.update(state='busy',operation=action,error='');return uid()
                 def close(inner):inner.calls.append(('close',{}));inner.snapshot.update(state='closed',owned=False,finished=True)
                 def cancel(inner):inner.calls.append(('cancel',{}));inner.snapshot.update(state='closed',owned=False,finished=True,cancelled=True)
-            patches=[mock.patch(__name__+'.excel_availability',return_value={'available':available,'reason':'Microsoft Excel nie jest zainstalowany.'}),mock.patch(__name__+'.ExcelSessionController',FakeController),mock.patch(__name__+'.excel_native_dialogs',return_value=clone(prompts or [])),mock.patch(__name__+'.excel_native_dialog_action',return_value={'ok':True,'sent':True})]
+            availability={'available':available,'reason':'Microsoft Excel nie jest zainstalowany.'}
+            if dependency:availability.update(reason=dependency['title'],dependency=dependency)
+            patches=[mock.patch(__name__+'.excel_availability',return_value=availability),mock.patch(__name__+'.ExcelSessionController',FakeController),mock.patch(__name__+'.excel_native_dialogs',return_value=clone(prompts or [])),mock.patch(__name__+'.excel_native_dialog_action',return_value={'ok':True,'sent':True})]
             active=[]
             for patch in patches:active.append(patch.start());self.addCleanup(patch.stop)
             dialog=ui['ExcelSessionDialog'](self.window,str(path));dialog.show();self.addCleanup(lambda:(dialog.dispose(),dialog.close()) if ui['qt_object_alive'](dialog) else None);app.processEvents()
@@ -22558,6 +22892,31 @@ def ui_test():
         def test_excel_session_unavailable_is_readable_and_never_starts(self):
             dialog,instances,scan,action=self.excel_session_fixture(available=False)
             self.assertIn('nie jest zainstalowany',dialog.state_note.text());self.assertFalse(dialog.open_button.isEnabled());dialog.start_session();self.assertFalse(instances);scan.assert_not_called();action.assert_not_called();self.assertIn('excel_session',self.window.app_actions)
+        def test_excel_missing_com_offers_preparation_without_starting_office(self):
+            from unittest import mock
+            issue=dependency_problem('excel','missing','Brak pythoncom')
+            dialog,instances,scan,action=self.excel_session_fixture(available=False,dependency=issue)
+            self.assertTrue(dialog.dependency_card.isVisible());self.assertFalse(dialog.open_button.isEnabled());self.assertFalse(instances)
+            self.assertEqual(dialog.dependency_card.prepare_button.text(),'Przygotuj obsługę Excela')
+            with mock.patch.object(self.window.dependencies,'start') as start:
+                dialog.dependency_card.prepare_button.click();start.assert_called_once_with('excel',False,None)
+            self.window.dependencies.profile='drivers';self.window.dependencies.state='restart';dialog.dependency_card.refresh()
+            self.assertEqual(dialog.dependency_card.prepare_button.text(),'Przygotuj obsługę Excela')
+            self.window.dependencies.profile='excel';dialog.dependency_card.refresh()
+            with mock.patch.object(self.window,'restart_after_preparation') as restart:
+                dialog.dependency_card.prepare_button.click();restart.assert_called_once()
+            scan.assert_not_called();action.assert_not_called()
+        def test_excel_broken_worker_import_exposes_repair_action(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session()
+            issue=dependency_problem('excel','broken','Nie można załadować biblioteki COM')
+            instances[0].snapshot.update(state='error',owned=False,finished=True,error=issue['title'],dependency=issue)
+            dialog.poll();app.processEvents()
+            self.assertTrue(dialog.dependency_card.isVisible());self.assertIs(dialog.body_tabs.currentWidget(),dialog.options_scroll)
+            self.assertFalse(dialog.open_button.isEnabled())
+            self.assertEqual(dialog.dependency_card.prepare_button.text(),'Napraw obsługę Excela')
+            with mock.patch.object(self.window.dependencies,'start') as start:
+                dialog.dependency_card.prepare_button.click();start.assert_called_once_with('excel',True,None)
         def test_excel_session_open_is_explicit_and_open_events_are_opt_in(self):
             dialog,instances,scan,action=self.excel_session_fixture();self.assertFalse(instances);self.assertFalse(dialog.open_events.isChecked());dialog.open_button.click();self.assertEqual(len(instances),1)
             self.assertEqual(instances[0].calls,[('start',{'run_open_events':False})]);self.assertTrue(dialog.pdf_button.isEnabled());self.assertFalse(dialog.run_button.isEnabled())
@@ -23118,7 +23477,8 @@ python-oracledb: UPL-1.0 or Apache-2.0; https://python-oracledb.readthedocs.io/
 firebird-driver: MIT; https://firebird-driver.readthedocs.io/
 JPype1: Apache-2.0; https://jpype.readthedocs.io/
 keyring: MIT; https://keyring.readthedocs.io/
-Java runtime, H2 JDBC JAR, fbclient, Oracle Client: supplied separately under their own terms.
+pywin32: component-specific licenses and notices; https://github.com/mhammond/pywin32/tree/b312#licenses
+Microsoft Excel, Java runtime, H2 JDBC JAR, fbclient, Oracle Client: supplied separately under their own terms.
 The native interface uses Qt Widgets only. No web renderer, server, telemetry or CDN.
 The application is an initial implementation, not an audited or certified database tool.
 '''
@@ -23702,16 +24062,16 @@ class SetupWindow:
         self.entry(self.options,'Certyfikaty CA (PEM) · opcjonalnie',self.ca,0,0,browse='file')
         self.entry(self.options,'Proxy · http(s)://serwer:port',self.proxy,1,0)
         ttk.Radiobutton(self.options,text='Użyj folderu z pakietami offline',variable=self.mode,value='offline',command=self.source_changed,style='Boot.TRadiobutton').grid(row=2,column=0,sticky='w',pady=self.px(5))
-        self.drivers_check=ttk.Checkbutton(self.fields,text='Przygotuj także sterowniki baz danych — zalecane',variable=self.include_drivers,style='Boot.TCheckbutton')
+        self.drivers_check=ttk.Checkbutton(self.fields,text='Przygotuj także składniki opcjonalne — zalecane',variable=self.include_drivers,style='Boot.TCheckbutton')
         if self.first_setup:
             self.drivers_check.grid(row=4,column=0,sticky='w',pady=(self.px(14),0))
             for row,key in enumerate(OPTIONAL_INSTALL_PROFILES,3):
-                text='Magazyn poświadczeń' if key=='secrets' else INSTALL_PROFILE_LABELS[key]
+                text='Magazyn poświadczeń' if key=='secrets' else 'Sesja Microsoft Excel' if key=='excel' else INSTALL_PROFILE_LABELS[key]
                 problem=installer_profile_problem(key)
                 if problem:self.driver_selection[key].set(False);text+=' · wymaga Pythona 3.11+'
                 ttk.Checkbutton(self.options,text=text,variable=self.driver_selection[key],style='Boot.TCheckbutton',state='disabled' if problem else 'normal').grid(row=row,column=0,sticky='w',pady=self.px(3))
-            self.drivers_note=ttk.Label(self.options,text='Pakiety Python. Java, Oracle Client i fbclient wymagają osobnej konfiguracji.',style='Boot.Small.TLabel')
-            self.drivers_note.grid(row=7,column=0,sticky='ew',pady=(self.px(5),0));self.entry_labels.append((self.drivers_note,self.options))
+            self.drivers_note=ttk.Label(self.options,text='Pakiety Python. Microsoft Excel, Java, Oracle Client i fbclient wymagają osobnej instalacji lub konfiguracji.',style='Boot.Small.TLabel')
+            self.drivers_note.grid(row=3+len(OPTIONAL_INSTALL_PROFILES),column=0,sticky='ew',pady=(self.px(5),0));self.entry_labels.append((self.drivers_note,self.options))
         self.build_progress()
         self.footer=ttk.Frame(self.host,style='Boot.TFrame');self.footer.grid(row=2,column=0,sticky='ew',pady=(self.px(14),0));self.footer.columnconfigure(0,weight=1)
         self.error_label=ttk.Label(self.footer,text='',style='Boot.Error.TLabel');self.error_label.grid(row=0,column=0,sticky='ew',pady=(0,self.px(12)));self.error_label.grid_remove()
@@ -24355,6 +24715,30 @@ def bootstrap_test():
                 with patch.object(sys,'version_info',(3,10,0)),self.assertRaisesRegex(UserError,'3.11'):
                     install_environment('firebird',root=self.root,source=package_source())
                 child.assert_not_called()
+        @unittest.skipUnless(os.name=='nt','Sesja Excel jest dostępna tylko w Windows')
+        def test_excel_preparation_verifies_com_imports_without_starting_office(self):
+            commands=[];downloads=[]
+            class DownloadInput(io.BytesIO):
+                def close(self):
+                    if not self.closed:
+                        payload=json.loads(self.getvalue());downloads.append(payload)
+                        Path(payload['dest'],'pywin32-312-cp314-cp314-win_amd64.whl').write_bytes(b'controlled test wheel')
+                    super().close()
+            class ProbeProcess:
+                def __init__(self,command,**kw):
+                    commands.append(command);self.stdout=io.BytesIO(b'');self.stdin=DownloadInput() if kw['stdin']==subprocess.PIPE else None;self.pid=999999
+                def poll(self):return 0
+                def wait(self,**kw):return 0
+            with patch.object(subprocess,'Popen',ProbeProcess):
+                marker=install_environment('excel',root=self.root,source=package_source(),progress=lambda _:None)
+            self.assertEqual(set(marker['profiles']),{'desktop','excel'})
+            self.assertEqual(downloads[0]['source']['index_url'],PUBLIC_INDEX)
+            self.assertIn("pywin32==312; sys_platform == 'win32'",downloads[0]['packages'])
+            probes=[command[-1] for command in commands if '-c' in command]
+            com_probes=[code for code in probes if 'import pythoncom' in code]
+            self.assertEqual(len(com_probes),1);self.assertIn('import win32com.client.dynamic',com_probes[0])
+            self.assertNotIn('PySide6',com_probes[0]);self.assertNotIn('Dispatch',com_probes[0]);self.assertNotIn('CoCreateInstance',com_probes[0])
+            self.assertTrue(any('--require-hashes' in command for command in commands))
         @unittest.skipIf(sys.version_info[:2]<(3,11),'Firebird wymaga Pythona 3.11+')
         def test_driver_verification_is_not_affected_by_qt_import_hooks(self):
             class DownloadInput(io.BytesIO):
@@ -24699,7 +25083,7 @@ def main(argv=None):
     parser.add_argument('--setup-result',help=argparse.SUPPRESS)
     parser.add_argument('--repair',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--resume',help=argparse.SUPPRESS)
-    parser.add_argument('--install',choices=['desktop','drivers','all','oracle','firebird','h2','secrets'],help='Wybierz źródło i przygotuj wskazane biblioteki.')
+    parser.add_argument('--install',choices=['desktop','drivers','all','oracle','firebird','h2','secrets','excel'],help='Wybierz źródło i przygotuj wskazane biblioteki.')
     parser.add_argument('--wheelhouse',help='Folder pakietów .whl dla instalacji offline.')
     parser.add_argument('--self-test',action='store_true',help='Testy rdzenia, bez Qt i bez sieci.')
     parser.add_argument('--bootstrap-test',action='store_true',help='Testy wyboru źródła, izolacji pip i natywnego Tk; bez pobierania.')
@@ -24713,7 +25097,9 @@ def main(argv=None):
     parser.add_argument('--no-bootstrap',action='store_true',help='Nie instaluj bibliotek; błąd przy braku Qt.')
     parser.add_argument('--no-runtime',action='store_true',help='Użyj bieżącego interpretera; nie przechodź do prywatnego venv.')
     parser.add_argument('--worker',action='store_true',help=argparse.SUPPRESS)
+    parser.add_argument('--excel-worker',action='store_true',help=argparse.SUPPRESS)
     args=parser.parse_args(argv);raw_args=list(argv) if argv is not None else sys.argv[1:]
+    if args.excel_worker:return excel_session_worker_main() or 0
     if args.worker:return worker_main() or 0
     if args.self_test:return self_test()
     if args.bootstrap_test:return bootstrap_test()
