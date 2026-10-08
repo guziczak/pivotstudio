@@ -4631,10 +4631,10 @@ def excel_worker_error_fields(exc,operation='',macro_name='',diagnostics=None):
         code='macro_failed';message='Nie udało się wykonać makra'+(' „'+macro_name+'”' if macro_name else '')+'.'
         if description:message+=' '+description
         if re.search(r'cannot run the macro|can.t run the macro|nie można uruchomić makra',description,re.IGNORECASE):
-            code='macro_unavailable';message+=' Sprawdź nazwę procedury i jej modułu oraz komunikat zabezpieczeń w „Pokaż Excel”.'
-        if operation=='run_control_macro':message+=' Jeśli procedura korzysta z Application.Caller, uruchom przycisk bezpośrednio w Excelu.'
+            code='macro_unavailable';message='Excel nie udostępnił makra'+(' „'+macro_name+'”' if macro_name else '')+'. Kliknij „Pokaż Excel” i sprawdź przycisk oraz pasek zabezpieczeń w tej samej kopii sesji. Ten błąd nie rozstrzyga przyczyny.'
+        elif operation=='run_control_macro':message+=' Jeśli procedura korzysta z Application.Caller, uruchom przycisk bezpośrednio w Excelu.'
         if diagnostics.get('has_vba_project') is False:message+=' Excel nie wykrywa projektu VBA w tym skoroszycie.'
-        message+=' Sprawdź wynik przed ponowną próbą; makro mogło wykonać część pracy.'
+        if code!='macro_unavailable':message+=' Sprawdź wynik przed ponowną próbą; makro mogło wykonać część pracy.'
     else:message=description or 'Excel nie wykonał operacji.'
     if diagnostics.get('protected_view'):
         code='protected_view';message+=' Excel ma otwarte okno Widoku chronionego. Sprawdź je przez „Pokaż Excel”; ustawienia zabezpieczeń pozostają bez zmian.'
@@ -4650,7 +4650,7 @@ class ExcelSessionWorker:
     def __init__(self,pythoncom,output,excel=None,session_id=''):
         self.pythoncom=pythoncom;self.output=output;self.excel=excel;self.book=None
         self.session_id=session_id;self.workbook_id=session_id+'-book';self.sheet_refs={};self.control_refs={}
-        self.revision=0;self.applied=0;self.layout_applied=0;self.layout_touched=0;self.owned_excel=False;self.working_copy='';self.open_events_enabled=False;self.handoff_incomplete=False
+        self.revision=0;self.applied=0;self.layout_applied=0;self.layout_touched=0;self.owned_excel=False;self.working_copy='';self.original_path='';self.resumed=False;self.open_events_enabled=False;self.handoff_incomplete=False
     def send(self,event,**fields):
         data=dumps(dict(fields,event=event,session_id=self.session_id))
         if len(data.encode('utf-8'))>EXCEL_SESSION_MAX_MESSAGE:raise UserError('Snapshot exceeds 4 MiB. Read a smaller range.')
@@ -4676,6 +4676,19 @@ class ExcelSessionWorker:
         context=request.get('context',{})
         if not isinstance(context,dict):raise UserError('Invalid workbook context.')
         if request.get('run_open_events') and (context.get('edits') or context.get('layout')):raise UserError('Open events cannot run before initial edits or layout changes.')
+        for option in ('resume','handoff_incomplete'):
+            if type(request.get(option,False)) is not bool:raise UserError('Invalid resumed session state.')
+        if request.get('handoff_incomplete') and request.get('run_open_events'):raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
+        original=request.get('original_path','')
+        if not isinstance(original,str) or '\x00' in original:raise UserError('Invalid original workbook path.')
+        if original:
+            source=Path(original);working=Path(path)
+            if not source.is_absolute():raise UserError('Nieprawidłowa pełna ścieżka oryginału.')
+            if source.resolve()==working.resolve() or (source.exists() and working.samefile(source)):raise UserError('Sesja wymaga kopii oddzielnej od oryginału.')
+        if request.get('resume'):
+            if not original or not Path(original).is_absolute():raise UserError('Brak ścieżki oryginału wznowionej sesji.')
+            if request.get('run_open_events'):raise UserError('Wznowienie sesji wymaga otwarcia bez makr automatycznych.')
+            if context.get('edits') or context.get('layout'):raise UserError('Wznowienie sesji nie może ponownie przenosić edycji ani wymiarów.')
     @staticmethod
     def same_com(a,b):
         if a is None or b is None:return False
@@ -4686,6 +4699,22 @@ class ExcelSessionWorker:
             for candidate in self.excel.Workbooks:
                 if self.same_com(self.book,candidate):return
         raise UserError('The bound workbook has been closed. Open a new session; writes were not retried.')
+    def session_save_path(self):
+        """An explicit Save can target only the retained copy opened by this worker."""
+        self.bound_book()
+        if not self.working_copy or not self.original_path:raise UserError('Nie potwierdzono oddzielnej kopii sesji. Użyj zapisu osobnej kopii.')
+        working=Path(self.working_copy);original=Path(self.original_path);bound=Path(str(self.book.FullName))
+        if not working.is_absolute() or not original.is_absolute() or not bound.is_absolute():raise UserError('Nie potwierdzono pełnej ścieżki kopii sesji.')
+        working=working.resolve();original=original.resolve();bound=bound.resolve()
+        if bound!=working or not working.is_file():raise UserError('Excel zmienił ścieżkę skoroszytu. Nie zapisano pliku sesji; użyj zapisu osobnej kopii.')
+        if working==original or (original.exists() and working.samefile(original)):raise UserError('Plik sesji wskazuje oryginał. Zapis został zatrzymany.')
+        return working
+    def save_session(self):
+        working=self.session_save_path()
+        if self.book.ReadOnly:raise UserError('Kopia sesji jest otwarta tylko do odczytu. Użyj zapisu osobnej kopii.')
+        self.book.call('Save')  # One call; workbook BeforeSave validation remains in force.
+        if self.session_save_path()!=working or not self.book.Saved:raise UserError('Excel nie potwierdził zapisu tej kopii sesji. Sprawdź komunikaty w „Pokaż Excel”.')
+        return {'session_saved':True,'session_saved_path':str(working)}
     def sheet_id(self,sheet):
         for identity,known in self.sheet_refs.items():
             if self.same_com(known,sheet):return identity
@@ -4894,11 +4923,14 @@ class ExcelSessionWorker:
             for sheet in itertools.islice(self.book.Worksheets,500):sheets.append({'id':self.sheet_id(sheet),'name':str(sheet.Name),'visible':int(sheet.Visible)})
         return {'active_sheet':active_sheet,'workbook_name':workbook_name,'workbook_id':self.workbook_id,'sheets':sheets,
                 'sheets_complete':self.book is not None and int(self.book.Worksheets.Count)<=500,'revision':self.revision,'applied':self.applied,
-                'layout_applied':self.layout_applied,'layout_touched':self.layout_touched,'handoff_incomplete':self.handoff_incomplete}
+                'layout_applied':self.layout_applied,'layout_touched':self.layout_touched,'handoff_incomplete':self.handoff_incomplete,'resumed':self.resumed}
     def open_workbook(self,request):
         # Invoke (without type information) needs VT_ERROR/DISP_E_PARAMNOTFOUND;
         # pythoncom.Missing is reserved for the generated InvokeTypes wrappers.
-        context=request.get('context',{});missing=self.pythoncom.ArgNotFound;self.working_copy=request['path'];self.open_events_enabled=bool(request.get('run_open_events',False))
+        context=request.get('context',{});missing=self.pythoncom.ArgNotFound;self.working_copy=request['path'];self.original_path=request.get('original_path','');self.resumed=bool(request.get('resume',False));self.handoff_incomplete=bool(request.get('handoff_incomplete',False));self.open_events_enabled=bool(request.get('run_open_events',False))
+        if self.resumed and (context.get('edits') or context.get('layout')):raise UserError('Wznowienie sesji nie może ponownie przenosić edycji ani wymiarów.')
+        if self.resumed and self.open_events_enabled:raise UserError('Wznowienie sesji wymaga otwarcia bez makr automatycznych.')
+        if self.handoff_incomplete and self.open_events_enabled:raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
         self.excel.AutomationSecurity=2  # msoAutomationSecurityByUI: respect Office/user policy.
         self.excel.EnableEvents=bool(request.get('run_open_events',False));self.excel.DisplayAlerts=True;self.excel.Visible=False
         self.book=self.excel.Workbooks.call('Open',request['path'],0,False,missing,missing,missing,True,missing,missing,False,False,missing,False)
@@ -4947,7 +4979,6 @@ class ExcelSessionWorker:
                 sheet=self.find_sheet(command);shape=self.find_control(command,sheet)
                 if not self.control_state(shape)['visible']:raise UserError('This control is hidden in Excel. The bridge does not unhide it.')
                 self.excel.Visible=True;self.book.call('Activate');sheet.call('Activate');self.excel.call('Goto',shape.TopLeftCell,True)
-                with contextlib.suppress(Exception):shape.call('Select')
                 extra.update(native_only=True,reveal_hwnd=int(self.excel.ActiveWindow.Hwnd))
             elif action=='run_control_macro':
                 sheet=self.find_sheet(command);shape=self.find_control(command,sheet);name=self.macro_name(shape.OnAction);availability=self.control_state(shape);macro=self.qualified_macro(name) if name else str(shape.OnAction)
@@ -4959,6 +4990,9 @@ class ExcelSessionWorker:
                 if sheet is None:raise UserError('No active sheet to export.')
                 missing=self.pythoncom.ArgNotFound;sheet.call('ExportAsFixedFormat',0,command['temp_path'],0,True,False,missing,missing,False)
             elif action in ('save_copy','save_working'):self.book.call('SaveCopyAs',command['temp_path'])
+            elif action=='save_session':
+                if 'destination' in command or 'temp_path' in command:raise UserError('Zapis sesji nie przyjmuje innej ścieżki docelowej.')
+                extra.update(self.save_session())
             else:raise UserError('Unsupported session action.')
             self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
             result=self.session_info();result.update(extra);self.send('done',id=identity,operation=action,result=result)
@@ -5044,14 +5078,89 @@ def excel_session_error_text(message):
     return text
 
 
+def _excel_retained_path(value):
+    if not isinstance(value,(str,Path)) or not str(value) or '\0' in str(value) or len(str(value))>32767:raise UserError('Nieprawidłowa ścieżka kopii sesji Excel.')
+    path=Path(os.path.abspath(os.path.expanduser(str(value))))
+    for part in (path,*path.parents):
+        if part.is_symlink() or (hasattr(part,'is_junction') and part.is_junction()):raise UserError('Kopia sesji i jej katalog nie mogą być dowiązaniem.')
+    return path
+
+
+def _excel_handoff_digest(context,source_revision):
+    return digest({'source_revision':source_revision.lower(),'edits':excel_session_edits(context.get('edits',[])),'layout':excel_session_layout(context.get('layout',[]))})
+
+
+def excel_resume_info(path,original_path=None,context=None):
+    """Inspect a retained copy without changing files, replaying edits or starting Office."""
+    path=_excel_retained_path(path)
+    if path.suffix.lower() not in ('.xlsx','.xlsm') or not path.is_file():raise UserError('Wybierz istniejącą kopię .xlsx lub .xlsm z katalogu sesji Pivot Studio.')
+    manifest_path=_excel_retained_path(path.parent/'session.json')
+    try:
+        with manifest_path.open('rb') as stream:raw=stream.read(65537)
+        if len(raw)>65536:raise ValueError('size')
+        manifest=json.loads(raw.decode('utf-8'))
+    except (OSError,ValueError,UnicodeError) as exc:raise UserError('Brak prawidłowego pliku session.json obok wybranej kopii.') from exc
+    if not isinstance(manifest,dict) or type(manifest.get('version',1)) is not int or manifest.get('version',1) not in (1,2):raise UserError('Nieobsługiwany opis sesji Excel.')
+    for key in ('original_path','working_copy','session_id','source_revision'):
+        if not isinstance(manifest.get(key),str) or not manifest[key] or len(manifest[key])>32767 or '\0' in manifest[key]:raise UserError('Niekompletny opis sesji Excel.')
+    if not re.fullmatch('[0-9a-fA-F]{64}',manifest['source_revision']):raise UserError('Nieprawidłowy skrót źródła zapisany w sesji Excel.')
+    original=Path(manifest['original_path']).expanduser()
+    stored=Path(manifest['working_copy']).expanduser()
+    if not original.is_absolute() or not stored.is_absolute() or _excel_retained_path(stored)!=path:raise UserError('Wybrany plik nie jest kopią wskazaną w opisie sesji.')
+    original=original.resolve()
+    if path.suffix.lower()!=original.suffix.lower() or path==original or (original.exists() and path.samefile(original)):raise UserError('Wznowienie może otworzyć wyłącznie kopię roboczą, nigdy oryginał.')
+    requested_source=Path(original_path).expanduser().resolve() if original_path is not None else None
+    source_is_copy=requested_source==path
+    if requested_source is not None and requested_source not in (original,path):raise UserError('Ta kopia sesji pochodzi z innego pliku źródłowego.')
+    if context is not None and not isinstance(context,dict):raise UserError('Nieprawidłowy kontekst wznowienia sesji Excel.')
+    context=context or {};revision=manifest['source_revision'].lower();requested=context.get('source_revision','')
+    edits=excel_session_edits(context.get('edits',[]));layout=excel_session_layout(context.get('layout',[]));has_changes=bool(edits or layout)
+    legacy=manifest.get('version',1)==1
+    if not legacy and any(key not in manifest for key in ('handoff_complete','saved_handoff','handoff_incomplete','handoff_digest','saved_revision')):raise UserError('Niekompletny opis zapisu sesji Excel.')
+    for key in ('handoff_complete','saved_handoff','handoff_incomplete'):
+        if key in manifest and type(manifest[key]) is not bool:raise UserError('Nieprawidłowy stan przeniesienia zmian w opisie sesji.')
+    for key in ('saved_revision','handoff_digest'):
+        if key in manifest and (not isinstance(manifest[key],str) or (manifest[key] and not re.fullmatch('[0-9a-fA-F]{64}',manifest[key]))):raise UserError('Nieprawidłowy skrót zapisany w opisie sesji.')
+    actual=file_digest(path);saved=manifest.get('saved_revision','').lower();changed=bool(saved and saved!=actual)
+    expected_source=actual if source_is_copy else revision
+    if requested and (not isinstance(requested,str) or requested.lower()!=expected_source):raise UserError('Lokalny arkusz pochodzi z innej wersji źródła. Nie można wznowić tej kopii bez utraty zmian.')
+    if has_changes and (source_is_copy or legacy or manifest.get('handoff_incomplete') or not manifest.get('handoff_complete') or not manifest.get('saved_handoff') or not saved or changed or manifest.get('handoff_digest')!=_excel_handoff_digest(context,revision)):
+        raise UserError('Kopia nie zawiera potwierdzonego zapisu tych samych lokalnych zmian. Zapisz dotychczasową sesję albo rozpocznij nową kopię; zmiany nie będą odtwarzane podczas wznowienia.')
+    return {'path':str(path),'original_path':str(original),'session_dir':str(path.parent),'source_revision':revision,'handoff_digest':manifest.get('handoff_digest',''),'saved_revision':saved,'disk_revision':actual,'externally_changed':changed,'legacy':legacy,'handoff_incomplete':bool(manifest.get('handoff_incomplete')),'manifest':manifest}
+
+
+class _ExcelSessionFileLock:
+    """OS-held lock: a stale file is harmless, and no PID is used to reclaim ownership."""
+    def __init__(self,directory):
+        path=_excel_retained_path(Path(directory)/'.pivot-session.lock');self.stream=None
+        if path.exists() and (not path.is_file() or path.stat().st_nlink>1):raise UserError('Nieprawidłowy plik blokady sesji Excel.')
+        stream=path.open('a+b')
+        try:
+            if stream.seek(0,os.SEEK_END)==0:stream.write(b'\0');stream.flush()
+            stream.seek(0)
+            if os.name=='nt':
+                import msvcrt
+                msvcrt.locking(stream.fileno(),msvcrt.LK_NBLCK,1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+            self.stream=stream
+        except (OSError,BlockingIOError) as exc:
+            stream.close();raise UserError('Ta kopia jest już otwarta w innej sesji Pivot Studio. Zamknij tamtą sesję przed wznowieniem.') from exc
+    def close(self):
+        stream,self.stream=self.stream,None
+        if stream is not None:stream.close()
+
+
 class ExcelSessionController:
     """Durable working copy + dedicated STA process; no COM calls on the UI thread."""
-    def __init__(self,source_path,root,on_event=None):
+    def __init__(self,source_path,root,on_event=None,*,resume_path=None):
         self.original=Path(os.path.abspath(os.path.expanduser(str(source_path))));self.root=Path(os.path.abspath(os.path.expanduser(str(root))));self.on_event=on_event
         self.session_id=uid();self.lock=threading.RLock();self.write_lock=threading.Lock();self.cancelled=threading.Event();self.finished=threading.Event()
         self.process=None;self.owned_process=None;self.thread=None;self.reaper=None;self.dispatcher=None;self.previous=set();self.pending=None;self.temp_root=None;self.staged=None;self._copy_cancel=None
+        self.resume_path=resume_path;self.session_file_lock=None;self.manifest={};self.resume_info=None
         self.state={'session_id':self.session_id,'workbook_id':self.session_id+'-book','state':'new','job_id':'','operation':'','original_path':str(self.original),'source_path':str(self.original),'staged_path':'','working_copy':'','temp_root':'','workspace_path':'','last_saved_path':'','pid':0,'hwnd':0,'owned':False,'alive':False,'active_sheet':'','last_result':{},'last_operation':'','error':'','error_operation':'','events':[],'cancelled':False,'finished':False,'handoff_incomplete':False}
-        self.state.update(error_details='',error_code='',macro_name='')
+        self.state.update(error_details='',error_code='',macro_name='',resumed=resume_path is not None,externally_changed=False)
     def _event(self,event,**fields):
         with self.lock:
             if isinstance(fields.get('result'),dict) and 'snapshot' in fields['result']:
@@ -5067,6 +5176,7 @@ class ExcelSessionController:
             return clone(self.state)
     def start(self,run_open_events=False,context=None):
         if type(run_open_events) is not bool:raise UserError('Nieprawidłowa opcja makr otwarcia.')
+        if self.resume_path is not None and run_open_events:raise UserError('Wznowienie tej samej kopii odbywa się bez automatycznych makr otwarcia.')
         context=clone(context or {})
         if not isinstance(context,dict):raise UserError('Nieprawidłowy kontekst skoroszytu.')
         context={key:context[key] for key in ('source_revision','edits','layout','sheet','companion_paths') if key in context}
@@ -5099,20 +5209,42 @@ class ExcelSessionController:
             hwnd=self.state.get('hwnd',0)
         if self.cancelled.is_set() or not owned or not owned.alive():raise UserError('Okno własnej sesji Excel nie jest jeszcze dostępne.')
         return excel_session_foreground(owned,hwnd,self.cancelled)
-    def _run(self,run_open_events,context):
-        try:
-            available=excel_availability()
-            if not available['available']:
-                issue=available.get('dependency')
-                if issue:raise DependencyError(issue['profile'],issue['state'],issue.get('details',''))
-                raise UserError(available['reason'])
+    def _write_manifest(self):
+        if not self.temp_root or not self.session_file_lock:raise UserError('Brak blokady własnej kopii sesji Excel.')
+        atomic_bytes(self.temp_root/'session.json',dumps(self.manifest).encode('utf-8'))
+    def _record_session_save(self,result):
+        if not isinstance(result,dict) or result.get('session_saved') is not True or _excel_retained_path(result.get('session_saved_path'))!=self.staged:raise UserError('Excel nie potwierdził zapisu tej samej kopii sesji.')
+        staged=_excel_retained_path(self.staged)
+        if not staged.is_file() or staged==self.original or (self.original.exists() and staged.samefile(self.original)):raise UserError('Nieprawidłowy plik zapisanej kopii sesji.')
+        before=staged.stat();revision=file_digest(staged);after=staged.stat()
+        if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):raise UserError('Kopia zmieniła się podczas potwierdzania zapisu. Zapisz sesję ponownie.')
+        incomplete=bool(self.state.get('handoff_incomplete') or result.get('handoff_incomplete'))
+        self.manifest.update(version=2,handoff_incomplete=incomplete,handoff_complete=not incomplete,saved_handoff=not incomplete,saved_revision=revision,saved_at=utcnow())
+        self.manifest.setdefault('handoff_digest',_excel_handoff_digest({},self.manifest['source_revision']))
+        self._write_manifest()
+        return dict(result,saved_path=str(staged),saved_revision=revision)
+    def _prepare_workbook(self,context):
+        if self.resume_path is not None:
+            self.staged=_excel_retained_path(self.resume_path);self.temp_root=self.staged.parent
+            if not self.staged.is_file():raise UserError('Nie znaleziono kopii do wznowienia.')
+            # Reject unrelated files before even creating a lock beside them;
+            # validate again under the lock before opening the retained copy.
+            excel_resume_info(self.staged,self.original,context)
+            self.session_file_lock=_ExcelSessionFileLock(self.temp_root)
+            info=excel_resume_info(self.staged,self.original,context);self.resume_info=info;self.manifest=clone(info['manifest']);self.original=Path(info['original_path'])
+            self.state.update(handoff_incomplete=info['handoff_incomplete'],externally_changed=info['externally_changed'])
+            # The retained file is the authoritative disk state. Never copy it or replay a handoff.
+            initial_sheet=context.get('sheet');context.clear()
+            if initial_sheet:context['sheet']=initial_sheet
+            self._event('resuming',message='Wznawiam tę samą kopię roboczą bez ponownego przenoszenia zmian.')
+        else:
             self.original=self.original.resolve();self.root=self.root.resolve()
             if self.original.suffix.lower() not in ('.xlsx','.xlsm') or not self.original.is_file():raise UserError('Wybierz istniejący skoroszyt .xlsx lub .xlsm.')
             self.root.mkdir(parents=True,exist_ok=True);self.temp_root=Path(tempfile.mkdtemp(prefix='session-',dir=self.root));self.staged=self.temp_root/self.original.name
+            self.session_file_lock=_ExcelSessionFileLock(self.temp_root)
             if os.name=='nt':
                 from ctypes import wintypes
                 self._copy_cancel=wintypes.BOOL(self.cancelled.is_set())
-            with self.lock:self.state.update(temp_root=str(self.temp_root),workspace_path=str(self.temp_root),staged_path=str(self.staged),working_copy=str(self.staged))
             self._event('copying',message='Tworzę prywatną kopię skoroszytu.')
             before=self.original.stat();excel_copy_workbook(self.original,self.staged,self.cancelled,self._copy_cancel);after=self.original.stat()
             if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):raise UserError('Skoroszyt zmienił się podczas kopiowania. Otwórz sesję ponownie.')
@@ -5123,7 +5255,7 @@ class ExcelSessionController:
                     fingerprint.update(block)
             revision=fingerprint.hexdigest()
             if context.get('source_revision') and revision!=context['source_revision'].lower():raise UserError('Plik źródłowy zmienił się od przygotowania edycji. Zmiany nie zostały wysłane do Excel.')
-            companions=[];names={self.staged.name.casefold(),'session.json'};total=0
+            companions=[];names={self.staged.name.casefold(),'session.json','.pivot-session.lock'};total=0
             for raw in context.pop('companion_paths',[]):
                 candidate=Path(raw).expanduser()
                 if candidate.is_symlink():raise UserError('Plik towarzyszący nie może być dowiązaniem.')
@@ -5136,14 +5268,25 @@ class ExcelSessionController:
                 excel_copy_workbook(candidate,self.temp_root/candidate.name,self.cancelled,self._copy_cancel)
                 after=candidate.stat()
                 if (info.st_size,info.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):raise UserError('Plik towarzyszący zmienił się podczas kopiowania: '+candidate.name)
-            (self.temp_root/'session.json').write_text(dumps({'session_id':self.session_id,'original_path':str(self.original),'working_copy':str(self.staged),'source_revision':revision,'companions':[p.name for p,_ in companions],'created_at':utcnow(),'retained':True}),encoding='utf-8')
+            has_changes=bool(context.get('edits') or context.get('layout'))
+            self.manifest={'version':2,'session_id':self.session_id,'original_path':str(self.original),'working_copy':str(self.staged),'source_revision':revision,'companions':[p.name for p,_ in companions],'created_at':utcnow(),'retained':True,'handoff_digest':_excel_handoff_digest(context,revision),'handoff_complete':not has_changes,'saved_handoff':not has_changes,'handoff_incomplete':has_changes,'saved_revision':revision}
+            self._write_manifest()
+        with self.lock:self.state.update(original_path=str(self.original),source_path=str(self.original),temp_root=str(self.temp_root),workspace_path=str(self.temp_root),staged_path=str(self.staged),working_copy=str(self.staged))
+    def _run(self,run_open_events,context):
+        try:
+            available=excel_availability()
+            if not available['available']:
+                issue=available.get('dependency')
+                if issue:raise DependencyError(issue['profile'],issue['state'],issue.get('details',''))
+                raise UserError(available['reason'])
+            self._prepare_workbook(context)
             self.previous=excel_process_ids()
             if self.cancelled.is_set():raise Cancelled('Anulowano otwieranie sesji.')
             env=dict(os.environ);env.update(PYTHONIOENCODING='utf-8',PYTHONUNBUFFERED='1')
             self.process=subprocess.Popen(excel_worker_command(),
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',bufsize=1,creationflags=CREATE_NO_WINDOW,cwd=str(self.temp_root),env=env)
             threading.Thread(target=self._stderr,name='pivot-excel-errors',daemon=True).start()
-            self._send({'action':'open','id':self.state['job_id'],'path':str(self.staged),'run_open_events':run_open_events,'context':context})
+            self._send({'action':'open','id':self.state['job_id'],'path':str(self.staged),'original_path':str(self.original),'resume':self.resume_path is not None,'handoff_incomplete':self.state['handoff_incomplete'],'run_open_events':run_open_events,'context':context})
             while True:
                 line=self.process.stdout.readline(EXCEL_SESSION_MAX_MESSAGE+1)
                 if not line:break
@@ -5204,12 +5347,24 @@ class ExcelSessionController:
         if pending:
             try:result=self._publish(pending);value['result']=dict(value.get('result') or {},**result)
             except Exception as exc:event='error';value['message']=safe_error(exc)
+        try:
+            if event=='done' and operation=='save_session':
+                if value.get('operation')!='save_session':raise UserError('Nieprawidłowe potwierdzenie zapisu sesji.')
+                value['result']=self._record_session_save(value.get('result'))
+            if self.manifest and operation=='open' and event in ('ready','error'):
+                incomplete=bool((value.get('result') or {}).get('handoff_incomplete'))
+                if self.resume_path is None:
+                    self.manifest.update(handoff_complete=event=='ready' and not incomplete,handoff_incomplete=incomplete or (event=='error' and not self.manifest.get('handoff_complete')))
+                elif incomplete:self.manifest['handoff_incomplete']=True
+                self._write_manifest()
+        except Exception as exc:
+            event='error';value['message']=safe_error(exc)
         with self.lock:
             if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
             if event=='busy':self.state['state']='busy'
             elif event in ('ready','done','error'):
                 self._remove_pending();self.state['last_operation']=str(value.get('operation') or operation or 'open')
-                if isinstance(value.get('result'),dict) and value['result'].get('handoff_incomplete') is True:self.state['handoff_incomplete']=True
+                if (isinstance(value.get('result'),dict) and value['result'].get('handoff_incomplete') is True) or self.manifest.get('handoff_incomplete'):self.state['handoff_incomplete']=True
                 if event=='error':
                     self.state.update(error=excel_session_error_text(value.get('message','Błąd Excel.'))[:1800],error_operation=str(value.get('operation') or operation or 'open'),error_details=str(value.get('details',''))[:16384],error_code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],applied=value.get('applied',0))
                     if value.get('result'):self.state.update(last_result=clone(value['result']),active_sheet=str(value['result'].get('active_sheet','')))
@@ -5223,7 +5378,7 @@ class ExcelSessionController:
         if not isinstance(args,dict):raise UserError('Nieprawidłowe parametry sesji Excel.')
         with self.lock:
             if self.state['state']!='ready' or self.cancelled.is_set() or not self.owned_process or not self.owned_process.alive():raise UserError('Poczekaj na gotową, własną sesję Excel.')
-            if action not in ('run_macro','export_pdf','save_copy','save_working','read_range','list_sheets','apply_edits','activate_sheet','reveal_control','run_control_macro','show_excel'):raise UserError('Nieobsługiwana akcja sesji Excel.')
+            if action not in ('run_macro','export_pdf','save_copy','save_working','save_session','read_range','list_sheets','apply_edits','activate_sheet','reveal_control','run_control_macro','show_excel'):raise UserError('Nieobsługiwana akcja sesji Excel.')
             if self.state.get('handoff_incomplete') and action in ('run_macro','run_control_macro','apply_edits'):raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
             workbook_id=self.state['workbook_id']
             if args.get('workbook_id',workbook_id)!=workbook_id:raise UserError('Polecenie dotyczy innego skoroszytu.')
@@ -5349,7 +5504,8 @@ class ExcelSessionController:
             while owned.alive() and time.monotonic()<deadline:time.sleep(.05)
             stopped=not owned.alive()
             if not stopped:self._event('cleanup_pending',message='Nie potwierdzono zatrzymania własnego procesu Excel. Kopia robocza pozostaje w '+str(self.temp_root))
-            with contextlib.suppress(Exception):owned.close()
+            if stopped:
+                with contextlib.suppress(Exception):owned.close()
         process=self.process
         if process is not None:
             if process.poll() is None:
@@ -5358,6 +5514,18 @@ class ExcelSessionController:
                 with contextlib.suppress(Exception):process.terminate();process.wait(timeout=2)
             for stream in (process.stdin,process.stdout,process.stderr):
                 with contextlib.suppress(Exception):stream.close()
+            stopped=stopped and process.poll() is not None
+        if self.session_file_lock:
+            if stopped:self.session_file_lock.close()
+            else:
+                # Retain exclusion until the exact owned handle and helper have exited.
+                # Never reopen/kill a process by an old numeric PID.
+                def release_when_closed():
+                    while (owned and owned.alive()) or (process is not None and process.poll() is None):time.sleep(.25)
+                    if owned:
+                        with contextlib.suppress(Exception):owned.close()
+                    self.session_file_lock.close()
+                threading.Thread(target=release_when_closed,name='pivot-excel-copy-lock',daemon=True).start()
         with self.lock:
             if stopped:self._remove_pending()
             self.state.update(owned=False,alive=False,job_id='',operation='')
@@ -5900,6 +6068,32 @@ def appearance_preferences(root=None):
 def save_appearance(prefs,root=None):
     safe={k:prefs[k] for k in ('theme','reduced_motion','dense') if k in prefs}
     atomic_bytes(Path(root or data_root())/'appearance.json',json.dumps(safe).encode())
+
+
+def excel_session_preferences(root=None):
+    """Local UI preference only; never represents Office trust or travels in a project."""
+    path=Path(root or data_root())/'excel-sessions.json'
+    try:
+        if path.stat().st_size>16384:raise ValueError()
+        raw=json.loads(path.read_text('utf-8'))
+        value=raw.get('working_root','') if isinstance(raw,dict) and raw.get('version')==1 else ''
+        if not isinstance(value,str) or len(value)>4096 or any(ord(c)<32 for c in value):raise ValueError()
+        if value and not Path(value).is_absolute():raise ValueError()
+        return {'working_root':value}
+    except (OSError,ValueError,TypeError):return {'working_root':''}
+
+
+def save_excel_session_preferences(prefs,root=None):
+    if not isinstance(prefs,dict):raise UserError('Nieprawidłowe ustawienia kopii sesji Excel.')
+    value=prefs.get('working_root','')
+    if not isinstance(value,str) or len(value)>4096 or any(ord(c)<32 for c in value):raise UserError('Nieprawidłowa ścieżka folderu kopii Excel.')
+    if value:
+        path=Path(value).expanduser()
+        if not path.is_absolute():raise UserError('Wybierz pełną ścieżkę folderu kopii Excel.')
+        # Validation of access belongs to the selected session, not app startup.
+        value=str(path)
+    atomic_bytes(Path(root or data_root())/'excel-sessions.json',dumps({'version':1,'working_root':value}).encode('utf-8'))
+    return {'working_root':value}
 
 
 def package_source(mode='pypi',index_url='',username='',password='',ca_file='',proxy='',wheel_dir='',*,check_paths=True):
@@ -10846,6 +11040,7 @@ def native_ui_types():
             self._scan_pending=False;self._action_pending=False;self._command_pending=False;self._sent_prompts={};self._retry_prompts=set();self._last_prompts=[];self._last_scan=0.;self._native_digest=None;self._event_seq=0;self._last_result_key=None
             self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
             self._last_failure=None;self._last_failure_key=None;self._show_pending=False
+            self._session_preferences=excel_session_preferences(window.service.root);self._resume_path='';self._resume_source_path='';self._resume_info={};self._resume_check_pending=False
             self._office_context=None;self._native_book_id='';self._native_controls=[];self._native_loading=False;self._last_view_refresh=0.;self._initial_control_pending=False;self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._companion_paths=[]
             self._tasks=AsyncTasks(self);self._timer=QC.QTimer(self);self._timer.setInterval(250);self._timer.timeout.connect(self.poll)
             self.setWindowTitle('Excel: makra i PDF');self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -10859,7 +11054,20 @@ def native_ui_types():
             self.options_frame=QW.QWidget();options=QW.QVBoxLayout(self.options_frame);options.setContentsMargins(10,10,10,10)
             options.addWidget(label('Uruchom sesję Excela, a potem wybierz przycisk skoroszytu i kliknij „Uruchom”. Excel pracuje w tle na osobnej kopii pliku. Jego okno otworzysz przyciskiem „Pokaż w Excelu”.',True,True))
             self.dependency_card=DependencyCard(window,self);options.addWidget(self.dependency_card)
+            self.source_heading=label('Plik źródłowy (pozostaje bez zmian)');options.addWidget(self.source_heading)
             self.file=PathField(path,'Skoroszyty Excel (*.xlsx *.xlsm)');options.addWidget(self.file)
+            self.storage_frame=QW.QGroupBox('Kopie sesji');storage=QW.QVBoxLayout(self.storage_frame)
+            storage.addWidget(label('Folder dla nowych kopii',True))
+            self.working_root=QW.QLineEdit();self.working_root.setReadOnly(True);self.working_root.setAccessibleName('Folder nowych kopii sesji Excel');storage.addWidget(self.working_root)
+            storage_actions=QW.QGridLayout();self.choose_root_button=button('Wybierz folder…',self.choose_working_root);self.default_root_button=button('Folder domyślny',self.reset_working_root)
+            storage_actions.addWidget(self.choose_root_button,0,0);storage_actions.addWidget(self.default_root_button,0,1)
+            self.resume_button=button('Wybierz zapisaną kopię do wznowienia…',self.choose_resume);self.fresh_copy_button=button('Nowa kopia ze źródła',self.clear_resume)
+            storage_actions.addWidget(self.resume_button,1,0,1,2);storage_actions.addWidget(self.fresh_copy_button,2,0,1,2);storage.addLayout(storage_actions)
+            self.resume_note=label('',True,True);self.resume_note.setTextFormat(Qt.TextFormat.PlainText);storage.addWidget(self.resume_note);options.addWidget(self.storage_frame)
+            self.session_paths=QW.QGroupBox('Pliki tej sesji');paths=QW.QVBoxLayout(self.session_paths)
+            paths.addWidget(label('Źródło (bez zmian)',True));self.source_path_view=QW.QLineEdit();self.source_path_view.setReadOnly(True);paths.addWidget(self.source_path_view)
+            paths.addWidget(label('Kopia sesji',True));self.session_path_view=QW.QLineEdit();self.session_path_view.setReadOnly(True);paths.addWidget(self.session_path_view);options.addWidget(self.session_paths)
+            for field in (self.working_root,self.source_path_view,self.session_path_view):field.setMinimumWidth(0);field.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed)
             self.open_events=QW.QCheckBox('Uruchom także makra otwarcia');self.open_events.setToolTip('Dotyczy tylko tej zewnętrznej sesji. Excel stosuje własne ustawienia zabezpieczeń makr.');options.addWidget(self.open_events)
             self.companion_button=button('Dodaj pliki powiązane…',self.choose_companions);options.addWidget(self.companion_button,0,Qt.AlignmentFlag.AlignLeft)
             self.companion_note=label('Szablony i dokumenty zostaną skopiowane obok skoroszytu.',True,True);options.addWidget(self.companion_note)
@@ -10869,9 +11077,10 @@ def native_ui_types():
             self.run_button=button('Uruchom makro',self.run_macro);row.addWidget(self.run_button);session_options.addLayout(row)
             self.pdf_button=button('PDF arkusza…',self.export_pdf);self.pdf_button.setToolTip('Eksportuje bieżący arkusz skoroszytu sesji Excel.')
             self.save_copy_button=button('Zapisz kopię…',self.save_copy);self.save_working_button=button('Zapisz stan sesji',lambda:self.submit('save_working',{}));self.open_workspace_button=button('Folder sesji',self.open_workspace)
+            self.save_session_button=button('Zapisz kopię sesji',lambda:self.submit('save_session',{}));self.save_session_button.setToolTip('Zapisuje ten sam plik roboczy, aby można było później wznowić jego sesję. Nie nadpisuje oryginalnego skoroszytu.')
             commands=QW.QGridLayout()
-            for i,control in enumerate((self.pdf_button,self.save_working_button,self.save_copy_button,self.open_workspace_button)):commands.addWidget(control,i//2,i%2)
-            session_options.addLayout(commands);session_options.addWidget(label('Przed zamknięciem zapisz stan sesji lub osobną kopię, aby zachować zmiany.',True,True));options.addWidget(self.session_options)
+            for i,control in enumerate((self.save_session_button,self.open_workspace_button,self.pdf_button,self.save_working_button,self.save_copy_button)):commands.addWidget(control,i//2,i%2)
+            session_options.addLayout(commands);session_options.addWidget(label('„Zapisz kopię sesji” zachowuje ten sam plik do wznowienia. „Zapisz stan sesji” i „Zapisz kopię…” tworzą osobne pliki.',True,True));options.addWidget(self.session_options)
             self.message=label('',True,True);self.message.setTextFormat(Qt.TextFormat.PlainText);options.addWidget(self.message)
             self.native_frame=QW.QGroupBox('Bieżący arkusz w Excelu');native_layout=QW.QVBoxLayout(self.native_frame)
             native_row=QW.QHBoxLayout();self.native_sheets=QW.QComboBox();native_row.addWidget(self.native_sheets,1)
@@ -10892,6 +11101,10 @@ def native_ui_types():
             self.failure_text=QW.QPlainTextEdit();self.failure_text.setReadOnly(True);self.failure_text.setAccessibleName('Pełna treść ostatniego błędu sesji Excel')
             self.failure_text.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.WidgetWidth);self.failure_text.setWordWrapMode(QG.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
             self.failure_text.setMinimumHeight(90);self.failure_text.setMaximumHeight(240);failure_layout.addWidget(self.failure_text,1)
+            self.macro_recovery=QW.QWidget();recovery=QW.QVBoxLayout(self.macro_recovery);recovery.setContentsMargins(0,0,0,0)
+            recovery.addWidget(label('Otwórz tę samą sesję Excela i sprawdź komunikaty przy skoroszycie. Jeśli chcesz uruchomić przycisk skoroszytu, kliknij go bezpośrednio w Excelu.',True,True))
+            self.macro_recovery_button=button('Pokaż tę sesję Excela',lambda:self.show_excel(select_control=False));recovery.addWidget(self.macro_recovery_button)
+            failure_layout.addWidget(self.macro_recovery);self.macro_recovery.hide()
             failure_actions=QW.QGridLayout();self.failure_details=button('Szczegóły błędu…',self.show_error_details);self.failure_copy=button('Kopiuj szczegóły',self.copy_error_details)
             failure_actions.addWidget(self.failure_details,0,0);failure_actions.addWidget(self.failure_copy,0,1);failure_layout.addLayout(failure_actions)
             self.prompt_layout.addWidget(self.failure_frame);self.failure_frame.hide()
@@ -10959,12 +11172,16 @@ def native_ui_types():
             # diagnostic view; their representation is not an instruction for a user.
             if re.match(r'^\(?-?\d{6,}\s*,',message):
                 details=details or message;message='Excel nie wykonał polecenia. Sprawdź komunikaty skoroszytu przyciskiem „Pokaż w Excelu”. Szczegóły błędu możesz otworzyć lub skopiować poniżej.'
+            if code=='macro_unavailable':
+                details='\n\n'.join(part for part in (message,details) if part)
+                message='Excel zgłosił problem z uruchomieniem makra. Nie wiadomo jeszcze, czy makro jest niedostępne, czy jego uruchomienie blokują ustawienia lub stan skoroszytu.'
             value={'message':message,'details':details,'code':str(code or ''),'operation':str(operation or '')};key=digest(value)
             if key==self._last_failure_key:return
             self._last_failure_key=key;self._last_failure=value;self.failure_text.setPlainText(message);self.failure_frame.show()
+            self.failure_frame.setTitle('Problem z uruchomieniem makra' if code=='macro_unavailable' else 'Ostatnia operacja nie powiodła się');self.macro_recovery.setVisible(code=='macro_unavailable')
             self.body_tabs.setCurrentIndex(1);self.prompt_scroll.verticalScrollBar().setValue(0)
         def clear_failure(self):
-            self._last_failure=None;self._last_failure_key=None;self.failure_text.clear();self.failure_frame.hide()
+            self._last_failure=None;self._last_failure_key=None;self.failure_text.clear();self.failure_frame.hide();self.macro_recovery.hide()
         def reflow_footer(self):
             if not hasattr(self,'footer_layout'):return
             active=self.session_running();controls=[self.native_macro,self.native_reveal,self.close_button] if active else [self.open_button,self.close_button]
@@ -10983,15 +11200,48 @@ def native_ui_types():
             super().resizeEvent(event);self.reflow_footer()
         def session_running(self):
             return bool(self._controller and (self._snapshot.get('owned') or (not self._snapshot.get('finished') and self._snapshot.get('state')!='closed')))
+        def working_directory(self):
+            return Path(self._session_preferences.get('working_root') or self._host_window.service.root/'excel-sessions')
+        def choose_working_root(self):
+            if self.session_running() or self._resume_check_pending:return
+            path=QW.QFileDialog.getExistingDirectory(self,'Folder nowych kopii sesji Excel',str(self.working_directory()))
+            if path:self.set_working_root(path)
+        def reset_working_root(self):
+            if not self.session_running() and not self._resume_check_pending:self.set_working_root('')
+        def set_working_root(self,path):
+            try:
+                preferences=dict(self._session_preferences,working_root=str(path or ''));self._session_preferences=save_excel_session_preferences(preferences,self._host_window.service.root)
+            except Exception as exc:self.message.setText(safe_error(exc));self.remember_failure(safe_error(exc),operation='preferences')
+            self.update_controls()
+        def clear_resume(self):
+            if self.session_running() or self._resume_check_pending:return
+            self._resume_path='';self._resume_source_path='';self._resume_info={};self.update_controls()
+        def choose_resume(self):
+            if self.session_running() or self._closing or self._resume_check_pending:return
+            path=QW.QFileDialog.getOpenFileName(self,'Wybierz zapisaną kopię sesji Excel',str(self.working_directory()),'Skoroszyty Excel (*.xlsx *.xlsm)')[0]
+            if not path:return
+            source=self._resume_source_path or self.file.text() or None;self._resume_path='';self._resume_source_path='';self._resume_info={};self._resume_check_pending=True;epoch=self._epoch;context=clone(self._office_context);self.message.setText('Sprawdzam zapisaną kopię sesji…');self.update_controls()
+            def done(info):
+                if self._disposed or epoch!=self._epoch:return
+                self._resume_check_pending=False;self._resume_path=str(info['path']);self._resume_source_path=str(source or info['original_path']);self._resume_info=info;self.file.edit.setText(self._resume_source_path);self.open_events.setChecked(False)
+                text='Wybrano zapisaną kopię. Kliknij „Wznów tę kopię”, aby otworzyć ten sam plik. Zmiany z Pivot nie zostaną nałożone ponownie.'
+                if info.get('legacy'):text+=' To kopia ze starszej sesji; otworzysz jej aktualny stan zapisany na dysku.'
+                elif info.get('externally_changed'):text+=' Plik zmienił się od ostatniego zapisu w Pivot; otworzysz jego aktualny stan z dysku.'
+                self.message.setText(text);self.update_controls()
+            def failed(error):
+                if self._disposed or epoch!=self._epoch:return
+                self._resume_check_pending=False;self.message.setText(str(error));self.remember_failure(str(error),operation='resume');self.update_controls()
+            self._tasks.submit(lambda:excel_resume_info(path,original_path=source,context=context),done,failed,'Sprawdzenie kopii sesji Excel')
         def choose_companions(self):
             if self.session_running():return
             paths=QW.QFileDialog.getOpenFileNames(self,'Pliki potrzebne makrom: szablony, dokumenty i obrazy','','Wszystkie pliki (*)')[0]
             if paths:self._companion_paths=list(dict.fromkeys(paths));self.companion_note.setText('Pliki obok skoroszytu: '+str(len(self._companion_paths)));self.companion_note.setToolTip('\n'.join(self._companion_paths))
         def open_workspace(self):
-            path=self._snapshot.get('workspace_path') or self._snapshot.get('temp_root')
+            path=self._resume_info.get('session_dir') if self._resume_path and not self.session_running() else self._snapshot.get('workspace_path') or self._snapshot.get('temp_root')
             if path and Path(path).is_dir():QG.QDesktopServices.openUrl(QC.QUrl.fromLocalFile(str(path)))
         def configure_office_context(self,context):
             if self.session_running():raise UserError('Zamknij poprzednią sesję Excela przed otwarciem innego skoroszytu.')
+            self._resume_path='';self._resume_source_path='';self._resume_info={}
             self._office_context=clone(context);self._launch_context=clone(context);self.file.edit.setText(str(context.get('source_path',self.file.text())))
             self.setWindowModality(Qt.WindowModality.WindowModal);self._initial_control_pending=bool(context.get('control'))
             edits=context.get('edits',[]);layout=context.get('layout',[])
@@ -11007,23 +11257,38 @@ def native_ui_types():
             state=self._snapshot.get('state','idle');active=self.session_running();ready=state=='ready' and self._snapshot.get('owned') and not self._closing and not self._command_pending
             # An automatic sheet read never disables explicit commands: they wait for it and run once.
             usable=bool(self._snapshot.get('owned') and not self._closing and self._queued is None and (ready or self.background_read_active()));blocked=self.blocking_error()
-            self.file.setEnabled(not active and not self._closing and not self._office_context);self.open_events.setEnabled(not active and not self._closing and not ((self._office_context or {}).get('edits') or (self._office_context or {}).get('layout')))
-            self.companion_button.setEnabled(not active and not self._closing)
-            for widget in (self.file,self.open_button,self.open_events,self.companion_button,self.companion_note):widget.setVisible(not active)
-            self.session_options.setVisible(active or bool(self._snapshot.get('workspace_path')));self.control_bar.setVisible(active);self.native_macro.setVisible(active);self.native_reveal.setVisible(active);self.stop_button.setVisible(active)
+            selecting=not active and not self._closing and not self._resume_check_pending
+            self.file.setEnabled(selecting and not self._office_context and not self._resume_path);self.open_events.setEnabled(selecting and not self._resume_path and not ((self._office_context or {}).get('edits') or (self._office_context or {}).get('layout')))
+            self.companion_button.setEnabled(selecting and not self._resume_path)
+            self.source_heading.setText('Plik powiązany z arkuszem Pivot' if self._resume_path else 'Plik źródłowy (pozostaje bez zmian)')
+            for widget in (self.source_heading,self.file,self.storage_frame,self.open_button,self.open_events,self.companion_button,self.companion_note):widget.setVisible(not active)
+            self.choose_root_button.setEnabled(selecting and not self._resume_path);self.default_root_button.setEnabled(selecting and not self._resume_path);self.resume_button.setEnabled(selecting);self.fresh_copy_button.setEnabled(selecting)
+            self.fresh_copy_button.setVisible(bool(self._resume_path))
+            note='Wznowienie otworzy ten sam zapisany plik bez ponownego nakładania zmian z Pivot.' if self._resume_path else 'Nowa sesja tworzy osobny folder. Do wznowienia wybierz zachowaną kopię sesji.'
+            if self._resume_info.get('legacy'):note+=' Starsza sesja: otworzysz aktualny stan pliku z dysku.'
+            elif self._resume_info.get('externally_changed'):note+=' Plik został zmieniony od ostatniego zapisu w Pivot. Otworzysz aktualny stan z dysku.'
+            if self._resume_info.get('handoff_incomplete'):note+=' To niepełna kopia. Po wznowieniu makra i edycja pozostaną zablokowane; można ją odczytać i zapisać do sprawdzenia.'
+            self.resume_note.setText(note)
+            session_path=str(self._resume_path if self._resume_path and not active else self._snapshot.get('working_copy') or self._snapshot.get('staged_path') or '')
+            self.session_paths.setVisible(bool(active or session_path))
+            for field,text in ((self.working_root,str(self.working_directory())),(self.source_path_view,str((self._resume_info.get('original_path') if self._resume_path and not active else self._snapshot.get('original_path')) or self.file.text())),(self.session_path_view,session_path)):
+                if field.text()!=text:field.setText(text);field.setToolTip(text);field.setCursorPosition(0)
+            self.session_options.setVisible(active or bool(self._snapshot.get('workspace_path')) or bool(self._resume_path));self.control_bar.setVisible(active);self.native_macro.setVisible(active);self.native_reveal.setVisible(active);self.stop_button.setVisible(active)
             target=(self._office_context or {}).get('control') or {};caption=str(target.get('caption') or target.get('name') or '')
             self.selected_note.setText('Wybrany przycisk: '+caption);self.selected_note.setToolTip(self.selected_note.text());self.selected_note.setVisible(bool(caption and not active))
             self.state_note.setToolTip(self.state_note.text());notice=(self._last_failure or {}).get('message') or self.message.text();self.notice_button.set_full_text(notice)
             self.notice_button.setVisible(bool(notice) and self.body_tabs.currentWidget() is not self.prompt_scroll)
-            self.open_button.setEnabled(bool(self._availability.get('available') and self.file.text().strip() and not active and not self._closing))
+            self.open_button.setText('Wznów tę kopię' if self._resume_path else 'Uruchom sesję Excela');self.open_button.setEnabled(bool(self._availability.get('available') and self.file.text().strip() and selecting))
             self.macro_name.setEnabled(usable);self.run_button.setEnabled(bool(usable and self.macro_name.text().strip() and not blocked));self.pdf_button.setEnabled(usable);self.save_copy_button.setEnabled(usable)
             self.save_working_button.setEnabled(usable)
-            self.open_workspace_button.setEnabled(bool(self._snapshot.get('workspace_path') or self._snapshot.get('temp_root')))
+            self.save_session_button.setEnabled(usable)
+            self.open_workspace_button.setEnabled(bool(self._snapshot.get('workspace_path') or self._snapshot.get('temp_root') or self._resume_info.get('session_dir')))
             self.stop_button.setEnabled(bool(active and not self._closing));self.close_button.setEnabled(not self._closing)
             native_ready=bool(ready and self._native_book_id);native_usable=bool(usable and self._native_book_id);self.native_model.editable=native_ready and not blocked
             for widget in (self.native_sheets,self.native_top,self.native_left,self.native_refresh):widget.setEnabled(native_ready)
             control=self.native_controls.currentData() or {};self.native_controls.setEnabled(native_usable)
             self.native_reveal.setEnabled(bool(self._snapshot.get('owned') and not self._closing and not self._show_pending))
+            self.macro_recovery_button.setEnabled(self.native_reveal.isEnabled())
             self.native_reveal.setToolTip('Otwórz okno tej sesji Excela, aby zobaczyć skoroszyt lub odpowiedzieć na jego komunikat.')
             self.native_macro.setEnabled(native_usable and bool(control.get('macro_supported')) and not blocked)
             self.native_controls.setToolTip(self.native_controls.currentText());self.native_macro.setToolTip('Uruchom makro przycisku: '+self.native_controls.currentText()+'. Jeśli wymaga Application.Caller, kliknij przycisk bezpośrednio w Excelu.' if control.get('macro_supported') else 'Tę kontrolkę uruchom w oknie Excela. Kliknij „Pokaż w Excelu”.')
@@ -11031,20 +11296,21 @@ def native_ui_types():
             prompt_hint=('Sesja działa w tle. Tutaj pojawią się pytania i komunikaty Excela. Jeśli makro czeka na inne okno, kliknij „Pokaż w Excelu”.' if active else 'Uruchom sesję Excela. Tutaj pojawią się jej pytania i komunikaty.')
             if self.message.text() and not self._last_failure:prompt_hint=self.message.text()+'\n\n'+prompt_hint
             self.prompt_empty.setText(prompt_hint if not self._last_failure else 'Możesz ponowić polecenie po usunięciu przyczyny błędu. „Pokaż w Excelu” otwiera okno tej sesji.')
+            if (self._last_failure or {}).get('code')=='macro_unavailable':self.prompt_empty.setText('Komunikaty i pytania tej sesji będą widoczne tutaj. Makro nie jest ponawiane automatycznie.')
             if self._snapshot.get('handoff_incomplete'):self.prompt_empty.setText('Nie przeniesiono wszystkich zmian z Pivot. Makra i edycja w tej sesji są zablokowane. Sprawdź stan kopii, zapisz ją w razie potrzeby i uruchom nową sesję. „Pokaż w Excelu” otwiera jej okno.')
             self.reflow_footer()
         def start_session(self):
-            if self._disposed or self._closing or not self._availability.get('available'):return
+            if self._disposed or self._closing or self._resume_check_pending or not self._availability.get('available'):return
             if self.session_running():return
-            path=self.file.text().strip()
+            path=self._resume_source_path if self._resume_path else self.file.text().strip()
             if not path or Path(path).suffix.lower() not in WORKBOOK_SUFFIXES:self.message.setText('Wybierz plik XLSM albo XLSX.');self.update_controls();return
             self._epoch+=1;self._event_seq=0;self._last_result_key=None;self._last_scan=0;self._native_digest=None;self._scan_pending=False;self._action_pending=False;self._show_pending=False;self._sent_prompts={};self._retry_prompts=set();self.history.clear();self.message.clear();self.clear_failure();self.render_prompts([])
             self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
             try:
                 self._native_book_id='';self.body_tabs.setTabVisible(0,False);self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._native_loading=True
                 self.native_model.set_snapshot({});self.native_sheets.clear();self.native_controls.clear();self._native_controls=[];self._native_loading=False
-                self._controller=ExcelSessionController(path,self._host_window.service.root/'excel-sessions');options={'run_open_events':self.open_events.isChecked()}
-                if self._office_context or self._companion_paths:options['context']=dict(clone(self._office_context or {}),companion_paths=list(self._companion_paths))
+                self._controller=ExcelSessionController(path,self.working_directory(),**({'resume_path':self._resume_path} if self._resume_path else {}));options={'run_open_events':False if self._resume_path else self.open_events.isChecked()}
+                if self._office_context or (self._companion_paths and not self._resume_path):options['context']=dict(clone(self._office_context or {}),companion_paths=[] if self._resume_path else list(self._companion_paths))
                 self._controller.start(**options);self._snapshot={'state':'starting'};self.poll()
             except Exception as exc:
                 if self._controller:
@@ -11092,10 +11358,10 @@ def native_ui_types():
         def reveal_control(self):
             control=self.native_controls.currentData() or {}
             if control:self.submit('reveal_control',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'control_id':control['id']})
-        def show_excel(self):
+        def show_excel(self,select_control=True):
             if self._disposed or self._closing or not self._controller or not self._snapshot.get('owned') or self._show_pending:return
             if self._snapshot.get('state')=='ready' and not self._command_pending:
-                if self.native_controls.currentData():self.reveal_control()
+                if select_control and self.native_controls.currentData():self.reveal_control()
                 else:
                     args={'workbook_id':self._native_book_id or self._snapshot.get('workbook_id')}
                     if self.native_sheets.currentData():args['sheet_id']=self.native_sheets.currentData()
@@ -11218,15 +11484,17 @@ def native_ui_types():
             if result and state=='ready' and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);destination=result.get('destination') if isinstance(result,dict) else None
                 operation=(result.get('action') or snapshot.get('last_operation') or snapshot.get('operation') or '') if isinstance(result,dict) else ''
-                if operation and operation not in ('open','show_excel','reveal_control') and not completed_background and not snapshot.get('handoff_incomplete'):self.clear_failure()
-                if operation in ('save_working','save_copy') and isinstance(result,dict) and (result.get('saved_path') or destination):self.saved_copy_path=str(result.get('saved_path') or destination);self.saved_copy_revision=str(result.get('saved_revision',''))
+                if operation and operation not in ('open','read_range','activate_sheet','show_excel','reveal_control') and not completed_background and not snapshot.get('handoff_incomplete'):self.clear_failure()
+                if operation in ('save_session','save_working','save_copy') and isinstance(result,dict) and (result.get('saved_path') or destination):self.saved_copy_path=str(result.get('saved_path') or destination);self.saved_copy_revision=str(result.get('saved_revision',''))
                 if operation not in ('read_range','open'):
                     done={'show_excel':'Otwarto okno tej sesji Excela.','reveal_control':'Przycisk jest wskazany w Excelu. Kliknij „Uruchom” tutaj albo ten przycisk w Excelu.','run_control_macro':'Makro zakończyło działanie.','run_macro':'Makro zakończyło działanie.','apply_edits':'Zapisano zmianę komórki w Excelu.'}
                     text='Zapisano: '+str(destination) if destination else done.get(operation,'Operacja zakończona.')
+                    if operation=='save_session':text='Zapisano kopię sesji do wznowienia: '+str(result.get('session_saved_path') or snapshot.get('working_copy') or '')
+                    if operation=='save_session' and snapshot.get('handoff_incomplete'):text='Zapisano niepełną kopię do sprawdzenia: '+str(result.get('session_saved_path') or snapshot.get('working_copy') or '')+'. Wznowienie zachowa blokadę makr i edycji.'
                     if operation=='reveal_control' and result.get('foreground') is False:text+=' Jeśli okno Excela nie wyszło na wierzch, wybierz je na pasku zadań.'
                     self.message.setText(text)
                 self.apply_native_result(result)
-                if self._close_after_save and operation in ('save_working','save_copy'):self._close_after_save=False;self.begin_close()
+                if self._close_after_save and operation in ('save_session','save_working','save_copy'):self._close_after_save=False;self.begin_close()
             elif not self._native_book_id and state=='ready' and snapshot.get('snapshot'):self.apply_native_result(snapshot)
             if snapshot.get('error'):
                 # After the (previous) result is shown, so its default sheet note cannot hide this.
@@ -11331,7 +11599,8 @@ def native_ui_types():
             if not self.session_running():
                 self.dispose();event.accept();return
             if self._snapshot.get('owned') and self._snapshot.get('state') in ('ready','busy'):
-                box=QW.QMessageBox(self);box.setWindowTitle('Zakończyć sesję Excela?');box.setText('Zapisz stan sesji lub osobną kopię, aby zachować ostatnie zmiany z Excela.')
+                box=QW.QMessageBox(self);box.setWindowTitle('Zakończyć sesję Excela?');box.setText('Zapisz kopię sesji, aby później ją wznowić, albo zachowaj zmiany w osobnym pliku.')
+                retained=box.addButton('Zapisz kopię sesji',QW.QMessageBox.ButtonRole.AcceptRole);retained.setEnabled(self._snapshot.get('state')=='ready')
                 working=box.addButton('Zapisz stan sesji',QW.QMessageBox.ButtonRole.AcceptRole);working.setEnabled(self._snapshot.get('state')=='ready')
                 save=box.addButton('Zapisz kopię…',QW.QMessageBox.ButtonRole.AcceptRole);save.setEnabled(self._snapshot.get('state')=='ready')
                 discard=box.addButton('Zamknij bez zapisu',QW.QMessageBox.ButtonRole.DestructiveRole);cancel=box.addButton('Anuluj',QW.QMessageBox.ButtonRole.RejectRole);box.setDefaultButton(cancel);box.exec()
@@ -11339,6 +11608,8 @@ def native_ui_types():
                     self._close_after_save=self.save_copy();event.ignore();return
                 if box.clickedButton()==working:
                     self._close_after_save=self.submit('save_working',{});event.ignore();return
+                if box.clickedButton()==retained:
+                    self._close_after_save=self.submit('save_session',{});event.ignore();return
                 if box.clickedButton()!=discard:event.ignore();return
             self.begin_close();event.ignore()
         def reject(self):self.close()
@@ -16928,6 +17199,8 @@ def native_ui_types():
             if getattr(self,'_excel_session_dialog',None) is dialog:self._excel_session_dialog=None
             saved=getattr(dialog,'saved_copy_path','')
             if not saved or bound is None or self.closing or self.service.generation!=generation:return
+            if getattr(dialog,'_snapshot',{}).get('handoff_incomplete'):
+                self.statusBar().showMessage('Zapisano kopię do sprawdzenia: '+str(saved)+'. Nie przeniesiono wszystkich zmian do Excela; lokalny arkusz pozostał zachowany.',15000);return
             saved_revision=getattr(dialog,'saved_copy_revision','')
             if not re.fullmatch('[0-9a-f]{64}',str(saved_revision)):
                 self.statusBar().showMessage('Zachowano plik '+str(saved)+'. Brak potwierdzenia wersji do odświeżenia lokalnego arkusza.',12000);return
@@ -19246,6 +19519,8 @@ if 'Brak bridge' in pathlib.Path(original).name:
  raise SystemExit(7)
 def result(command=None):
  value={'active_sheet':'Raport','workbook_name':'copy.xlsm','workbook_id':session+'-book','sheets':[{'id':'native-sheet','name':'Raport','visible':-1}]}
+ if request.get('handoff_incomplete'):value['handoff_incomplete']=True
+ if command is not None and command['action']=='save_session':value.update(session_saved=True,session_saved_path=original)
  if command is None or command['action'] in ('read_range','activate_sheet'):
   value['snapshot']={'sheet_id':'native-sheet','sheet':'Raport','top':(command or {}).get('top',1),'left':1,'rows':1,'cols':1,'cells':[{'row':1,'column':1,'address':'A1','kind':'formula','formula':'=SUM(20,22)','value':42,'text':'42,00','style':{'bold':True,'fill_color':255}}],'controls':[{'id':'native-control','name':'Print','on_action':'Print','native_only':True}]}
  return value
@@ -19496,6 +19771,118 @@ send('closed')
             self.assertTrue(state['handoff_incomplete'])
             for action,args in (('run_macro',{'name':'Print'}),('run_control_macro',{'sheet_id':'native-sheet','control_id':'native-control'}),('apply_edits',{'edits':[]})):
                 with self.subTest(action=action),self.assertRaisesRegex(UserError,'Przeniesienie zmian'):controller.submit(action,args)
+        def save_session(self,controller):
+            controller.submit('save_session');state=self.wait(controller,lambda s:s['state']=='ready' and s['last_operation']=='save_session')
+            self.assertFalse(state['error']);return Path(state['last_result']['saved_path'])
+        def resume(self,path,context=None,source=None):
+            controller=ExcelSessionController(source or self.original,self.root/'unused-folder',resume_path=path);self.controllers.append(controller);controller.start(context=context)
+            self.wait(controller,lambda s:s['state']=='ready');return controller
+        def test_save_session_confirms_exact_file_without_snapshot_or_original_mutation(self):
+            controller=self.start();staged=Path(controller.poll()['staged_path']);inode=staged.stat().st_ino
+            self.assertEqual(self.save_session(controller),staged);self.assertEqual(staged.stat().st_ino,inode)
+            manifest=json.loads((staged.parent/'session.json').read_text('utf-8'));self.assertEqual(manifest['version'],2);self.assertEqual(manifest['saved_revision'],file_digest(staged));self.assertTrue(manifest['saved_handoff'])
+            self.assertEqual(controller.poll()['last_result']['saved_revision'],file_digest(staged));self.assertFalse(list(staged.parent.glob('snapshot-*')));self.assertEqual(self.original.read_bytes(),self.before)
+        def test_resume_preserves_exact_unicode_path_and_never_recopies_or_replays(self):
+            controller=self.start();staged=self.save_session(controller);controller.close();self.assertTrue(controller.finished.wait(4))
+            with zipfile.ZipFile(staged,'a') as archive:archive.writestr('customXml/resume.txt','saved manually in same copy')
+            saved=staged.read_bytes();info=excel_resume_info(staged,self.original,{});self.assertTrue(info['externally_changed'])
+            with patch(__name__+'.excel_copy_workbook',side_effect=AssertionError('Resume must not recopy')):
+                resumed=self.resume(staged)
+            state=resumed.poll();request=json.loads((staged.parent/'opened.json').read_text('utf-8'));self.assertEqual(state['staged_path'],str(staged));self.assertTrue(state['resumed']);self.assertTrue(state['externally_changed'])
+            self.assertEqual(request['path'],str(staged));self.assertEqual(request['original_path'],str(self.original));self.assertTrue(request['resume']);self.assertFalse(request['run_open_events']);self.assertFalse(request['context'].get('edits'));self.assertFalse(request['context'].get('layout'))
+            self.assertNotEqual(resumed.session_id,controller.session_id);self.assertFalse((self.root/'unused-folder').exists());self.assertEqual(staged.read_bytes(),saved);self.assertEqual(self.original.read_bytes(),self.before)
+        def test_resume_pending_handoff_requires_same_confirmed_saved_changes(self):
+            context={'source_revision':file_digest(self.original),'edits':[{'sheet':'Raport','address':'A1','kind':'number','value':12}],
+                     'layout':[{'sheet':'Raport','columns':[{'index':1,'width':180}],'rows':[]}]}
+            controller=ExcelSessionController(self.original,self.private);self.controllers.append(controller);controller.start(context=context);self.wait(controller,lambda s:s['state']=='ready');staged=controller.staged
+            with self.assertRaisesRegex(UserError,'potwierdzonego zapisu'):excel_resume_info(staged,self.original,context)
+            self.save_session(controller);self.assertEqual(excel_resume_info(staged,self.original,context)['path'],str(staged))
+            changed=clone(context);changed['edits'][0]['value']=13
+            with self.assertRaises(UserError):excel_resume_info(staged,self.original,changed)
+            changed=clone(context);changed['layout'][0]['columns'][0]['width']=181
+            with self.assertRaises(UserError):excel_resume_info(staged,self.original,changed)
+            controller.close();self.assertTrue(controller.finished.wait(4));resumed=self.resume(staged,context)
+            request=json.loads((staged.parent/'opened.json').read_text('utf-8'));self.assertFalse(request['context'].get('edits'));self.assertFalse(request['context'].get('layout'));resumed.close();self.assertTrue(resumed.finished.wait(4))
+            with zipfile.ZipFile(staged,'a') as archive:archive.writestr('customXml/external.txt','changed')
+            with self.assertRaises(UserError):excel_resume_info(staged,self.original,context)
+            self.assertTrue(excel_resume_info(staged,self.original,{})['externally_changed'])
+        def test_resume_copy_imported_as_local_source_keeps_real_original_and_blocks_new_edits(self):
+            controller=self.start();staged=self.save_session(controller);controller.close();self.assertTrue(controller.finished.wait(4))
+            with zipfile.ZipFile(staged,'a') as archive:archive.writestr('customXml/source.txt','new disk state')
+            context={'source_revision':file_digest(staged),'edits':[],'layout':[]}
+            info=excel_resume_info(staged,staged,context);self.assertEqual(info['original_path'],str(self.original))
+            resumed=self.resume(staged,context,source=staged);request=json.loads((staged.parent/'opened.json').read_text('utf-8'));self.assertEqual(request['original_path'],str(self.original));self.assertEqual(self.save_session(resumed),staged)
+            context['edits']=[{'sheet':'Raport','address':'A1','kind':'text','value':'new local edit'}]
+            with self.assertRaises(UserError):excel_resume_info(staged,staged,context)
+            with self.assertRaises(UserError):excel_resume_info(staged,staged,{'source_revision':file_digest(self.original)})
+        def test_legacy_retained_sessions_resume_without_edits_and_upgrade_when_saved(self):
+            controller=self.start();staged=controller.staged;controller.close();self.assertTrue(controller.finished.wait(4));manifest_path=staged.parent/'session.json'
+            manifest=json.loads(manifest_path.read_text('utf-8'))
+            for key in ('version','handoff_digest','handoff_complete','saved_handoff','handoff_incomplete','saved_revision'):manifest.pop(key)
+            manifest_path.write_text(dumps(manifest),encoding='utf-8');self.assertTrue(excel_resume_info(staged,self.original,{})['legacy'])
+            with self.assertRaises(UserError):excel_resume_info(staged,self.original,{'edits':[{'sheet':'Raport','address':'A1','kind':'text','value':'pending'}]})
+            resumed=self.resume(staged,{'source_revision':file_digest(self.original)});self.save_session(resumed);self.assertFalse(excel_resume_info(staged)['legacy'])
+        def test_partial_handoff_save_and_resume_never_clear_macro_latch(self):
+            controller=self.start();controller.state.update(handoff_incomplete=True);controller.manifest.update(handoff_incomplete=True,handoff_complete=False,saved_handoff=False);controller._write_manifest()
+            staged=self.save_session(controller);self.assertTrue(excel_resume_info(staged)['handoff_incomplete']);controller.close();self.assertTrue(controller.finished.wait(4))
+            resumed=self.resume(staged);self.assertTrue(resumed.poll()['handoff_incomplete']);self.save_session(resumed);self.assertTrue(resumed.poll()['handoff_incomplete'])
+            resumed.submit('read_range');self.wait(resumed,lambda s:s['state']=='ready');self.assertTrue(resumed.poll()['handoff_incomplete'])
+            for action,args in (('run_macro',{'name':'Print'}),('apply_edits',{'edits':[]})):
+                with self.assertRaises(UserError):resumed.submit(action,args)
+            with self.assertRaises(UserError):ExcelSessionController(self.original,self.private,resume_path=staged).start(run_open_events=True)
+        def test_session_copy_lock_prevents_second_controller_and_releases_after_cleanup(self):
+            controller=self.start();staged=controller.staged;second=ExcelSessionController(self.original,self.private,resume_path=staged);self.controllers.append(second);second.start();self.assertTrue(second.finished.wait(4))
+            self.assertIn('już otwarta',second.poll()['error']);self.assertEqual(len(self.launches),1)
+            controller.close();self.assertTrue(controller.finished.wait(4));self.assertTrue((staged.parent/'.pivot-session.lock').is_file())
+            resumed=self.resume(staged);self.assertEqual(resumed.poll()['staged_path'],str(staged));self.assertEqual(len(self.launches),2)
+        def test_session_lock_is_cross_process_and_stale_lockfile_is_harmless(self):
+            controller=self.start();folder=controller.temp_root
+            script="import sys;from pathlib import Path;from PivotStudio import _ExcelSessionFileLock,UserError\ntry: lock=_ExcelSessionFileLock(Path(sys.argv[1]))\nexcept UserError: sys.exit(23)\nlock.close()\n"
+            def probe():
+                process=self.original_popen([sys.executable,'-B','-c',script,str(folder)],cwd=str(Path(__file__).parent),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                out,err=process.communicate(timeout=10);self.assertFalse(err,err.decode('utf-8','replace'));return process.returncode
+            self.assertEqual(probe(),23);controller.close();self.assertTrue(controller.finished.wait(4));self.assertEqual(probe(),0)
+        def test_lock_stays_held_until_exact_owned_process_has_stopped(self):
+            controller=self.start();owned=controller.owned_process
+            with patch.object(owned,'terminate',return_value=None):
+                controller.cancel();self.assertTrue(controller.finished.wait(6))
+                with self.assertRaises(UserError):_ExcelSessionFileLock(controller.temp_root)
+                self.assertTrue(owned.running);owned.running=False
+                deadline=time.monotonic()+3
+                while controller.session_file_lock.stream is not None and time.monotonic()<deadline:time.sleep(.01)
+                self.assertIsNone(controller.session_file_lock.stream)
+            check=_ExcelSessionFileLock(controller.temp_root);check.close()
+        def test_resume_rejects_malformed_mismatched_and_unbounded_manifests(self):
+            controller=self.start();staged=controller.staged;controller.close();self.assertTrue(controller.finished.wait(4));manifest_path=staged.parent/'session.json';valid=json.loads(manifest_path.read_text('utf-8'))
+            for change in ({'version':77},{'working_copy':str(self.original)},{'original_path':str(staged)},{'source_revision':'bad'},{'handoff_incomplete':'false'},{'saved_revision':None},{'saved_revision':[]},{'handoff_digest':False}):
+                with self.subTest(change=change):
+                    manifest_path.write_text(dumps(dict(valid,**change)),encoding='utf-8')
+                    with self.assertRaises(UserError):excel_resume_info(staged,self.original,{})
+            manifest_path.write_text(' '*65537,encoding='utf-8')
+            with self.assertRaises(UserError):excel_resume_info(staged)
+            manifest_path.write_text(dumps(valid),encoding='utf-8')
+            with self.assertRaises(UserError):excel_resume_info(staged,self.root/'another.xlsm',{})
+            with self.assertRaises(UserError):excel_resume_info(staged,self.original,{'source_revision':'0'*64})
+            with self.assertRaises(UserError):excel_resume_info(self.original,self.original,{})
+        def test_resume_rejects_copy_hardlinked_to_original(self):
+            controller=self.start();staged=controller.staged;controller.close();self.assertTrue(controller.finished.wait(4));staged.unlink()
+            try:os.link(self.original,staged)
+            except OSError as exc:self.skipTest(str(exc))
+            with self.assertRaisesRegex(UserError,'nigdy oryginał'):excel_resume_info(staged,self.original,{})
+        def test_resume_rejects_symlinked_workbook_or_manifest(self):
+            controller=self.start();staged=controller.staged;controller.close();self.assertTrue(controller.finished.wait(4));target=self.root/'real-session.json';manifest=staged.parent/'session.json';manifest.rename(target)
+            try:manifest.symlink_to(target)
+            except OSError as exc:target.rename(manifest);self.skipTest(str(exc))
+            with self.assertRaisesRegex(UserError,'dowiązaniem'):excel_resume_info(staged)
+        def test_unconfirmed_or_foreign_session_save_cannot_publish_resume_hash(self):
+            controller=self.start();before=clone(controller.manifest)
+            for result in ({'session_saved':True,'session_saved_path':str(self.original)},{'session_saved_path':str(controller.staged)}):
+                with self.assertRaises(UserError):controller._record_session_save(result)
+                self.assertEqual(controller.manifest,before)
+        @unittest.skipUnless(os.name=='nt','Windows case-insensitive pathname identity')
+        def test_same_session_save_accepts_canonicalized_windows_path_case(self):
+            controller=self.start();result=controller._record_session_save({'session_saved':True,'session_saved_path':str(controller.staged).swapcase()})
+            self.assertEqual(result['saved_path'],str(controller.staged));self.assertEqual(result['saved_revision'],file_digest(controller.staged))
     class FakeCom:
         def __init__(self,handlers=None,**values):
             self.handlers=handlers or {};self.calls=[];self.__dict__.update(values)
@@ -19681,7 +20068,7 @@ send('closed')
             command={'action':'run_control_macro','session_id':'fixture','workbook_id':'fixture-book','id':'generate','sheet_id':sid,'control_id':control['id']}
             self.worker.handle_command(command);error=json.loads(self.output.getvalue().splitlines()[-1])
             self.assertEqual(calls,[self.worker.qualified_macro('Moduł.Generuj')]);self.assertEqual(error['code'],'macro_unavailable')
-            self.assertIn('Application.Caller',error['message']);self.assertIn('on_action',error['details']);self.assertIn('working_copy',error['details']);self.assertIn('open_events_enabled',error['details'])
+            self.assertIn('tej samej kopii sesji',error['message']);self.assertNotIn('Application.Caller',error['message']);self.assertIn('on_action',error['details']);self.assertIn('working_copy',error['details']);self.assertIn('open_events_enabled',error['details'])
             self.assertEqual(control['macro_qualified_name'],calls[0]);self.assertFalse(control['caller_emulated'])
             shape.Type=12;command['control_id']=self.worker.controls(self.sheet,sid)[0]['id'];self.worker.handle_command(command)
             self.assertEqual(len(calls),1);self.assertEqual(json.loads(self.output.getvalue().splitlines()[-1])['event'],'error')
@@ -19742,6 +20129,98 @@ send('closed')
         def test_open_runs_legacy_auto_macro_only_after_explicit_opt_in(self):
             self.worker.open_workbook(self.open_request(True));self.assertIs(self.open_calls[0][2],True)
             self.assertEqual([args for name,args in self.book.calls if name=='RunAutoMacros'],[(1,)])
+        def prepare_session_save(self):
+            request=self.open_request();original=self.path.parent/'original.xlsm';original.write_bytes(b'original workbook remains unchanged')
+            request['original_path']=str(original);self.worker.open_workbook(request);self.book.FullName=str(self.path);self.book.ReadOnly=False;self.book.Saved=False
+            def save():self.path.write_bytes(b'explicitly saved retained workbook');self.book.Saved=True
+            self.book.handlers['Save']=save
+            return request,original
+        def session_command(self,action='save_session',**values):
+            self.worker.handle_command(dict(values,action=action,id=action,session_id='fixture',workbook_id='fixture-book'))
+            return json.loads(self.output.getvalue().splitlines()[-1])
+        def test_save_session_writes_only_same_retained_file_once(self):
+            request,original=self.prepare_session_save();before=original.read_bytes();event=self.session_command()
+            self.assertEqual(event['event'],'done');self.assertIs(event['result']['session_saved'],True)
+            self.assertEqual(Path(event['result']['session_saved_path']),self.path.resolve());self.assertEqual(original.read_bytes(),before)
+            self.assertEqual(self.path.read_bytes(),b'explicitly saved retained workbook');self.assertEqual([name for name,_ in self.book.calls].count('Save'),1)
+            self.assertNotIn('SaveCopyAs',[name for name,_ in self.book.calls])
+        def test_save_partial_session_keeps_the_handoff_latch(self):
+            request,original=self.prepare_session_save();self.worker.handoff_incomplete=True;event=self.session_command()
+            self.assertEqual(event['event'],'done');self.assertTrue(event['result']['session_saved']);self.assertTrue(event['result']['handoff_incomplete'])
+            self.assertTrue(self.worker.handoff_incomplete);self.assertEqual(self.session_command('run_macro',name='Print')['event'],'error')
+            self.assertNotIn('Run',[name for name,_ in self.excel.calls])
+        def test_save_session_refuses_original_drift_readonly_and_destination_override(self):
+            request,original=self.prepare_session_save();other=self.path.parent/'other.xlsm';other.write_bytes(b'other workbook')
+            for change,args in (({'original_path':str(self.path)},{}),({'original_path':''},{}),({}, {'destination':str(other)}),({}, {'temp_path':str(other)})):
+                self.worker.original_path=str(original)
+                for key,value in change.items():setattr(self.worker,key,value)
+                self.assertEqual(self.session_command(**args)['event'],'error')
+            self.worker.original_path=str(original);self.book.FullName=str(other);self.assertEqual(self.session_command()['event'],'error')
+            self.book.FullName=str(self.path);self.book.ReadOnly=True;self.assertEqual(self.session_command()['event'],'error')
+            self.assertNotIn('Save',[name for name,_ in self.book.calls]);self.assertEqual(other.read_bytes(),b'other workbook')
+        def test_save_session_refuses_a_hardlink_to_original(self):
+            request,original=self.prepare_session_save();alias=self.path.parent/'original-alias.xlsm'
+            try:os.link(self.path,alias)
+            except (OSError,NotImplementedError) as exc:self.skipTest('Hardlinks unavailable: '+str(exc))
+            self.worker.original_path=str(alias);event=self.session_command();self.assertEqual(event['event'],'error')
+            self.assertNotIn('Save',[name for name,_ in self.book.calls])
+        def test_save_session_cancelled_or_failed_is_not_reported_saved_or_retried(self):
+            request,original=self.prepare_session_save();self.book.handlers['Save']=lambda:None
+            event=self.session_command();self.assertEqual(event['event'],'error');self.assertNotIn('result',event)
+            self.assertEqual([name for name,_ in self.book.calls].count('Save'),1)
+            def fail():raise RuntimeError('0x8001010A RPC_E_SERVERCALL_RETRYLATER')
+            self.book.calls.clear();self.book.handlers['Save']=fail;event=self.session_command()
+            self.assertEqual(event['event'],'error');self.assertEqual(event['code'],'office_busy');self.assertFalse(event['retry_safe'])
+            self.assertEqual([name for name,_ in self.book.calls].count('Save'),1)
+        def test_save_session_detects_workbook_saveas_during_before_save(self):
+            request,original=self.prepare_session_save();other=self.path.parent/'redirected.xlsm';other.write_bytes(b'previous file')
+            def redirect():self.book.FullName=str(other);self.book.Saved=True
+            self.book.handlers['Save']=redirect;event=self.session_command();self.assertEqual(event['event'],'error');self.assertNotIn('result',event)
+            self.assertEqual([name for name,_ in self.book.calls].count('Save'),1)
+        def test_save_session_rechecks_com_identity_after_before_save(self):
+            request,original=self.prepare_session_save()
+            for replacement in (None,FakeCom(Name=self.book.Name,FullName=str(self.path),Saved=True)):
+                self.excel.Workbooks.values=[self.book];self.book.calls.clear();self.book.Saved=False
+                def close_or_replace():
+                    self.excel.Workbooks.values=[] if replacement is None else [replacement];self.book.Saved=True
+                self.book.handlers['Save']=close_or_replace;event=self.session_command()
+                self.assertEqual(event['event'],'error');self.assertNotIn('result',event);self.assertEqual([name for name,_ in self.book.calls].count('Save'),1)
+        def test_resume_opens_exact_file_without_replaying_handoff_and_keeps_latch(self):
+            request=self.open_request();original=self.path.parent/'original.xlsm';original.write_bytes(b'original')
+            request.update(original_path=str(original),resume=True,handoff_incomplete=True);self.worker.validate_open(request)
+            with patch.object(self.worker,'apply_edits') as edits,patch.object(self.worker,'apply_layout') as layout:
+                result=self.worker.open_workbook(request);edits.assert_not_called();layout.assert_not_called()
+            self.assertTrue(result['resumed']);self.assertTrue(result['handoff_incomplete']);self.assertEqual(self.open_calls[0][0][0],str(self.path))
+            self.assertIs(self.excel.Visible,False);self.assertEqual(self.session_command('list_sheets')['event'],'done')
+            self.book.FullName=str(self.path);self.book.ReadOnly=False;self.book.Saved=False;self.book.handlers['Save']=lambda:setattr(self.book,'Saved',True)
+            saved=self.session_command();self.assertEqual(saved['event'],'done');self.assertTrue(saved['result']['handoff_incomplete']);self.assertTrue(self.worker.handoff_incomplete)
+            self.assertEqual(self.session_command('run_macro',name='Print')['event'],'error');self.assertNotIn('Run',[name for name,_ in self.excel.calls])
+        def test_resume_rejects_replayed_edits_layout_or_original_before_open(self):
+            request=self.open_request();original=self.path.parent/'original.xlsm';original.write_bytes(b'original');request.update(original_path=str(original),resume=True)
+            for context in ({'edits':[self.edit()]},{'layout':[{'sheet':'Raport','rows':[{'index':1,'height':40}]}]}):
+                request['context']=context
+                with self.assertRaises(UserError):self.worker.validate_open(request)
+                with self.assertRaises(UserError):self.worker.open_workbook(request)
+            self.assertEqual(self.open_calls,[]);request['context']={};request['original_path']=str(self.path)
+            with self.assertRaises(UserError):self.worker.validate_open(request)
+            request['original_path']=''
+            with self.assertRaises(UserError):self.worker.validate_open(request)
+        def test_partial_resume_cannot_run_open_macros_around_handoff_latch(self):
+            request=self.open_request(True);original=self.path.parent/'original.xlsm';original.write_bytes(b'original')
+            request.update(original_path=str(original),resume=True,handoff_incomplete=True)
+            for incomplete in (True,False):
+                request['handoff_incomplete']=incomplete
+                with self.assertRaises(UserError):self.worker.validate_open(request)
+                with self.assertRaises(UserError):self.worker.open_workbook(request)
+            self.assertEqual(self.open_calls,[]);self.assertNotIn('RunAutoMacros',[name for name,_ in self.book.calls])
+        def test_reveal_control_scrolls_without_selecting_shape_or_invoking_macro(self):
+            self.worker.open_workbook(self.open_request());self.excel.ActiveWindow=FakeCom(Hwnd=848484);self.excel.handlers['Goto']=lambda *_:None
+            shape=FakeCom(ID=9,Name='Generuj',Type=8,OnAction='ThisWorkbook.GenerateDocument',Visible=-1,ControlFormat=FakeCom(Enabled=True),
+                Top=10.,Left=20.,Width=50.,Height=18.,TopLeftCell=FakeCom(Row=1,Column=1))
+            self.sheet.Shapes.values=[shape];sid=self.worker.sheet_id(self.sheet);control=self.worker.controls(self.sheet,sid)[0]
+            event=self.session_command('reveal_control',sheet_id=sid,control_id=control['id'])
+            self.assertEqual(event['event'],'done');self.assertEqual(event['result']['reveal_hwnd'],848484);self.assertTrue(self.excel.Visible)
+            self.assertIn('Goto',[name for name,_ in self.excel.calls]);self.assertNotIn('Run',[name for name,_ in self.excel.calls]);self.assertNotIn('Select',[name for name,_ in shape.calls])
         def test_auto_open_failure_keeps_workbook_and_reports_specific_macro_without_retry(self):
             request=self.open_request(True)
             def fail(*_):raise RuntimeError('Błąd inicjalizacji makra.')
@@ -23214,6 +23693,13 @@ def ui_test():
             self.wait(lambda:book.get('origin')==str(saved));self.assertEqual(book['id'],old_id);self.assertEqual(book['sheets'][0]['id'],sheet_id)
             self.assertEqual(unpack(book['sheets'][0]['cells']['A1']['v']),'from Excel');self.assertEqual(book['source_revision'],file_digest(saved))
             self.assertIs(self.window.sheet_workspace.session.book,book);self.assertEqual(sheet_excel_handoff(book)['edits'],[])
+        def test_office_handoff_partial_saved_copy_never_replaces_pending_local_changes(self):
+            import types
+            path,book=self.office_handoff_fixture();ws=self.window.sheet_workspace;ws.session.edit(ws.sheet_id,0,0,'keep local change');before=clone(book)
+            saved=self.root/'partial-session.xlsx';fresh=sheet_new_book();fresh['sheets'][0]['name']=book['sheets'][0]['name'];fresh['sheets'][0]['cells']={'A1':{'v':pack('incomplete Excel state')}};sheet_export_xlsx(fresh,saved)
+            dialog=types.SimpleNamespace(saved_copy_path=str(saved),saved_copy_revision=file_digest(saved),_snapshot={'handoff_incomplete':True})
+            self.window._excel_session_finished(dialog,book,self.service.generation,book['revision']);app.processEvents()
+            self.assertEqual(book,before);self.assertFalse(self.window.tasks.pending);self.assertEqual(unpack(book['sheets'][0]['cells']['A1']['v']),'keep local change');self.assertTrue(sheet_excel_handoff(book)['edits'])
         def test_office_handoff_late_result_does_not_overwrite_new_project_or_local_edits(self):
             import types
             path,book=self.office_handoff_fixture();before=clone(book);revision=book['revision'];dialog=types.SimpleNamespace(saved_copy_path=str(path),saved_copy_revision=file_digest(path))
@@ -23237,8 +23723,8 @@ def ui_test():
             from unittest import mock
             instances=[];path=self.root/'session.xlsm';path.write_bytes(b'INERT GUI FIXTURE; no Excel is started')
             class FakeController:
-                def __init__(inner,source,root):
-                    inner.calls=[];inner.snapshot={'session_id':uid(),'state':'new','owned':False,'pid':701,'hwnd':702,'active_sheet':'Raport','events':[],'last_result':{},'error':'','finished':False};instances.append(inner)
+                def __init__(inner,source,root,resume_path=None):
+                    inner.source=source;inner.root=Path(root);inner.resume_path=resume_path;inner.calls=[];inner.snapshot={'session_id':uid(),'state':'new','owned':False,'pid':701,'hwnd':702,'active_sheet':'Raport','events':[],'last_result':{},'error':'','finished':False};instances.append(inner)
                 def start(inner,**options):inner.calls.append(('start',options));inner.snapshot.update(state='ready',owned=True);return inner.snapshot['session_id']
                 def poll(inner):return clone(inner.snapshot)
                 def submit(inner,action,args):inner.calls.append((action,clone(args)));inner.snapshot.update(state='busy',operation=action,error='');return uid()
@@ -23586,6 +24072,66 @@ def ui_test():
             dialog,instances,scan,action=self.excel_session_fixture();self.assertFalse(instances);self.assertFalse(dialog.open_events.isChecked());dialog.open_button.click();self.assertEqual(len(instances),1)
             self.assertEqual(instances[0].calls,[('start',{'run_open_events':False})]);self.assertTrue(dialog.pdf_button.isEnabled());self.assertFalse(dialog.run_button.isEnabled())
             instances[0].snapshot.update(state='closed',owned=False,finished=True);dialog.poll();dialog.open_events.setChecked(True);dialog.open_button.click();self.assertEqual(instances[1].calls,[('start',{'run_open_events':True})])
+        def test_excel_session_working_folder_is_explicit_persisted_and_resettable(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();default=self.service.root/'excel-sessions';target=self.root/'Chosen workbooks'
+            self.assertEqual(dialog.working_directory(),default)
+            with mock.patch.object(QW.QFileDialog,'getExistingDirectory',return_value=str(target)),mock.patch.object(ui['QtGui'].QDesktopServices,'openUrl') as opened:
+                dialog.choose_root_button.click();self.assertEqual(dialog.working_directory(),target);self.assertFalse(target.exists());opened.assert_not_called()
+            self.assertEqual(excel_session_preferences(self.service.root)['working_root'],str(target));self.assertFalse(instances)
+            dialog.open_button.click();self.assertEqual(instances[0].root,target);self.assertIsNone(instances[0].resume_path)
+            instances[0].snapshot.update(state='closed',owned=False,finished=True);dialog.poll();dialog.default_root_button.click()
+            self.assertEqual(excel_session_preferences(self.service.root)['working_root'],'');self.assertEqual(dialog.working_directory(),default)
+        def test_excel_session_resume_requires_selection_then_explicit_start_same_copy(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();source=dialog.file.text();copy=self.root/'retained'/'session.xlsm';context={'source_path':source,'source_revision':'x'*64,'edits':[{'address':'A1','value':'pending'}],'layout':[]}
+            dialog.configure_office_context(context);info={'path':str(copy),'original_path':source,'session_dir':str(copy.parent),'source_revision':'x'*64}
+            with mock.patch(__name__+'.excel_resume_info',return_value=info) as resume,mock.patch.object(QW.QFileDialog,'getOpenFileName',return_value=(str(copy),'')):
+                dialog.resume_button.click();self.wait(lambda:not dialog._resume_check_pending);resume.assert_called_once_with(str(copy),original_path=source,context=context)
+            self.assertFalse(instances);self.assertEqual(dialog.open_button.text(),'Wznów tę kopię');self.assertEqual(dialog.session_path_view.text(),str(copy));self.assertEqual(dialog.source_path_view.text(),source)
+            self.assertFalse(dialog.open_events.isChecked());self.assertFalse(dialog.open_events.isEnabled());self.assertFalse(dialog.companion_button.isEnabled());self.assertIn('bez ponownego',dialog.resume_note.text())
+            dialog.open_button.click();self.assertEqual(len(instances),1);controller=instances[0];self.assertEqual(controller.source,source);self.assertEqual(controller.resume_path,str(copy))
+            self.assertFalse(controller.calls[0][1]['run_open_events']);self.assertEqual(controller.calls[0][1]['context']['edits'],context['edits']);self.assertFalse(any(call[0]=='apply_edits' for call in controller.calls))
+        def test_excel_session_resume_failure_never_starts_or_reuses_previous_selection(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();dialog._resume_path='previous.xlsm';dialog._resume_info={'path':'previous.xlsm'}
+            with mock.patch(__name__+'.excel_resume_info',side_effect=UserError('Zmiany lokalne nie pasują do zapisanej kopii.')),mock.patch.object(QW.QFileDialog,'getOpenFileName',return_value=(str(self.root/'other.xlsm'),'')):
+                dialog.choose_resume();self.wait(lambda:not dialog._resume_check_pending)
+            self.assertFalse(instances);self.assertEqual(dialog._resume_path,'');self.assertIn('Zmiany lokalne',dialog.failure_text.toPlainText());self.assertEqual(dialog.open_button.text(),'Uruchom sesję Excela')
+        def test_excel_session_resume_preserves_local_source_already_bound_to_retained_copy(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();original=dialog.file.text();copy=str(self.root/'retained'/'same.xlsm');context={'source_path':copy,'source_revision':'a'*64,'edits':[],'layout':[]}
+            dialog.configure_office_context(context);info={'path':copy,'original_path':original,'session_dir':str(Path(copy).parent),'disk_revision':'a'*64}
+            with mock.patch(__name__+'.excel_resume_info',return_value=info) as resume,mock.patch.object(QW.QFileDialog,'getOpenFileName',return_value=(copy,'')):
+                dialog.choose_resume();self.wait(lambda:not dialog._resume_check_pending);resume.assert_called_once_with(copy,original_path=copy,context=context)
+            self.assertEqual(dialog.file.text(),copy);self.assertEqual(dialog.source_path_view.text(),original);dialog.start_session()
+            self.assertEqual(instances[0].source,copy);self.assertEqual(instances[0].resume_path,copy);self.assertEqual(instances[0].calls[0][1]['context']['source_revision'],'a'*64)
+        def test_excel_session_resume_changed_disk_note_and_cancel_preserve_choice(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();copy=self.root/'retained.xlsm';info={'path':str(copy),'original_path':dialog.file.text(),'session_dir':str(self.root),'externally_changed':True}
+            with mock.patch(__name__+'.excel_resume_info',return_value=info),mock.patch.object(QW.QFileDialog,'getOpenFileName',return_value=(str(copy),'')):
+                dialog.choose_resume();self.wait(lambda:not dialog._resume_check_pending)
+            self.assertIn('aktualny stan z dysku',dialog.resume_note.text())
+            with mock.patch.object(QW.QFileDialog,'getOpenFileName',return_value=('','')):dialog.choose_resume()
+            self.assertEqual(dialog._resume_path,str(copy));self.assertFalse(instances);dialog.fresh_copy_button.click();self.assertEqual(dialog._resume_path,'');self.assertTrue(dialog.file.isEnabled())
+        def test_excel_session_save_retained_copy_waits_for_confirmed_result_before_close(self):
+            from unittest import mock
+            dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();controller=instances[0];copy=str(self.root/'retained'/'session.xlsm')
+            controller.snapshot.update(working_copy=copy,original_path=dialog.file.text(),workspace_path=str(Path(copy).parent));dialog.poll()
+            self.assertEqual(dialog.session_path_view.text(),copy)
+            with mock.patch.object(QW.QMessageBox,'exec',lambda box:next(b for b in box.buttons() if b.text()=='Zapisz kopię sesji').click()):dialog.close()
+            self.wait(lambda:not dialog._command_pending);self.assertEqual(controller.calls[-1],('save_session',{}));self.assertFalse(dialog._closing);self.assertEqual(dialog.saved_copy_path,'')
+            controller.snapshot.update(state='ready',last_result={'action':'save_session','session_saved':True,'session_saved_path':copy,'saved_path':copy,'saved_revision':'z'*64},error='');dialog.poll()
+            self.assertEqual(dialog.saved_copy_path,copy);self.assertEqual(dialog.saved_copy_revision,'z'*64);self.assertEqual(controller.calls[-1][0],'close');dialog.poll();self.assertTrue(dialog._disposed)
+        def test_excel_session_macro_recovery_reveals_same_workbook_without_retry_and_keeps_error(self):
+            dialog,controller=self.native_session();details='HRESULT 0x800A03EC: native diagnostic'
+            controller.snapshot.update(state='ready',error='Cannot run named macro',error_details=details,error_code='macro_unavailable',error_operation='run_control_macro');dialog.poll();app.processEvents()
+            self.assertTrue(dialog.macro_recovery.isVisible());self.assertIn('Nie wiadomo jeszcze',dialog.failure_text.toPlainText());self.assertNotIn('HRESULT',dialog.failure_text.toPlainText());self.assertIn(details,dialog.error_report())
+            before=len(controller.calls);dialog.macro_recovery_button.click();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual(controller.calls[before:],[('show_excel',{'workbook_id':'native-book','sheet_id':'sheet-1'})])
+            controller.snapshot.update(state='ready',error='',error_operation='',last_operation='show_excel',last_result={'action':'show_excel'});dialog.poll();self.assertTrue(dialog.macro_recovery.isVisible())
+            dialog.refresh_native();self.wait(lambda:not dialog._command_pending);controller.snapshot.update(state='ready',error='',last_operation='read_range',last_result=dict(self.native_excel_payload(),action='read_range'));dialog.poll()
+            self.assertIsNotNone(dialog._last_failure);self.assertIn(details,dialog.error_report());self.assertFalse(any(call[0] in ('run_macro','run_control_macro') for call in controller.calls))
         def test_excel_session_macro_pdf_and_copy_are_explicit_async_commands(self):
             from unittest import mock
             dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();controller=instances[0];dialog.macro_name.setText('Module1.Report');dialog.run_button.click();self.wait(lambda:not dialog._command_pending)
