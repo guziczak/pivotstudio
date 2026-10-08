@@ -4645,6 +4645,123 @@ def excel_worker_error_fields(exc,operation='',macro_name='',diagnostics=None):
     return result
 
 
+def excel_vba_source_view(modules,macro_name='',prompt_text=''):
+    """Bounded static VBA references, never an execution trace or a full VBA parser."""
+    complete=True;remaining=500000;records=[];procedures=[];module_count=0
+    notice='Statyczny kod VBA: wskazane miejsca są kandydatami. Ten widok nie ustala aktualnie wykonywanej linii ani wyniku makra.'
+    def normal(value):return re.sub(r'\s+',' ',value).strip().casefold()
+    def parts(line):
+        result=[];start=0;i=0;quoted=False
+        while i<len(line):
+            char=line[i]
+            if char=='"':
+                if quoted and i+1<len(line) and line[i+1]=='"':i+=2;continue
+                quoted=not quoted
+            elif not quoted and char=="'":break
+            elif not quoted and char==':' and (i+1>=len(line) or line[i+1]!='='):result.append(line[start:i]);start=i+1
+            i+=1
+        result.append(line[start:i]);return result
+    def literals(statement):
+        values=[];masked=[];i=0
+        while i<len(statement):
+            if statement[i]!='"':masked.append(statement[i]);i+=1;continue
+            start=i;i+=1;value=[];closed=False
+            while i<len(statement):
+                if statement[i]=='"':
+                    if i+1<len(statement) and statement[i+1]=='"':value.append('"');i+=2;continue
+                    i+=1;closed=True;break
+                value.append(statement[i]);i+=1
+            if closed:values.append(''.join(value))
+            masked.append(' '*(i-start))
+        return values,''.join(masked)
+    if not isinstance(modules,list):modules=[];complete=False
+    if len(modules)>100:complete=False
+    for module in modules[:100]:
+        if not isinstance(module,dict) or not isinstance(module.get('name'),str) or not isinstance(module.get('code'),str):complete=False;continue
+        if remaining<=0:complete=False;break
+        name=module['name'][:128];code=module['code'][:remaining];remaining-=len(code);module_count+=1
+        if len(module['name'])>128 or len(module['code'])>len(code):complete=False
+        lines=code.splitlines();current=None;pending='';start=1
+        for line_number,line in enumerate(lines,1):
+            if len(records)>=12000:complete=False;break
+            for part in parts(line):
+                if len(records)>=12000:complete=False;break
+                if re.match(r'^\s*Rem(?:\s|$)',part,re.I):break
+                if not part.strip():continue
+                if not pending:start=line_number
+                statement=(pending+' '+part).strip() if pending else part.strip();pending=''
+                if re.search(r'\s_\s*$',statement):pending=re.sub(r'\s_\s*$','',statement);continue
+                values,masked=literals(statement)
+                declaration=re.match(r'^\s*(?:(?:Public|Private|Friend|Static)\s+)*(Sub|Function|Property\s+(?:Get|Let|Set))\s+([^\W\d]\w*)\b',masked,re.I)
+                if declaration:
+                    if current is not None:current['end']=max(current['line'],start-1);complete=False
+                    current={'module':name,'procedure':declaration[2],'kind':normal(declaration[1]),'line':start,'end':len(lines),'lines':lines}
+                    procedures.append(current)
+                records.append({'module':name,'procedure':current,'line':start,'end':line_number,'code':statement,'masked':masked,'literals':values,'lines':lines,'declaration':bool(declaration)})
+                if re.match(r'^\s*End\s+(?:Sub|Function|Property)\s*$',masked,re.I):
+                    if current is not None:current['end']=line_number;current=None
+            if len(records)>=12000:complete=False;break
+        if pending or current is not None:complete=False
+    def snippet(record,kind='',match='',literal=''):
+        proc=record.get('procedure');proc=proc if isinstance(proc,dict) else record
+        line=record['line'];end=record.get('end',line);lines=record['lines']
+        first=max(proc.get('line',1),line-3);last=min(proc.get('end',len(lines)),max(line+3,end),first+11)
+        body='\n'.join(str(n)+': '+lines[n-1] for n in range(first,last+1))[:1800]
+        value={'module':record['module'],'procedure':proc.get('procedure','') if isinstance(proc.get('procedure',''),str) else '',
+            'line':line,'end_line':end,'snippet':body,'snippet_first_line':first,'snippet_last_line':last}
+        if kind:value['kind']=kind
+        if match:value['match']=match;value['literal']=literal[:512]
+        return value
+    requested=str(macro_name or '')[:1024].strip();requested=requested.rsplit('!',1)[-1].strip().strip("'")
+    qualification=requested.rsplit('.',1);procedure_name=qualification[-1].casefold();module_name=qualification[0].casefold() if len(qualification)==2 else ''
+    found=[proc for proc in procedures if proc['procedure'].casefold()==procedure_name and (not module_name or proc['module'].casefold()==module_name)] if procedure_name else []
+    found_ids={id(proc) for proc in found}
+    entry_values=[snippet(proc,kind=proc['kind']) for proc in found[:4]]
+    if len(found)>4:complete=False
+    prompt=str(prompt_text or '')[:8192];normalized_prompt=normal(prompt);matches=[];signals=[]
+    for record in records:
+        masked=record['masked'];kinds=[]
+        if record['declaration']:masked=''
+        if re.search(r'\b(?:MsgBox|InputBox)\b',masked,re.I):kinds.append('message')
+        if re.search(r'\bExit\s+(?:Sub|Function|Property)\b|\bEnd\s*$',masked,re.I):kinds.append('exit')
+        if re.search(r'\bOn\s+Error\b|\bResume(?:\s+Next)?\b|\bErr\s*\.\s*Raise\b',masked,re.I):kinds.append('error_handler')
+        if re.search(r'\b(?:ExportAsFixedFormat|SaveAs|SaveAs2|SaveCopyAs|PrintOut)\b',masked,re.I):kinds.append('export')
+        for kind in kinds:
+            signals.append((0 if id(record['procedure']) in found_ids else 1,record['line'],snippet(record,kind=kind)));signals.sort(key=lambda value:(value[0],value[1]))
+            if len(signals)>24:signals.pop();complete=False
+        if not normalized_prompt:continue
+        candidates=[]
+        for literal in record['literals']:
+            normalized=normal(literal)
+            if literal==prompt:candidates.append((0,'literal_exact',literal))
+            elif normalized and normalized==normalized_prompt:candidates.append((1,'literal_normalized',literal))
+            elif len(normalized)>=12 and normalized in normalized_prompt:candidates.append((2,'literal_fragment',literal))
+        # Adjacent literal pieces separated only by VBA concatenation and known
+        # whitespace constants can identify a fixed message without evaluating VBA.
+        for chain in re.finditer(r'"(?:[^"]|"")*"(?:\s*&\s*(?:"(?:[^"]|"")*"|vbCrLf|vbCr|vbLf|vbNewLine|vbTab))+',record['code'],re.I):
+            values=[]
+            for token in re.finditer(r'"((?:[^"]|"")*)"|\b(vbCrLf|vbCr|vbLf|vbNewLine|vbTab)\b',chain[0],re.I):
+                values.append(token[1].replace('""','"') if token[1] is not None else {'vbcrlf':'\r\n','vbcr':'\r','vblf':'\n','vbnewline':'\r\n','vbtab':'\t'}[token[2].casefold()])
+            literal=''.join(values)
+            if literal==prompt:candidates.append((0,'literal_exact',literal))
+            elif normal(literal)==normalized_prompt:candidates.append((1,'literal_normalized',literal))
+        if candidates:
+            rank,kind,literal=min(candidates,key=lambda value:value[0]);matches.append((rank,0 if 'message' in kinds else 1,record['module'].casefold(),record['line'],snippet(record,match=kind,literal=literal)))
+            matches.sort(key=lambda value:value[:-1])
+            if len(matches)>12:matches.pop();complete=False
+    signals.sort(key=lambda value:(value[0],value[1]));matches.sort(key=lambda value:value[:-1])
+    if len(signals)>24 or len(matches)>12:complete=False
+    result={'kind':'static_vba_source','status':'available' if records else 'empty','notice':notice,'complete':complete,'module_count':module_count,
+        'entry':entry_values[0] if len(found)==1 else None,'entries':entry_values,'entry_ambiguous':len(found)>1,'matches':[item[-1] for item in matches[:12]],'signals':[item[-1] for item in signals[:24]]}
+    # Keep IPC/UI output bounded even for Unicode-heavy source text.
+    while len(dumps(result).encode('utf-8'))>65536:
+        collection=next((result[key] for key in ('signals','matches','entries') if result[key]),None)
+        if collection is None:break
+        collection.pop();result['complete']=False
+    if not result['complete']:result['status']='partial'
+    return result
+
+
 class _ExcelPdfObserver:
     """Bounded observations in the session directory, never proof of VBA success."""
     MAX_ENTRIES=2048;MAX_PDFS=128;MAX_RESULTS=64;MAX_RESULT_BYTES=512*1024;MAX_SIZE=128*1024*1024;TIME_LIMIT=.25
@@ -4732,6 +4849,7 @@ class _ExcelPdfObserver:
 
 class ExcelSessionWorker:
     """One bound workbook in an owned Excel process; all COM stays on its STA."""
+    VBA_MAX_MODULES=100;VBA_MAX_CHARACTERS=500000;VBA_MAX_LINES=20000;VBA_MAX_SECONDS=3.;VBA_MAX_JSON=3*1024*1024
     def __init__(self,pythoncom,output,excel=None,session_id=''):
         self.pythoncom=pythoncom;self.output=output;self.excel=excel;self.book=None
         self.session_id=session_id;self.workbook_id=session_id+'-book';self.sheet_refs={};self.control_refs={}
@@ -5037,7 +5155,63 @@ class ExcelSessionWorker:
         if initial_error:self.send('error',id=request.get('id'),operation='open',result=result,applied=self.applied,layout_applied=self.layout_applied,layout_touched=self.layout_touched,retry_safe=False,**initial_error)
         else:self.send('ready',id=request.get('id'),result=result)
         return result
-    def invoke_macro(self,macro,extra):
+    def inspect_vba(self,macro=''):
+        """Read a bounded static source snapshot; never unlock or edit a project."""
+        self.bound_book();result={'status':'available','modules':[],'reason':'','characters':0,'modules_complete':True,'workbook_id':self.workbook_id,'macro_name':macro,'working_copy':self.working_copy,'inspected_at':utcnow()}
+        remaining=self.VBA_MAX_CHARACTERS;line_budget=self.VBA_MAX_LINES;deadline=time.monotonic()+self.VBA_MAX_SECONDS;current=None
+        def incomplete(reason):
+            result['modules_complete']=False;result['status']='partial'
+            if not result['reason']:result['reason']=reason
+        def failed(exc):
+            details=excel_worker_error_text(exc).encode('utf-8','replace').decode('utf-8');result['details']=details[:2000];result['modules_complete']=False
+            denied=isinstance(exc,PermissionError) or bool(re.search(r'0x80070005|0x800A17B4|programmatic access.{0,200}not trusted|(?:programowy|programistyczny) dost.p.{0,200}(?:nie jest zaufany|niezaufany|zablokowan)|access.{0,30}denied|odmowa dost.pu',details,re.IGNORECASE))
+            result['status']='partial' if result['modules'] else ('denied' if denied else 'unavailable')
+            result['reason']=('Excel odmówił odczytu projektu VBA. Dostęp do jego kodu jest osobnym uprawnieniem od uruchamiania makr.' if denied else 'Nie udało się odczytać całego kodu VBA w tej kopii skoroszytu.')
+        try:
+            project=self.book.VBProject
+            if project is None:raise UserError('Skoroszyt nie udostępnia projektu VBA.')
+            protection=int(project.Protection)
+            if protection==1:
+                result.update(status='locked',modules_complete=False,reason='Projekt VBA jest zablokowany. Pivot nie odblokowuje go ani nie zmienia zabezpieczeń.')
+            elif protection!=0:raise UserError('Nieznany stan ochrony projektu VBA.')
+            else:
+                components=project.VBComponents;count=int(components.Count)
+                if count<0:raise UserError('Nieprawidłowa liczba modułów VBA.')
+                if count>self.VBA_MAX_MODULES:incomplete('Osiągnięto limit liczby modułów; pokazano część źródła VBA.')
+                for component in itertools.islice(components,self.VBA_MAX_MODULES):
+                    current=None
+                    if remaining<=0 or line_budget<=0 or time.monotonic()>=deadline:incomplete('Osiągnięto limit odczytu; pokazano część źródła VBA.');break
+                    name=str(component.Name)
+                    if not name or len(name)>128:raise UserError('Nieprawidłowa nazwa modułu VBA.')
+                    name.encode('utf-8')
+                    module=component.CodeModule;lines=int(module.CountOfLines)
+                    if lines<0:raise UserError('Nieprawidłowa liczba linii VBA.')
+                    item={'name':name,'code':'','complete':True};current=item;result['modules'].append(item);start=1
+                    while start<=lines:
+                        if remaining<=0 or line_budget<=0 or time.monotonic()>=deadline:item['complete']=False;incomplete('Osiągnięto limit odczytu; pokazano część źródła VBA.');break
+                        take=min(256,lines-start+1,line_budget);chunk=module.get('Lines',start,take)
+                        if not isinstance(chunk,str):raise UserError('Excel nie zwrócił tekstu modułu VBA.')
+                        try:chunk.encode('utf-8')
+                        except UnicodeEncodeError:chunk=chunk.encode('utf-8','replace').decode('utf-8');item['complete']=False;incomplete('Źródło VBA zawiera znaki, których nie można wiernie wyświetlić.')
+                        if item['code'] and not item['code'].endswith(('\r','\n')):chunk='\r\n'+chunk
+                        if len(chunk)>remaining:chunk=chunk[:remaining];item['complete']=False;incomplete('Osiągnięto limit długości źródła VBA.')
+                        item['code']+=chunk;remaining-=len(chunk);line_budget-=take;start+=take
+                    if not item['complete']:break
+        except Exception as exc:
+            if current is not None:current['complete']=False
+            failed(exc)
+        finally:
+            # A closed/replaced workbook is a binding error, never a source warning.
+            self.bound_book()
+        result['characters']=sum(len(item['code']) for item in result['modules'])
+        while len(dumps(result).encode('utf-8'))>self.VBA_MAX_JSON and result['modules']:
+            incomplete('Osiągnięto limit przesyłanego źródła VBA.');item=result['modules'][-1]
+            if item['code']:item['code']=item['code'][:len(item['code'])//2];item['complete']=False
+            else:result['modules'].pop()
+            result['characters']=sum(len(item['code']) for item in result['modules'])
+        return result
+    def invoke_macro(self,macro,extra,diagnostics=False,identity=None,action='run_macro'):
+        if diagnostics:self.send('vba_source',id=identity,operation=action,report=self.inspect_vba(macro))
         before=None;extra['pdf_outputs']={'files':[],'scope':'','complete':False,'status':'unknown'}
         with contextlib.suppress(Exception):
             if self.pdf_observer is None:self.pdf_observer=_ExcelPdfObserver(self.working_copy)
@@ -5052,13 +5226,16 @@ class ExcelSessionWorker:
         action=command.get('action');identity=command.get('id');self.applied=0;macro='';invocation={};extra={}
         self.send('busy',id=identity,operation=action)
         try:
-            self.excel.AutomationSecurity=2;self.bound_book()
+            if type(command.get('diagnostics',False)) is not bool:raise UserError('Nieprawidłowa opcja diagnostyki VBA.')
+            if action!='inspect_vba':self.excel.AutomationSecurity=2
+            self.bound_book()
             if command.get('workbook_id')!=self.workbook_id:raise UserError('Wrong workbook identity.')
             if self.handoff_incomplete and action in ('run_macro','run_control_macro','apply_edits'):raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
             if action=='run_macro':
                 name=command.get('name','')
                 if not isinstance(name,str) or not re.fullmatch(r'[^\W\d]\w*(?:\.[^\W\d]\w*)?',name):raise UserError('Use a macro name or Module.Macro without workbook qualifiers or arguments.')
-                macro=self.qualified_macro(name);invocation={'method':'Application.Run','caller_emulated':False};self.book.call('Activate');self.invoke_macro(macro,extra);self.revision+=1
+                macro=self.qualified_macro(name);invocation={'method':'Application.Run','caller_emulated':False};self.book.call('Activate');self.invoke_macro(macro,extra,command.get('diagnostics',False),identity,action);self.revision+=1
+            elif action=='inspect_vba':extra['vba_source']=self.inspect_vba()
             elif action=='read_range':extra['snapshot']=self.read_range(command)
             elif action=='list_sheets':pass
             elif action=='apply_edits':self.apply_edits(command.get('edits'))
@@ -5077,7 +5254,7 @@ class ExcelSessionWorker:
                 sheet=self.find_sheet(command);shape=self.find_control(command,sheet);name=self.macro_name(shape.OnAction);availability=self.control_state(shape);macro=self.qualified_macro(name) if name else str(shape.OnAction)
                 invocation={'method':'Application.Run','on_action':str(shape.OnAction),'control_name':str(shape.Name),'control_type':int(shape.Type),'sheet':str(sheet.Name),'caller_emulated':False}
                 if int(shape.Type)==12 or not name or not availability['visible'] or not availability['enabled']:raise UserError('Use the real Excel control. Hidden, disabled or unverified controls are not invoked; Application.Caller and ActiveX events are not emulated.')
-                self.book.call('Activate');sheet.call('Activate');self.invoke_macro(macro,extra);self.revision+=1;extra['caller_emulated']=False
+                self.book.call('Activate');sheet.call('Activate');self.invoke_macro(macro,extra,command.get('diagnostics',False),identity,action);self.revision+=1;extra['caller_emulated']=False
             elif action=='export_pdf':
                 sheet=self.excel.ActiveSheet
                 if sheet is None:raise UserError('No active sheet to export.')
@@ -5087,10 +5264,11 @@ class ExcelSessionWorker:
                 if 'destination' in command or 'temp_path' in command:raise UserError('Zapis sesji nie przyjmuje innej ścieżki docelowej.')
                 extra.update(self.save_session())
             else:raise UserError('Unsupported session action.')
-            self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
+            if action!='inspect_vba':self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
             result=self.session_info();result.update(extra);self.send('done',id=identity,operation=action,result=result)
         except Exception as exc:
-            with contextlib.suppress(Exception):self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
+            if action!='inspect_vba':
+                with contextlib.suppress(Exception):self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
             outcome={'result':{'pdf_outputs':extra['pdf_outputs']}} if 'pdf_outputs' in extra else {}
             self.send('error',id=identity,operation=action,applied=self.applied,retry_safe=False,**outcome,**self.error_fields(exc,action,macro,invocation))
         return True
@@ -5323,9 +5501,9 @@ class ExcelSessionController:
         self.original=Path(os.path.abspath(os.path.expanduser(str(source_path))));self.root=Path(os.path.abspath(os.path.expanduser(str(root))));self.on_event=on_event
         self.session_id=uid();self.lock=threading.RLock();self.write_lock=threading.Lock();self.cancelled=threading.Event();self.finished=threading.Event()
         self.process=None;self.owned_process=None;self.thread=None;self.reaper=None;self.dispatcher=None;self.previous=set();self.pending=None;self.temp_root=None;self.staged=None;self._copy_cancel=None
-        self.resume_path=resume_path;self.session_file_lock=None;self.manifest={};self.resume_info=None
+        self.resume_path=resume_path;self.session_file_lock=None;self.manifest={};self.resume_info=None;self._vba_requested_job=''
         self.state={'session_id':self.session_id,'workbook_id':self.session_id+'-book','state':'new','job_id':'','operation':'','original_path':str(self.original),'source_path':str(self.original),'staged_path':'','working_copy':'','temp_root':'','workspace_path':'','last_saved_path':'','pid':0,'hwnd':0,'owned':False,'alive':False,'active_sheet':'','last_result':{},'last_operation':'','error':'','error_operation':'','events':[],'cancelled':False,'finished':False,'handoff_incomplete':False}
-        self.state.update(error_details='',error_code='',macro_name='',resumed=resume_path is not None,externally_changed=False)
+        self.state.update(error_details='',error_code='',macro_name='',resumed=resume_path is not None,externally_changed=False,vba_source={},vba_source_job='')
     def _event(self,event,**fields):
         with self.lock:
             if isinstance(fields.get('result'),dict) and 'snapshot' in fields['result']:
@@ -5504,6 +5682,13 @@ class ExcelSessionController:
             if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
             pending=self.pending if event=='done' else None
             owned=self.owned_process;operation=self.state.get('operation')
+        if event=='vba_source':
+            if value.get('operation')!=operation or operation not in ('run_macro','run_control_macro') or value.get('id')!=self._vba_requested_job:return
+            self._accept_vba_source(value.get('report'),value.get('id'))
+            return
+        if isinstance(value.get('result'),dict) and 'vba_source' in value['result']:
+            value=clone(value);report=value['result'].pop('vba_source')
+            if event=='done' and operation=='inspect_vba' and value.get('operation')==operation:self._accept_vba_source(report,value.get('id'))
         if event=='done' and operation in ('reveal_control','show_excel') and value.get('operation')==operation:
             result=value.get('result') or {};value['result']=result
             try:result['foreground']=excel_session_foreground(owned,result.get('reveal_hwnd'),self.cancelled)
@@ -5538,16 +5723,31 @@ class ExcelSessionController:
                     if result.get('saved_path'):self.state['last_saved_path']=result['saved_path']
                 self.state.update(state='ready',job_id='',operation='')
         self._event(event,operation=value.get('operation','open'),message=value.get('message',''),details=str(value.get('details',''))[:16384],code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],result=value.get('result',{}),applied=value.get('applied',0),retry_safe=False)
+    def _accept_vba_source(self,report,jid):
+        # Source belongs only to the current in-memory view, never the event log.
+        if not isinstance(report,dict) or report.get('status') not in ('available','partial','denied','locked','unavailable'):return
+        modules=report.get('modules',[])
+        if not isinstance(modules,list) or len(modules)>100:return
+        if any(not isinstance(m,dict) or not isinstance(m.get('name'),str) or len(m['name'])>200 or not isinstance(m.get('code'),str) for m in modules):return
+        if sum(len(m['code']) for m in modules)>500000:return
+        clean={key:report[key] for key in ('status','workbook_id','macro_name','characters','modules_complete') if key in report}
+        clean.update(modules=[{'name':m['name'],'code':m['code']} for m in modules],reason=str(report.get('reason',''))[:1800],details=str(report.get('details',''))[:2000],captured_at=str(report.get('inspected_at') or utcnow())[:80])
+        with self.lock:
+            if self.cancelled.is_set() or not jid or jid!=self.state['job_id'] or report.get('workbook_id')!=self.state['workbook_id']:return
+            self.state.update(vba_source=clean,vba_source_job=jid)
     def submit(self,action,args=None):
         args=args or {}
         if not isinstance(args,dict):raise UserError('Nieprawidłowe parametry sesji Excel.')
         with self.lock:
             if self.state['state']!='ready' or self.cancelled.is_set() or not self.owned_process or not self.owned_process.alive():raise UserError('Poczekaj na gotową, własną sesję Excel.')
-            if action not in ('run_macro','export_pdf','save_copy','save_working','save_session','read_range','list_sheets','apply_edits','activate_sheet','reveal_control','run_control_macro','show_excel'):raise UserError('Nieobsługiwana akcja sesji Excel.')
+            if action not in ('run_macro','export_pdf','save_copy','save_working','save_session','read_range','list_sheets','apply_edits','activate_sheet','reveal_control','run_control_macro','show_excel','inspect_vba'):raise UserError('Nieobsługiwana akcja sesji Excel.')
             if self.state.get('handoff_incomplete') and action in ('run_macro','run_control_macro','apply_edits'):raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
             workbook_id=self.state['workbook_id']
             if args.get('workbook_id',workbook_id)!=workbook_id:raise UserError('Polecenie dotyczy innego skoroszytu.')
             jid=uid();command={'action':action,'id':jid,'workbook_id':workbook_id}
+            if action in ('run_macro','run_control_macro') and 'diagnostics' in args:
+                if type(args['diagnostics']) is not bool:raise UserError('Nieprawidłowa opcja diagnostyki VBA.')
+                command['diagnostics']=args['diagnostics']
             if action=='run_macro':
                 name=args.get('name','')
                 if not isinstance(name,str) or not re.fullmatch(r'[^\W\d]\w*(?:\.[^\W\d]\w*)?',name) or len(name)>200:raise UserError('Podaj nazwę makra lub Moduł.Makro, bez argumentów i nazwy skoroszytu.')
@@ -5569,6 +5769,8 @@ class ExcelSessionController:
                     if type(value) is not int or not 1<=value<=maximum:raise UserError('Nieprawidłowy zakres podglądu Excel.')
                     command[key]=value
                 if command['top']+command['rows']-1>1048576 or command['left']+command['cols']-1>16384:raise UserError('Podgląd wychodzi poza arkusz Excel.')
+            if action in ('run_macro','run_control_macro','inspect_vba'):self.state.update(vba_source={},vba_source_job='')
+            self._vba_requested_job=jid if command.get('diagnostics') is True else ''
             self.state.update(state='busy',job_id=jid,operation=action,error='',error_operation='',error_details='',error_code='',macro_name='')
             self.dispatcher=threading.Thread(target=self._dispatch,args=(command,),name='pivot-excel-request',daemon=False);self.dispatcher.start()
         self._event('submitted',operation=action,id=jid);return jid
@@ -5642,7 +5844,7 @@ class ExcelSessionController:
         if self._copy_cancel is not None:self._copy_cancel.value=True
         with self.lock:
             if self.finished.is_set():return
-            self.state.update(state='closing',cancelled=bool(force),job_id='')
+            self.state.update(state='closing',cancelled=bool(force),job_id='',vba_source={},vba_source_job='');self._vba_requested_job=''
             if self.reaper:return
             self.reaper=threading.Thread(target=self._reap,args=(force,),name='pivot-excel-close',daemon=False);self.reaper.start()
     def _reap(self,force):
@@ -11205,6 +11407,7 @@ def native_ui_types():
             self._scan_pending=False;self._action_pending=False;self._command_pending=False;self._sent_prompts={};self._retry_prompts=set();self._last_prompts=[];self._last_scan=0.;self._native_digest=None;self._event_seq=0;self._last_result_key=None
             self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
             self._last_failure=None;self._last_failure_key=None;self._show_pending=False
+            self._vba_report={};self._vba_job='';self._vba_ignored_job='';self._vba_prompt='';self._vba_macro='';self._diag_active=False;self._diag_terminal_key=None;self._diag_macro_job=''
             self._macro_pdf_outputs=None;self._pdf_destination='';self._pdf_destination_confirmed=False;self._pdf_publish_pending=False;self._pdf_publish_cancel=threading.Event();self._pdf_attempt_destination=''
             self._session_preferences=excel_session_preferences(window.service.root);self._resume_path='';self._resume_source_path='';self._resume_info={};self._resume_check_pending=False
             self._office_context=None;self._native_book_id='';self._native_controls=[];self._native_loading=False;self._last_view_refresh=0.;self._initial_control_pending=False;self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._companion_paths=[]
@@ -11295,11 +11498,22 @@ def native_ui_types():
             self.history=QW.QPlainTextEdit();self.history.setReadOnly(True);self.history.setMaximumBlockCount(100);self.history.setMaximumHeight(110);self.history.hide();self.history_toggle.toggled.connect(self.history.setVisible);options.addWidget(self.history)
             self.stop_button=button('Przerwij sesję',self.stop_session);options.addWidget(self.stop_button,0,Qt.AlignmentFlag.AlignLeft);options.addStretch()
             self.options_scroll=QW.QScrollArea();self.options_scroll.setWidgetResizable(True);self.options_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.options_scroll.setWidget(self.options_frame);self.body_tabs.addTab(self.options_scroll,'Plik i opcje');self.body_tabs.setCurrentIndex(2)
+            self.vba_frame=QW.QWidget();vba_layout=QW.QVBoxLayout(self.vba_frame)
+            self.diagnostics_enabled=QW.QCheckBox('Odczytaj kod VBA przed uruchomieniem makra');vba_layout.addWidget(self.diagnostics_enabled)
+            vba_layout.addWidget(label('Kod jest odczytywany lokalnie, bez zmiany skoroszytu. Podgląd pokazuje źródło i możliwe miejsca związane z pytaniem, nie aktualnie wykonywaną linię. Dostęp zależy od ustawień Office i blokady projektu.',True,True))
+            self.inspect_vba_button=button('Odczytaj kod VBA',self.read_vba_source);vba_layout.addWidget(self.inspect_vba_button)
+            self.vba_status=label('Włącz odczyt przed kolejnym uruchomieniem lub odczytaj kod gotowej sesji.',True,True);self.vba_status.setTextFormat(Qt.TextFormat.PlainText);vba_layout.addWidget(self.vba_status)
+            self.vba_locations=QW.QComboBox();self.vba_locations.setMinimumContentsLength(1);self.vba_locations.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);self.vba_locations.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed);vba_layout.addWidget(self.vba_locations)
+            self.vba_code=QW.QPlainTextEdit();self.vba_code.setReadOnly(True);self.vba_code.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.NoWrap);self.vba_code.setFont(QG.QFontDatabase.systemFont(QG.QFontDatabase.SystemFont.FixedFont));self.vba_code.setAccessibleName('Odczytany kod VBA — podgląd statyczny');self.vba_code.setMinimumHeight(160);vba_layout.addWidget(self.vba_code,1)
+            vba_layout.addWidget(label('Zaobserwowane zdarzenia — bez śledzenia instrukcji VBA',True))
+            self.vba_events=QW.QPlainTextEdit();self.vba_events.setReadOnly(True);self.vba_events.setMaximumBlockCount(100);self.vba_events.setMaximumHeight(140);vba_layout.addWidget(self.vba_events)
+            self.vba_scroll=QW.QScrollArea();self.vba_scroll.setWidgetResizable(True);self.vba_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.vba_scroll.setWidget(self.vba_frame);self.body_tabs.addTab(self.vba_scroll,'Diagnostyka VBA')
+            self.vba_locations.currentIndexChanged.connect(self.show_vba_location)
             self.notice_button=ExcelStatusLine();self.notice_button.clicked.connect(self.show_message);outer.addWidget(self.notice_button)
             self.footer=QW.QWidget();self.footer_layout=QW.QGridLayout(self.footer);self.footer_layout.setContentsMargins(0,0,0,0)
             self.open_button=button('Uruchom sesję Excela',self.start_session,True);self.close_button=button('Zamknij',self.close);outer.addWidget(self.footer);self._footer_compact=None
             # Only the footer and short status rows constrain the window. Each page can scroll.
-            for area in (self.native_scroll,self.prompt_scroll,self.options_scroll):area.setMinimumSize(0,0);area.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Ignored)
+            for area in (self.native_scroll,self.prompt_scroll,self.options_scroll,self.vba_scroll):area.setMinimumSize(0,0);area.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Ignored)
             for combo in (self.native_sheets,self.native_controls):combo.setMinimumContentsLength(1);combo.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);combo.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed)
             for control in self.findChildren(QW.QPushButton):control.setAutoDefault(False)
             self.file.edit.textChanged.connect(self.update_controls);self.macro_name.textChanged.connect(self.update_controls);self.body_tabs.currentChanged.connect(self.update_controls);self.macro_pdf_files.currentIndexChanged.connect(self.update_controls)
@@ -11309,6 +11523,38 @@ def native_ui_types():
             self.state_note.setText('Wybierz skoroszyt i otwórz własną sesję Excela.' if self._availability.get('available') else self._availability.get('reason','Excel nie jest dostępny.'))
             if not self._availability.get('available'):self.message.setText(self.state_note.text())
             self.render_prompts([]);self.update_controls();self.resize(900,700);self.fit_to_screen();self._timer.start()
+        def reset_vba_diagnostics(self,active=False):
+            self._diag_active=active;self._diag_terminal_key=None;self._diag_macro_job='';self._vba_ignored_job=self._snapshot.get('vba_source_job','');self._vba_job='';self._vba_report={};self._vba_prompt='';self._vba_macro=''
+            self.vba_locations.clear();self.vba_code.clear();self.vba_events.clear();self.vba_status.setText('Czekam na odczyt kodu VBA.' if active else 'Włącz odczyt przed kolejnym uruchomieniem lub odczytaj kod gotowej sesji.')
+        def diagnostic_event(self,text):
+            if self._diag_active:self.vba_events.appendPlainText(time.strftime('%H:%M:%S')+'  '+str(text)[:2000])
+        def read_vba_source(self):
+            if self.submit('inspect_vba',{}):self.body_tabs.setCurrentWidget(self.vba_scroll)
+        def update_vba_source(self,snapshot):
+            report=snapshot.get('vba_source');job=snapshot.get('vba_source_job')
+            if not self._diag_active or not job or job in (self._vba_job,self._vba_ignored_job) or not isinstance(report,dict) or report.get('workbook_id')!=snapshot.get('workbook_id'):return
+            self._vba_job=job;self._vba_report=clone(report);self.render_vba_source()
+            self.diagnostic_event('Odczyt kodu: '+str(report.get('status','unavailable'))+'. '+str(report.get('reason','')))
+        def render_vba_source(self):
+            report=self._vba_report;self.vba_locations.clear();self.vba_code.clear()
+            if not report:return
+            modules=report.get('modules',[]);view=excel_vba_source_view(modules,report.get('macro_name') or self._vba_macro,self._vba_prompt)
+            states={'available':'Odczytano kod VBA.','partial':'Odczytano część kodu VBA.','denied':'Excel odmówił dostępu do kodu VBA.','locked':'Projekt VBA jest zablokowany.','unavailable':'Kod VBA nie jest dostępny.'}
+            note=states.get(report.get('status'),'Nie odczytano kodu VBA.')+' '+str(report.get('reason',''))
+            if report.get('captured_at'):note+='\nOdczyt: '+str(report['captured_at'])
+            note+='\n'+view['notice']
+            if not view.get('complete'):note+='\nAnaliza lub lista wyników została ograniczona; pełny odczyt modułu jest dostępny na liście.'
+            if self._vba_prompt and not view['matches']:note+='\nNie znaleziono dosłownego tekstu pytania w przeanalizowanej części kodu. Może powstawać z kilku wartości lub pochodzić z innego projektu.'
+            if view.get('entry_ambiguous'):note+='\nNazwa procedury pasuje do kilku miejsc; nie ustalono jednoznacznego wejścia.'
+            self.vba_status.setText(note)
+            for item in view['matches']:self.vba_locations.addItem('Możliwe źródło pytania: '+item['module']+'.'+item['procedure']+' · wiersz '+str(item['line']),item['snippet'])
+            for item in view['entries']:self.vba_locations.addItem('Procedura: '+item['module']+'.'+item['procedure']+' · wiersz '+str(item['line']),item['snippet'])
+            kinds={'message':'Komunikat','exit':'Wyjście z procedury','error_handler':'Obsługa błędu','export':'Zapis dokumentu'}
+            for item in view['signals']:self.vba_locations.addItem(kinds.get(item['kind'],item['kind'])+': '+item['module']+'.'+item['procedure']+' · wiersz '+str(item['line']),item['snippet'])
+            for module in modules:self.vba_locations.addItem('Cały odczytany moduł: '+module['name'],module['code'])
+            if report.get('details'):self.vba_locations.addItem('Szczegóły odczytu VBA',str(report['details']))
+            self.show_vba_location()
+        def show_vba_location(self,*_):self.vba_code.setPlainText(str(self.vba_locations.currentData() or ''))
         def available_work_area(self):
             handle=self.windowHandle();parent=self.parentWidget()
             screen=handle.screen() if self.isVisible() and handle else parent.screen() if parent else self.screen()
@@ -11529,6 +11775,7 @@ def native_ui_types():
             self.macro_name.setEnabled(usable);self.run_button.setEnabled(bool(usable and self.macro_name.text().strip() and not blocked));self.pdf_button.setEnabled(usable);self.save_copy_button.setEnabled(usable)
             self.save_working_button.setEnabled(usable)
             self.save_session_button.setEnabled(usable)
+            self.inspect_vba_button.setEnabled(bool(usable and not self._last_prompts));self.diagnostics_enabled.setEnabled(not self._closing and not self._command_pending and state not in ('busy','starting','closing'))
             pdf_idle=not self._closing and not self._pdf_publish_pending and not self._last_prompts and not self._command_pending and state not in ('busy','starting','closing')
             self.pdf_target_button.setEnabled(pdf_idle);self.macro_pdf_save.setEnabled(bool(pdf_idle and self.macro_pdf_files.currentData()));self.macro_pdf_locate.setEnabled(pdf_idle);self.pdf_locate_button.setEnabled(pdf_idle)
             self.macro_pdf_frame.setVisible(bool(self._macro_pdf_outputs or self._pdf_publish_pending or self.macro_pdf_location.text()) and not self._last_prompts)
@@ -11557,6 +11804,7 @@ def native_ui_types():
             self._epoch+=1;self._event_seq=0;self._last_result_key=None;self._last_scan=0;self._native_digest=None;self._scan_pending=False;self._action_pending=False;self._show_pending=False;self._sent_prompts={};self._retry_prompts=set();self.history.clear();self.message.clear();self.clear_failure();self.render_prompts([])
             self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
             self.reset_macro_pdf_results();self._pdf_attempt_destination=''
+            self.reset_vba_diagnostics()
             try:
                 self._native_book_id='';self.body_tabs.setTabVisible(0,False);self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._native_loading=True
                 self.native_model.set_snapshot({});self.native_sheets.clear();self.native_controls.clear();self._native_controls=[];self._native_loading=False
@@ -11575,8 +11823,14 @@ def native_ui_types():
                 if background or self._queued is not None or not self.background_read_active():return False
                 self._queued=(action,clone(args));self.message.setText('Kończę odczyt arkusza w Excelu, potem wykonam polecenie.');self.update_controls();return True
             controller=self._controller;epoch=self._epoch;service=self._host_window.service;previous_result_key=self._last_result_key;self._command_pending=True;self._auto_read=bool(background);self._last_result_key=None
+            args=dict(args)
             if action in ('run_macro','run_control_macro'):
                 self.reset_macro_pdf_results();self._pdf_attempt_destination=self._pdf_destination if self._pdf_destination_confirmed else '';self._pdf_destination_confirmed=False
+                self.reset_vba_diagnostics(self.diagnostics_enabled.isChecked())
+                if self._diag_active:args['diagnostics']=True
+                control=self.native_controls.currentData() or {};self._vba_macro=str(args.get('name') or control.get('on_action') or control.get('macro_name') or '')
+            elif action=='inspect_vba':
+                self.reset_vba_diagnostics(True);control=self.native_controls.currentData() or {};self._vba_macro=self.macro_name.text().strip() or str(control.get('on_action') or control.get('macro_name') or '')
             if not background:self._quiet_read_error=False;self.message.clear()
             self.update_controls()
             def work():
@@ -11586,6 +11840,8 @@ def native_ui_types():
                 return controller.submit(action,payload)
             def done(job_id):
                 if self._disposed or epoch!=self._epoch:return
+                if action in ('run_macro','run_control_macro'):
+                    self._diag_macro_job=job_id;self.diagnostic_event('Zlecono uruchomienie makra. Samo zlecenie nie potwierdza wykonania jego instrukcji.')
                 self._command_pending=False;self.poll()
             def failed(error):
                 if self._disposed or epoch!=self._epoch:return
@@ -11735,6 +11991,7 @@ def native_ui_types():
             names={'starting':'Otwieranie kopii w Excelu…','ready':'Sesja Excela gotowa.','busy':'Excel wykonuje zadanie…','closing':'Zamykanie własnej sesji Excela…','closed':'Sesja Excela zakończona.','error':'Nie udało się wykonać operacji Excela.'}
             status='Excel gotowy · odświeżam podgląd arkusza…' if self.background_read_active() else names.get(state,str(state or ''))
             self.state_note.setText(status+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
+            self.update_vba_source(snapshot)
             result=snapshot.get('last_result')
             if result and snapshot.get('error') and not self._command_pending and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);self.apply_native_result(result,allow_reveal=False)
@@ -11742,7 +11999,7 @@ def native_ui_types():
             if result and state=='ready' and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);destination=result.get('destination') if isinstance(result,dict) else None
                 operation=(result.get('action') or snapshot.get('last_operation') or snapshot.get('operation') or '') if isinstance(result,dict) else ''
-                if operation and operation not in ('open','read_range','activate_sheet','show_excel','reveal_control') and not completed_background and not snapshot.get('handoff_incomplete'):self.clear_failure()
+                if operation and operation not in ('open','read_range','activate_sheet','show_excel','reveal_control','inspect_vba') and not completed_background and not snapshot.get('handoff_incomplete'):self.clear_failure()
                 if operation in ('save_session','save_working','save_copy') and isinstance(result,dict) and (result.get('saved_path') or destination):self.saved_copy_path=str(result.get('saved_path') or destination);self.saved_copy_revision=str(result.get('saved_revision',''))
                 if operation not in ('read_range','open'):
                     done={'show_excel':'Otwarto okno tej sesji Excela.','reveal_control':'Przycisk jest wskazany w Excelu. Kliknij „Uruchom” tutaj albo ten przycisk w Excelu.','run_control_macro':'Makro zakończyło działanie.','run_macro':'Makro zakończyło działanie.','apply_edits':'Zapisano zmianę komórki w Excelu.'}
@@ -11750,6 +12007,7 @@ def native_ui_types():
                     if operation in ('run_macro','run_control_macro'):
                         outputs=result.get('pdf_outputs') or {};found=outputs.get('files') or []
                         text='Makro zakończyło działanie. '+('Znaleziono nowe lub zmienione pliki PDF: '+str(len(found))+'.' if found else 'Utworzenie PDF nie zostało potwierdzone.')
+                        self.diagnostic_event('Wywołanie makra wróciło do Pivota. '+('Znalezione nowe lub zmienione PDF: '+str(len(found))+'.' if found else 'Brak potwierdzonego PDF w folderze sesji. Nie ustalono, w którym miejscu makro zakończyło pracę.'))
                     if operation=='save_session':text='Zapisano kopię sesji do wznowienia: '+str(result.get('session_saved_path') or snapshot.get('working_copy') or '')
                     if operation=='save_session' and snapshot.get('handoff_incomplete'):text='Zapisano niepełną kopię do sprawdzenia: '+str(result.get('session_saved_path') or snapshot.get('working_copy') or '')+'. Wznowienie zachowa blokadę makr i edycji.'
                     if operation=='reveal_control' and result.get('foreground') is False:text+=' Jeśli okno Excela nie wyszło na wierzch, wybierz je na pasku zadań.'
@@ -11759,10 +12017,13 @@ def native_ui_types():
                     if not isinstance(result.get('pdf_outputs'),dict):self.apply_macro_pdf_outputs({'files':[],'status':'unknown','complete':False})
                     outputs=self._macro_pdf_outputs or {};found=outputs.get('files') or [];target=self._pdf_attempt_destination;self._pdf_attempt_destination=''
                     if target and len(found)==1 and outputs.get('complete') is True:self.publish_macro_pdf(found[0],outputs['scope'],target)
-                    self.body_tabs.setCurrentIndex(1)
+                    if self.body_tabs.currentWidget() is not self.vba_scroll or not self._diag_active:self.body_tabs.setCurrentIndex(1)
                 if self._close_after_save and operation in ('save_session','save_working','save_copy'):self._close_after_save=False;self.begin_close()
             elif not self._native_book_id and state=='ready' and snapshot.get('snapshot'):self.apply_native_result(snapshot)
             if snapshot.get('error'):
+                diagnostic_key=(snapshot.get('error_operation'),snapshot.get('error'),snapshot.get('error_details'))
+                if self._diag_macro_job and not self._command_pending and diagnostic_key!=self._diag_terminal_key and snapshot.get('error_operation') in ('run_macro','run_control_macro'):
+                    self._diag_terminal_key=diagnostic_key;self.diagnostic_event('Błąd wywołania makra: '+str(snapshot['error']))
                 # After the (previous) result is shown, so its default sheet note cannot hide this.
                 if self._quiet_read_error:self.native_note.setText('Nie odświeżono podglądu: '+str(snapshot['error']))
                 else:
@@ -11811,6 +12072,9 @@ def native_ui_types():
         def render_prompts(self,items):
             key=digest([(item.get('hwnd'),item.get('fingerprint')) for item in items]) if items else None
             new_prompt=bool(key and key!=self._prompt_tab_key)
+            if new_prompt and self._diag_active:
+                self._vba_prompt='\n'.join(str(item.get('text','')) for item in items)[:8000]
+                self.diagnostic_event('Excel wyświetlił pytanie: '+self._vba_prompt);self.render_vba_source()
             if new_prompt:self.body_tabs.setCurrentIndex(1)
             elif not key and self._prompt_tab_key and self._native_book_id and not self._last_failure and self.body_tabs.currentIndex()==1:self.body_tabs.setCurrentIndex(0)
             self._prompt_tab_key=key
@@ -11841,7 +12105,9 @@ def native_ui_types():
             pid,hwnd=identity[-2:];caption=str(native.get('text','')).replace('&','')
             def done(result):
                 if self._disposed or identity!=self.session_identity():return
+                self.diagnostic_event('Wysłano odpowiedź „'+caption+'” na pytanie: '+str(snapshot.get('text',''))+'. Nie potwierdza to wykonania konkretnej gałęzi VBA.')
                 self._action_pending=False;self._sent_prompts[snapshot['hwnd']]=(snapshot.get('fingerprint'),time.monotonic());self._retry_prompts.discard((snapshot['hwnd'],snapshot.get('fingerprint')));self._native_digest=None;self._last_scan=0;self.message.setText('Wysłano wybór „'+caption+'”. Czekam na odpowiedź Excela.');self.poll()
+                if self._diag_active and all(item.get('hwnd')==snapshot.get('hwnd') and item.get('fingerprint')==snapshot.get('fingerprint') for item in self._last_prompts):self.body_tabs.setCurrentWidget(self.vba_scroll)
             def failed(error):
                 if self._disposed or identity!=self.session_identity():return
                 self._action_pending=False;self._native_digest=None;self._last_scan=0;self.message.setText(str(error));self.poll()
@@ -11880,6 +12146,7 @@ def native_ui_types():
         def dispose(self):
             if self._disposed:return
             self._disposed=True;self._pdf_publish_cancel.set();self._epoch+=1;self._timer.stop();self._tasks.close()
+            self.reset_vba_diagnostics()
             if self._controller and self._snapshot.get('state')!='closed':self._controller.cancel()
             if self.saved_copy_path and not self._native_saved_emitted:self._native_saved_emitted=True;self.nativeCopyReady.emit(self.saved_copy_path)
 
@@ -19768,6 +20035,88 @@ def excel_handoff_test_suite():
     return unittest.defaultTestLoader.loadTestsFromTestCase(ExcelHandoffTests)
 
 
+def excel_vba_source_test_suite():
+    import unittest
+    class VbaSourceTests(unittest.TestCase):
+        def modules(self):
+            return [{'name':'ThisWorkbook','code':'''Option Explicit
+Public Sub GenerateDocument()
+    On Error GoTo Failed
+    Dim answer As VbMsgBoxResult
+    answer = MsgBox("Czy przerwac sprawdzanie?", vbYesNo)
+    If answer = vbYes Then
+        Exit Sub
+    End If
+    Worksheets("Raport").ExportAsFixedFormat Type:=xlTypePDF
+    Exit Sub
+Failed:
+    Err.Raise Err.Number, Err.Source, Err.Description
+End Sub
+'''}]
+        def test_qualified_entry_and_static_message_reference_are_separate_from_execution(self):
+            result=excel_vba_source_view(self.modules(),"'Book.xlsm'!ThisWorkbook.GenerateDocument",'Czy przerwac sprawdzanie?')
+            self.assertEqual(result['status'],'available');self.assertTrue(result['complete']);self.assertEqual(result['entry']['module'],'ThisWorkbook');self.assertEqual(result['entry']['procedure'],'GenerateDocument')
+            self.assertEqual(result['entry']['line'],2);self.assertEqual(result['entry']['end_line'],13);self.assertFalse(result['entry_ambiguous'])
+            match=result['matches'][0];self.assertEqual(match['match'],'literal_exact');self.assertEqual(match['line'],5);self.assertIn('MsgBox',match['snippet'])
+            self.assertEqual({item['kind'] for item in result['signals']},{'message','exit','error_handler','export'});self.assertIn('Statyczny',result['notice']);self.assertIn('nie ustala',result['notice']);self.assertNotIn('execution_line',result)
+        def test_comments_and_string_contents_never_become_code_or_procedures(self):
+            code='''\' Public Sub Fake()
+Rem MsgBox "Czy przerwac sprawdzanie?"
+Public Sub Real()
+    x = "MsgBox Exit Sub ExportAsFixedFormat On Error"
+    x = 1: Rem MsgBox "Czy przerwac sprawdzanie?"
+    x = 2 ' MsgBox "Czy przerwac sprawdzanie?"
+End Sub'''
+            result=excel_vba_source_view([{'name':'Module1','code':code}],'Module1.Fake','Czy przerwac sprawdzanie?')
+            self.assertIsNone(result['entry']);self.assertEqual(result['matches'],[]);self.assertEqual(result['signals'],[])
+        def test_normalized_literal_and_escaped_quotes_remain_literal_evidence(self):
+            code='Sub A()\nMsgBox "Czy   przerwac ""test""?"\nEnd Sub'
+            result=excel_vba_source_view([{'name':'M','code':code}],'A','czy przerwac "test"?')
+            self.assertEqual(result['matches'][0]['match'],'literal_normalized');self.assertEqual(result['matches'][0]['literal'],'Czy   przerwac "test"?')
+        def test_continuation_and_known_whitespace_concatenation_match_fixed_message(self):
+            code='''Public Sub A()
+    MsgBox "Nieprawidlowy numer." & vbCrLf & _
+        "Czy przerwac sprawdzanie?"
+End Sub'''
+            result=excel_vba_source_view([{'name':'M','code':code}],'M.A','Nieprawidlowy numer.\nCzy przerwac sprawdzanie?')
+            self.assertEqual(len(result['matches']),1);self.assertEqual(result['matches'][0]['match'],'literal_normalized');self.assertEqual(result['matches'][0]['line'],2);self.assertEqual(result['matches'][0]['end_line'],3)
+        def test_dynamic_expression_is_only_a_literal_fragment_candidate(self):
+            code='Sub A()\nMsgBox "Nieprawidlowy numer projektu: " & projectNumber & ". Czy przerwac?"\nEnd Sub'
+            result=excel_vba_source_view([{'name':'M','code':code}],'A','Nieprawidlowy numer projektu: P999. Czy przerwac?')
+            self.assertEqual(result['matches'][0]['match'],'literal_fragment');self.assertNotIn('P999',result['matches'][0]['snippet'])
+            self.assertEqual(excel_vba_source_view([{'name':'M','code':'Sub A()\nMsgBox "Nie"\nEnd Sub'}],'A','Nieprawidlowy numer projektu')['matches'],[])
+        def test_unqualified_duplicate_entry_is_ambiguous_without_guessing(self):
+            modules=[{'name':'M1','code':'Sub GenerateDocument()\nEnd Sub'},{'name':'M2','code':'Private Sub GenerateDocument()\nEnd Sub'}]
+            result=excel_vba_source_view(modules,'GenerateDocument');self.assertIsNone(result['entry']);self.assertTrue(result['entry_ambiguous']);self.assertEqual(len(result['entries']),2)
+            self.assertEqual(excel_vba_source_view(modules,'m2.generatedocument')['entry']['module'],'M2')
+        def test_colon_statements_and_literal_assignment_keep_real_line_numbers(self):
+            code='Public Function A() As String\nDim text As String: text = "Czy przerwac sprawdzanie?": MsgBox text: Exit Function\nEnd Function'
+            result=excel_vba_source_view([{'name':'M','code':code}],'A','Czy przerwac sprawdzanie?')
+            self.assertEqual(result['matches'][0]['line'],2);self.assertEqual(result['matches'][0]['procedure'],'A');self.assertEqual({item['kind'] for item in result['signals']},{'message','exit'})
+        def test_named_arguments_and_colons_in_strings_are_not_statement_boundaries(self):
+            code='Sub A()\nMsgBox Prompt:="Czy przerwac: tak czy nie?", Buttons:=vbYesNo\nEnd Sub'
+            result=excel_vba_source_view([{'name':'M','code':code}],'A','Czy przerwac: tak czy nie?')
+            self.assertEqual(result['matches'][0]['match'],'literal_exact');self.assertEqual(result['matches'][0]['line'],2);self.assertEqual(result['signals'][0]['kind'],'message')
+        def test_procedure_named_like_builtin_is_not_classified_as_its_invocation(self):
+            result=excel_vba_source_view([{'name':'M','code':'Public Sub ExportAsFixedFormat()\nEnd Sub'}],'M.ExportAsFixedFormat')
+            self.assertIsNotNone(result['entry']);self.assertEqual(result['signals'],[])
+        def test_loop_exit_is_not_reported_as_procedure_exit(self):
+            code='Sub A()\nFor i = 1 To 10\nExit For\nNext i\nDo\nExit Do\nLoop\nExit Sub\nEnd Sub'
+            result=excel_vba_source_view([{'name':'M','code':code}],'A');exits=[item for item in result['signals'] if item['kind']=='exit']
+            self.assertEqual(len(exits),1);self.assertEqual(exits[0]['line'],8)
+        def test_empty_invalid_and_truncated_inputs_are_explicit(self):
+            self.assertEqual(excel_vba_source_view([])['status'],'empty');self.assertEqual(excel_vba_source_view(None)['status'],'partial')
+            self.assertFalse(excel_vba_source_view([{'name':'M','code':'Sub A()\nMsgBox "unfinished"'}])['complete'])
+            self.assertFalse(excel_vba_source_view([{'name':'M','code':12}])['complete'])
+            result=excel_vba_source_view([{'name':str(n),'code':'Sub A()\nEnd Sub'} for n in range(101)],'A')
+            self.assertEqual(result['module_count'],100);self.assertFalse(result['complete']);self.assertLessEqual(len(result['entries']),4)
+        def test_large_unicode_source_has_bounded_report_and_candidates(self):
+            code='Sub A()\n'+'\n'.join('MsgBox "'+('\u0141'*1200)+'"' for _ in range(300))+'\nEnd Sub'
+            result=excel_vba_source_view([{'name':'M','code':code}],'A','\u0141'*1200)
+            self.assertLessEqual(len(dumps(result).encode('utf-8')),65536);self.assertLessEqual(len(result['matches']),12);self.assertLessEqual(len(result['signals']),24);self.assertFalse(result['complete'])
+    return unittest.defaultTestLoader.loadTestsFromTestCase(VbaSourceTests)
+
+
 def excel_macro_pdf_test_suite():
     import unittest
     from unittest.mock import patch
@@ -20257,6 +20606,106 @@ send('closed')
         def test_same_session_save_accepts_canonicalized_windows_path_case(self):
             controller=self.start();result=controller._record_session_save({'session_saved':True,'session_saved_path':str(controller.staged).swapcase()})
             self.assertEqual(result['saved_path'],str(controller.staged));self.assertEqual(result['saved_revision'],file_digest(controller.staged))
+        def vba_report(self,controller,**values):
+            return dict({'status':'available','workbook_id':controller.poll()['workbook_id'],'macro_name':"'copy.xlsm'!ThisWorkbook.GenerateDocument",
+                'modules':[{'name':'ThisWorkbook','code':'Sub GenerateDocument()\nConst token = "fixture-private-vba-secret"\nEnd Sub'}],'reason':'','modules_complete':True},**values)
+        def finish_vba_command(self,controller,jid,action,result=None):
+            controller._consume({'session_id':controller.session_id,'event':'done','id':jid,'operation':action,'result':result or {'workbook_id':controller.poll()['workbook_id'],'active_sheet':'Raport'}})
+        def test_vba_diagnostics_are_explicit_bool_only_on_single_macro_command(self):
+            controller=self.start()
+            with patch.object(controller,'_send') as send:
+                for action,args in (('run_macro',{'name':'GenerateDocument'}),('run_control_macro',{'sheet_id':'native-sheet','control_id':'native-control'})):
+                    for invalid in (1,0,None,'true',[],{}):
+                        with self.subTest(action=action,invalid=invalid),self.assertRaises(UserError):controller.submit(action,dict(args,diagnostics=invalid))
+                    self.assertEqual(controller.poll()['state'],'ready')
+                    for option in ('absent',False,True):
+                        payload=dict(args)
+                        if option!='absent':payload['diagnostics']=option
+                        send.reset_mock();jid=controller.submit(action,payload);controller.dispatcher.join(2);send.assert_called_once();command=send.call_args.args[0]
+                        self.assertEqual(command['action'],action)
+                        if option=='absent':self.assertNotIn('diagnostics',command)
+                        else:self.assertIs(command['diagnostics'],option)
+                        self.finish_vba_command(controller,jid,action)
+        def test_vba_intermediate_source_does_not_finish_duplicate_or_log_macro(self):
+            controller=self.start();callbacks=[];controller.on_event=callbacks.append
+            with patch.object(controller,'_send') as send:
+                jid=controller.submit('run_macro',{'name':'GenerateDocument','diagnostics':True});controller.dispatcher.join(2);report=self.vba_report(controller)
+                event={'session_id':controller.session_id,'event':'vba_source','id':jid,'operation':'run_macro','report':report}
+                controller._consume(event);controller._consume(event);state=controller.poll()
+                self.assertEqual(state['state'],'busy');self.assertEqual(state['job_id'],jid);self.assertEqual(state['operation'],'run_macro');self.assertEqual(state['vba_source_job'],jid)
+                self.assertEqual(state['vba_source']['modules'],report['modules']);self.assertEqual(state['vba_source']['macro_name'],report['macro_name']);self.assertEqual(send.call_count,1)
+                self.assertNotIn('fixture-private-vba-secret',dumps(state['events']));self.assertNotIn('fixture-private-vba-secret',dumps(callbacks))
+                self.finish_vba_command(controller,jid,'run_macro');state=controller.poll();self.assertEqual(state['state'],'ready');self.assertEqual(send.call_count,1)
+                self.assertNotIn('vba_source',state['last_result']);self.assertEqual(state['vba_source']['modules'],report['modules'])
+                self.assertNotIn('fixture-private-vba-secret',dumps(state['events']));self.assertNotIn('fixture-private-vba-secret',dumps(callbacks))
+                self.assertNotIn('fixture-private-vba-secret',(controller.temp_root/'session.json').read_text('utf-8'))
+        def test_vba_source_requires_current_session_job_workbook_and_operation(self):
+            controller=self.start()
+            with patch.object(controller,'_send'):
+                jid=controller.submit('run_macro',{'name':'GenerateDocument','diagnostics':True});controller.dispatcher.join(2)
+                event={'session_id':controller.session_id,'event':'vba_source','id':jid,'operation':'run_macro','report':self.vba_report(controller)}
+                for changed in ({'session_id':'other-session'},{'id':'old-job'},{'operation':'read_range'},{'report':self.vba_report(controller,workbook_id='foreign-book')}):
+                    with self.subTest(changed=tuple(changed)):
+                        controller._consume(dict(event,**changed));self.assertFalse(controller.poll()['vba_source']);self.assertEqual(controller.poll()['job_id'],jid)
+                controller.cancelled.set();controller._consume(event);self.assertFalse(controller.poll()['vba_source']);controller.cancelled.clear()
+                controller._consume(event);source=clone(controller.poll()['vba_source']);self.finish_vba_command(controller,jid,'run_macro')
+                event['report']=self.vba_report(controller,modules=[{'name':'Old','code':'late obsolete source'}]);controller._consume(event);self.assertEqual(controller.poll()['vba_source'],source)
+        def test_vba_standalone_done_keeps_source_out_of_done_result_and_callbacks(self):
+            controller=self.start();callbacks=[];controller.on_event=callbacks.append
+            with patch.object(controller,'_send') as send:
+                jid=controller.submit('inspect_vba');controller.dispatcher.join(2);send.assert_called_once();self.assertEqual(send.call_args.args[0]['action'],'inspect_vba');self.assertNotIn('diagnostics',send.call_args.args[0])
+                report=self.vba_report(controller);payload={'workbook_id':controller.poll()['workbook_id'],'active_sheet':'Raport','vba_source':report}
+                self.finish_vba_command(controller,jid,'inspect_vba',payload);state=controller.poll()
+                self.assertEqual(state['state'],'ready');self.assertEqual(state['last_operation'],'inspect_vba');self.assertEqual(state['vba_source_job'],jid);self.assertEqual(state['vba_source']['modules'],report['modules'])
+                self.assertNotIn('vba_source',state['last_result']);self.assertNotIn('fixture-private-vba-secret',dumps(state['events']));self.assertNotIn('fixture-private-vba-secret',dumps(callbacks));self.assertIn('vba_source',payload)
+        def test_vba_denied_report_does_not_finish_or_repeat_macro_and_preserves_its_error(self):
+            controller=self.start()
+            with patch.object(controller,'_send') as send:
+                jid=controller.submit('run_macro',{'name':'GenerateDocument','diagnostics':True});controller.dispatcher.join(2)
+                controller._consume({'session_id':controller.session_id,'event':'vba_source','id':jid,'operation':'run_macro','report':self.vba_report(controller,status='denied',modules=[],reason='Programmatic access denied')})
+                self.assertEqual(controller.poll()['state'],'busy');self.assertFalse(controller.poll()['error']);self.assertEqual(send.call_count,1)
+                controller._consume({'session_id':controller.session_id,'event':'error','id':jid,'operation':'run_macro','message':'Actual macro failure','code':'operation_failed'})
+                state=controller.poll();self.assertEqual(state['state'],'ready');self.assertEqual(state['error'],'Actual macro failure');self.assertEqual(state['vba_source']['status'],'denied');self.assertEqual(send.call_count,1)
+        def test_vba_report_rejects_malformed_or_unbounded_source_without_changing_job(self):
+            controller=self.start()
+            with patch.object(controller,'_send'):
+                jid=controller.submit('inspect_vba');controller.dispatcher.join(2)
+                reports=[self.vba_report(controller,status='unknown'),self.vba_report(controller,modules={}),self.vba_report(controller,modules=[{'name':'M','code':123}]),
+                    self.vba_report(controller,modules=[{'name':'M'*201,'code':'source'}]),self.vba_report(controller,modules=[{'name':'M','code':''} for _ in range(101)]),
+                    self.vba_report(controller,modules=[{'name':'M','code':'x'*500001}])]
+                for report in reports:
+                    controller._accept_vba_source(report,jid);self.assertFalse(controller.poll()['vba_source']);self.assertEqual(controller.poll()['job_id'],jid)
+                self.finish_vba_command(controller,jid,'inspect_vba')
+        def test_vba_source_survives_sheet_read_but_is_cleared_before_new_macro(self):
+            controller=self.start()
+            with patch.object(controller,'_send'):
+                jid=controller.submit('inspect_vba');controller.dispatcher.join(2);self.finish_vba_command(controller,jid,'inspect_vba',{'vba_source':self.vba_report(controller)})
+                captured=clone(controller.poll()['vba_source']);read=controller.submit('read_range');controller.dispatcher.join(2);self.finish_vba_command(controller,read,'read_range')
+                self.assertEqual(controller.poll()['vba_source'],captured);self.assertEqual(controller.poll()['vba_source_job'],jid)
+                following=controller.submit('run_macro',{'name':'Other'});controller.dispatcher.join(2);self.assertFalse(controller.poll()['vba_source']);self.assertEqual(controller.poll()['vba_source_job'],'')
+                controller._consume({'session_id':controller.session_id,'event':'vba_source','id':jid,'operation':'run_macro','report':self.vba_report(controller)})
+                self.assertFalse(controller.poll()['vba_source']);self.finish_vba_command(controller,following,'run_macro')
+        def test_vba_source_embedded_in_other_result_is_never_retained_or_logged(self):
+            controller=self.start();callbacks=[];controller.on_event=callbacks.append
+            with patch.object(controller,'_send'):
+                jid=controller.submit('read_range');controller.dispatcher.join(2);self.finish_vba_command(controller,jid,'read_range',{'vba_source':self.vba_report(controller)})
+                state=controller.poll();self.assertFalse(state['vba_source']);self.assertNotIn('vba_source',state['last_result']);self.assertNotIn('fixture-private-vba-secret',dumps(state['events']));self.assertNotIn('fixture-private-vba-secret',dumps(callbacks))
+        def test_vba_unsolicited_intermediate_source_requires_explicit_current_job_optin(self):
+            controller=self.start();callbacks=[];controller.on_event=callbacks.append
+            with patch.object(controller,'_send'):
+                for args in ({'name':'GenerateDocument'},{'name':'GenerateDocument','diagnostics':False}):
+                    jid=controller.submit('run_macro',args);controller.dispatcher.join(2)
+                    controller._consume({'session_id':controller.session_id,'event':'vba_source','id':jid,'operation':'run_macro','report':self.vba_report(controller)})
+                    self.assertFalse(controller.poll()['vba_source']);self.assertEqual(controller.poll()['vba_source_job'],'');self.assertEqual(controller.poll()['job_id'],jid)
+                    self.finish_vba_command(controller,jid,'run_macro')
+                self.assertNotIn('fixture-private-vba-secret',dumps(controller.poll()['events']));self.assertNotIn('fixture-private-vba-secret',dumps(callbacks))
+        def test_vba_cancel_clears_snapshot_and_late_report_cannot_restore_it(self):
+            controller=self.start()
+            with patch.object(controller,'_send'):
+                jid=controller.submit('run_macro',{'name':'GenerateDocument','diagnostics':True});controller.dispatcher.join(2)
+                event={'session_id':controller.session_id,'event':'vba_source','id':jid,'operation':'run_macro','report':self.vba_report(controller)}
+                controller._consume(event);self.assertTrue(controller.poll()['vba_source'])
+            controller.cancel();controller._consume(event);state=controller.poll();self.assertFalse(state['vba_source']);self.assertEqual(state['vba_source_job'],'');self.assertTrue(controller.finished.wait(4))
     class FakeCom:
         def __init__(self,handlers=None,**values):
             self.handlers=handlers or {};self.calls=[];self.__dict__.update(values)
@@ -20431,6 +20880,84 @@ send('closed')
             result=self.worker.error_fields(RuntimeError('macro unavailable'),'run_macro','M.Print')
             self.assertEqual(result['code'],'protected_view');self.assertIn('Widoku chronionego',result['message']);self.assertIn('nie wykrywa projektu VBA',result['message'])
             self.assertFalse(hasattr(self.excel,'AutomationSecurity'))
+        def fake_vba(self,sources):
+            components=[];reads=[]
+            for name,code in sources:
+                lines=code.split('\r\n') if code else []
+                def read(start,count,lines=lines,name=name):reads.append((name,start,count));return '\r\n'.join(lines[start-1:start-1+count])
+                module=FakeCom({'Lines':read},CountOfLines=len(lines));components.append(FakeCom(Name=name,CodeModule=module))
+            self.book.VBProject=FakeCom(Protection=0,VBComponents=FakeCollection(components));return reads
+        def test_inspect_vba_reads_only_bound_static_code_in_small_property_chunks(self):
+            code='\r\n'.join("' wiersz "+str(i) for i in range(600));reads=self.fake_vba([('ThisWorkbook',code),('Empty','')])
+            event=self.session_command('inspect_vba');report=event['result']['vba_source']
+            self.assertEqual(event['event'],'done');self.assertEqual(report['status'],'available');self.assertTrue(report['modules_complete']);self.assertEqual(report['characters'],len(code))
+            self.assertEqual(report['modules'],[{'name':'ThisWorkbook','code':code,'complete':True},{'name':'Empty','code':'','complete':True}])
+            self.assertEqual(reads,[('ThisWorkbook',1,256),('ThisWorkbook',257,256),('ThisWorkbook',513,88)])
+            self.assertEqual(report['workbook_id'],'fixture-book');self.assertTrue(report['inspected_at']);self.assertFalse(self.book.calls);self.assertFalse(self.excel.calls)
+            for name in ('AutomationSecurity','EnableEvents','DisplayAlerts','Visible'):self.assertFalse(hasattr(self.excel,name))
+            self.assertEqual(self.worker.revision,0)
+        def test_inspect_vba_locked_or_denied_is_a_report_without_changing_policy(self):
+            self.book.VBProject=FakeCom(Protection=1)
+            event=self.session_command('inspect_vba');report=event['result']['vba_source']
+            self.assertEqual(event['event'],'done');self.assertEqual(report['status'],'locked');self.assertFalse(report['modules'])
+            def deny(_):raise PermissionError('Programmatic access to Visual Basic Project is not trusted')
+            with patch.object(FakeCom,'VBProject',property(deny),create=True):event=self.session_command('inspect_vba')
+            self.assertEqual(event['event'],'done');self.assertEqual(event['result']['vba_source']['status'],'denied');self.assertFalse(event['result']['vba_source']['modules'])
+            for name in ('AutomationSecurity','EnableEvents','DisplayAlerts','Visible'):self.assertFalse(hasattr(self.excel,name))
+        def test_inspect_vba_generic_1004_does_not_claim_trust_denial(self):
+            def fail(_):raise RuntimeError('0x800A03EC Application-defined or object-defined error')
+            with patch.object(FakeCom,'VBProject',property(fail),create=True):event=self.session_command('inspect_vba')
+            report=event['result']['vba_source'];self.assertEqual(report['status'],'unavailable');self.assertIn('800A03EC',report['details'])
+        def test_inspect_vba_respects_module_character_line_time_and_message_limits(self):
+            for setting,limit in (('VBA_MAX_MODULES',1),('VBA_MAX_CHARACTERS',10),('VBA_MAX_LINES',1),('VBA_MAX_SECONDS',0),('VBA_MAX_JSON',1024)):
+                with self.subTest(setting=setting):
+                    self.fake_vba([('ThisWorkbook','\r\n'.join("' źródło" for _ in range(300))),('Module1','Sub X()\r\nEnd Sub')])
+                    with patch.object(self.worker,setting,limit):report=self.worker.inspect_vba()
+                    self.assertEqual(report['status'],'partial');self.assertFalse(report['modules_complete']);self.assertTrue(report['reason'])
+                    if setting=='VBA_MAX_MODULES':self.assertEqual(len(report['modules']),1)
+                    if setting=='VBA_MAX_CHARACTERS':self.assertLessEqual(report['characters'],limit)
+                    if setting=='VBA_MAX_LINES':self.assertEqual(report['modules'][0]['code'],"' źródło")
+                    if setting=='VBA_MAX_JSON':self.assertLessEqual(len(dumps(report).encode('utf-8')),limit)
+        def test_inspect_vba_partial_read_preserves_source_already_read(self):
+            self.fake_vba([('Module1','Sub First()\r\nEnd Sub'),('Module2','Sub Next()\r\nEnd Sub')])
+            def fail(*_):raise RuntimeError('component unavailable')
+            self.book.VBProject.VBComponents.values[1].CodeModule.handlers['Lines']=fail;report=self.worker.inspect_vba()
+            self.assertEqual(report['status'],'partial');self.assertIn('Sub First()',report['modules'][0]['code']);self.assertFalse(report['modules'][-1]['complete']);self.assertIn('component unavailable',report['details'])
+        def test_inspect_vba_binding_errors_are_not_hidden_in_optional_source_status(self):
+            self.fake_vba([('ThisWorkbook','Sub Print()\r\nEnd Sub')])
+            def closed(*_):self.excel.Workbooks.values=[];return 'Sub Print()\r\nEnd Sub'
+            self.book.VBProject.VBComponents.values[0].CodeModule.handlers['Lines']=closed;event=self.session_command('inspect_vba')
+            self.assertEqual(event['event'],'error');self.assertIn('bound workbook has been closed',event['message']);self.assertNotIn('result',event)
+            for name in ('AutomationSecurity','EnableEvents','DisplayAlerts'):self.assertFalse(hasattr(self.excel,name))
+        def test_macro_diagnostics_emit_source_before_single_run_and_denial_does_not_block_run(self):
+            self.worker.open_workbook(self.open_request());self.fake_vba([('ThisWorkbook','Sub Generate()\r\nEnd Sub')]);calls=[]
+            def run(macro):
+                calls.append(macro);event=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(event['event'],'vba_source');self.assertEqual(event['report']['macro_name'],macro);self.assertEqual(event['report']['workbook_id'],'fixture-book')
+            self.excel.handlers['Run']=run;event=self.session_command('run_macro',name='ThisWorkbook.Generate',diagnostics=True)
+            self.assertEqual(event['event'],'done');self.assertEqual(len(calls),1)
+            def deny(_):raise PermissionError('Programmatic access is not trusted')
+            with patch.object(FakeCom,'VBProject',property(deny),create=True):event=self.session_command('run_macro',name='ThisWorkbook.Generate',diagnostics=True)
+            self.assertEqual(event['event'],'done');self.assertEqual(len(calls),2)
+            reports=[json.loads(line)['report'] for line in self.output.getvalue().splitlines() if json.loads(line)['event']=='vba_source'];self.assertEqual([report['status'] for report in reports],['available','denied'])
+        def test_macro_without_diagnostics_does_not_access_vba_project(self):
+            self.worker.open_workbook(self.open_request());self.excel.handlers['Run']=lambda *_:None
+            def forbidden(_):raise AssertionError('VBA source was not requested')
+            with patch.object(FakeCom,'VBProject',property(forbidden),create=True):event=self.session_command('run_macro',name='Generate')
+            self.assertEqual(event['event'],'done');self.assertNotIn('vba_source',[json.loads(line)['event'] for line in self.output.getvalue().splitlines()])
+            event=self.session_command('run_macro',name='Generate',diagnostics='yes');self.assertEqual(event['event'],'error');self.assertEqual([name for name,_ in self.excel.calls].count('Run'),1)
+        def test_macro_diagnostics_stop_on_lost_workbook_binding_without_run(self):
+            self.worker.open_workbook(self.open_request());self.fake_vba([('ThisWorkbook','Sub Generate()\r\nEnd Sub')]);self.excel.handlers['Run']=lambda *_:None
+            def closed(*_):self.excel.Workbooks.values=[];return 'Sub Generate()\r\nEnd Sub'
+            self.book.VBProject.VBComponents.values[0].CodeModule.handlers['Lines']=closed;event=self.session_command('run_macro',name='Generate',diagnostics=True)
+            self.assertEqual(event['event'],'error');self.assertFalse(any(name=='Run' for name,_ in self.excel.calls));self.assertNotIn('vba_source',[json.loads(line)['event'] for line in self.output.getvalue().splitlines()])
+        def test_control_macro_source_event_uses_exact_assignment_and_precedes_run(self):
+            self.worker.open_workbook(self.open_request());self.fake_vba([('ThisWorkbook','Sub GenerateDocument()\r\nEnd Sub')])
+            shape=FakeCom(ID=29,Name='Button1',Type=8,OnAction='ThisWorkbook.GenerateDocument',Visible=-1,ControlFormat=FakeCom(Enabled=True),Top=0.,Left=0.,Width=60.,Height=20.,TopLeftCell=FakeCom(Row=1,Column=1))
+            self.sheet.Shapes.values=[shape];sid=self.worker.sheet_id(self.sheet);control=self.worker.controls(self.sheet,sid)[0]
+            def run(macro):
+                report=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(report['event'],'vba_source');self.assertEqual(report['operation'],'run_control_macro');self.assertEqual(report['report']['macro_name'],macro);self.assertEqual(report['report']['status'],'available')
+            self.excel.handlers['Run']=run;event=self.session_command('run_control_macro',sheet_id=sid,control_id=control['id'],diagnostics=True)
+            self.assertEqual(event['event'],'done');self.assertEqual([args for name,args in self.excel.calls if name=='Run'],[(self.worker.qualified_macro('ThisWorkbook.GenerateDocument'),)])
         def fake_pdf(self,path,content=b'fixture document'):
             path.write_bytes(b'%PDF-1.7\r\n'+content+b'\r\n%%EOF\r\n');return path
         def test_macro_normal_return_without_pdf_is_only_not_observed(self):
@@ -22815,6 +23342,7 @@ def self_test():
     suite.addTests(database_cell_service_test_suite())
     suite.addTests(database_cell_test_suite())
     suite.addTests(excel_native_dialog_test_suite())
+    suite.addTests(excel_vba_source_test_suite())
     suite.addTests(excel_macro_pdf_test_suite())
     suite.addTests(excel_session_test_suite())
     suite.addTests(excel_handoff_test_suite())
@@ -24368,7 +24896,7 @@ def ui_test():
             dialog,instances,scan,action=self.excel_session_fixture();dialog._timer.stop();available=QC.QRect(-1200,-20,683,364)
             with mock.patch.object(dialog,'available_work_area',return_value=available) as area:
                 dialog.fit_to_screen();QTest.qWait(25);app.processEvents();self.assertTrue(area.called);self.assertTrue(available.contains(dialog.frameGeometry()))
-                self.assertEqual(dialog.body_tabs.count(),3);self.assertIs(dialog.body_tabs.widget(2),dialog.options_scroll);dialog.body_tabs.setCurrentIndex(2);app.processEvents()
+                self.assertEqual(dialog.body_tabs.count(),4);self.assertIs(dialog.body_tabs.widget(2),dialog.options_scroll);self.assertIs(dialog.body_tabs.widget(3),dialog.vba_scroll);dialog.body_tabs.setCurrentIndex(2);app.processEvents()
                 for widget in (dialog.file,dialog.open_events,dialog.companion_button):
                     dialog.options_scroll.ensureWidgetVisible(widget,4,4);app.processEvents()
                     self.assertTrue(dialog.options_scroll.viewport().rect().contains(widget.mapTo(dialog.options_scroll.viewport(),widget.rect().center())))
@@ -24416,6 +24944,65 @@ def ui_test():
         def native_session(self,payload=None):
             dialog,instances,scan,action=self.excel_session_fixture();dialog._timer.stop();dialog.start_session();controller=instances[0]
             controller.snapshot['last_result']=payload or self.native_excel_payload();dialog.poll();app.processEvents();return dialog,controller
+        def vba_source_session(self):
+            payload=self.native_excel_payload();payload['snapshot']['controls'][0]['on_action']='ThisWorkbook.GenerateDocument';dialog,controller=self.native_session(payload)
+            controller.snapshot['workbook_id']='native-book';dialog.poll();self.wait(lambda:not dialog._scan_pending);return dialog,controller
+        def vba_source_report(self,status='available'):
+            return {'status':status,'workbook_id':'native-book','macro_name':'ThisWorkbook.GenerateDocument','captured_at':'2026-10-08T12:00:00Z','modules_complete':True,
+                'reason':'Odczyt tylko do podglądu.' if status=='available' else 'Dostęp niedostępny w bieżących ustawieniach Office.',
+                'modules':[{'name':'ThisWorkbook','code':'Public Sub GenerateDocument()\n    If MsgBox("Czy przerwac <b>sprawdzanie</b>?", vbYesNo) = vbYes Then Exit Sub\n    Worksheets("Raport").ExportAsFixedFormat Type:=xlTypePDF\nEnd Sub'}] if status=='available' else []}
+        def test_office_vba_diagnostics_default_has_no_flag_and_optin_adds_it_only_to_macro(self):
+            dialog,controller=self.vba_source_session();self.assertFalse(dialog.diagnostics_enabled.isChecked());dialog.run_control_macro();self.wait(lambda:not dialog._command_pending)
+            self.assertNotIn('diagnostics',controller.calls[-1][1]);self.assertFalse(dialog._diag_active);self.assertEqual(dialog.vba_events.toPlainText(),'')
+            controller.snapshot.update(state='ready',operation='',last_result={});dialog.poll();dialog.diagnostics_enabled.setChecked(True);dialog.run_control_macro();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual(controller.calls[-1][1]['diagnostics'],True);self.assertTrue(dialog._diag_active);self.assertIn('nie potwierdza',dialog.vba_events.toPlainText())
+            controller.snapshot.update(state='ready',operation='',last_result={});dialog.poll();dialog.refresh_native();self.wait(lambda:not dialog._command_pending);self.assertEqual(controller.calls[-1][0],'read_range');self.assertNotIn('diagnostics',controller.calls[-1][1])
+        def test_office_vba_explicit_inspection_denied_is_readable_and_does_not_run_macro(self):
+            dialog,controller=self.vba_source_session();dialog.inspect_vba_button.click();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual(controller.calls[-1],('inspect_vba',{}));self.assertFalse(any(call[0] in ('run_macro','run_control_macro') for call in controller.calls));self.assertIs(dialog.body_tabs.currentWidget(),dialog.vba_scroll)
+            controller.snapshot.update(state='ready',operation='',last_result={},vba_source_job='read-one',vba_source=self.vba_source_report('denied'));dialog.poll();app.processEvents()
+            self.assertIn('odmówił',dialog.vba_status.text());self.assertEqual(dialog.vba_status.textFormat(),Qt.TextFormat.PlainText);self.assertEqual(dialog.vba_code.toPlainText(),'');self.assertIsNone(dialog._last_failure);self.assertTrue(dialog.native_macro.isEnabled());self.assertTrue(dialog.inspect_vba_button.isEnabled())
+        def test_office_vba_static_source_and_prompt_match_are_plain_text_candidates(self):
+            dialog,controller=self.vba_source_session();dialog.diagnostics_enabled.setChecked(True);dialog.run_control_macro();self.wait(lambda:not dialog._command_pending)
+            report=self.vba_source_report();controller.snapshot.update(vba_source_job='macro-source-one',vba_source=report);dialog.poll()
+            self.assertTrue(dialog.vba_code.isReadOnly());self.assertIn('GenerateDocument',dialog.vba_code.toPlainText());self.assertIn('Statyczny',dialog.vba_status.text());self.assertIn('nie ustala',dialog.vba_status.text())
+            prompt=self.excel_prompt_fixture();prompt['text']='Czy przerwac <b>sprawdzanie</b>?';dialog.render_prompts([prompt]);app.processEvents()
+            self.assertEqual(dialog.body_tabs.currentIndex(),1);self.assertTrue(dialog.vba_locations.itemText(0).startswith('Możliwe źródło pytania:'));self.assertIn('<b>sprawdzanie</b>',dialog.vba_code.toPlainText());self.assertIn('MsgBox',dialog.vba_code.toPlainText());self.assertIn('Excel wyświetlił pytanie',dialog.vba_events.toPlainText())
+            index=next(i for i in range(dialog.vba_locations.count()) if dialog.vba_locations.itemText(i).startswith('Cały odczytany moduł:'));dialog.vba_locations.setCurrentIndex(index);self.assertEqual(dialog.vba_code.toPlainText(),report['modules'][0]['code'])
+        def test_office_vba_new_attempt_and_session_clear_source_and_ignore_old_job(self):
+            dialog,controller=self.vba_source_session();dialog.diagnostics_enabled.setChecked(True);dialog.run_control_macro();self.wait(lambda:not dialog._command_pending)
+            controller.snapshot.update(state='ready',operation='',last_result={},vba_source_job='old-source',vba_source=self.vba_source_report());dialog.poll();old=clone(controller.snapshot);self.assertTrue(dialog.vba_code.toPlainText())
+            dialog.run_control_macro();self.wait(lambda:not dialog._command_pending);self.assertEqual(dialog.vba_code.toPlainText(),'');self.assertEqual(dialog._vba_report,{})
+            dialog.update_vba_source(old);self.assertEqual(dialog.vba_code.toPlainText(),'');self.assertNotIn('Odczyt kodu',dialog.vba_events.toPlainText())
+            foreign=dict(old,vba_source_job='foreign-source',vba_source=dict(self.vba_source_report(),workbook_id='other-book'));dialog.update_vba_source(foreign);self.assertEqual(dialog.vba_code.toPlainText(),'')
+            controller.snapshot.update(state='closed',owned=False,finished=True);dialog.poll();dialog.start_session();self.assertEqual(dialog.vba_code.toPlainText(),'');self.assertEqual(dialog.vba_events.toPlainText(),'');self.assertFalse(dialog._diag_active)
+            dialog.update_vba_source(old);self.assertEqual(dialog.vba_code.toPlainText(),'')
+        def test_office_vba_answer_trace_returns_to_diagnostics_until_new_question(self):
+            dialog,instances,scan,action=self.excel_session_fixture();dialog._timer.stop();dialog.start_session();controller=instances[0];controller.snapshot.update(last_result=self.native_excel_payload(),workbook_id='native-book');dialog.poll();self.wait(lambda:not dialog._scan_pending)
+            dialog.diagnostics_enabled.setChecked(True);dialog.run_control_macro();self.wait(lambda:not dialog._command_pending);prompt=self.excel_prompt_fixture();scan.return_value=[prompt];dialog._last_scan=0;dialog.poll();self.wait(lambda:not dialog._scan_pending)
+            self.excel_button(dialog,'Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending);self.assertIs(dialog.body_tabs.currentWidget(),dialog.vba_scroll);self.assertEqual(action.call_count,1)
+            text=dialog.vba_events.toPlainText();self.assertEqual(text.count('Wysłano odpowiedź „Nie”'),1);self.assertIn('Nie potwierdza to wykonania konkretnej gałęzi VBA',text)
+            controller.snapshot.update(state='ready',operation='',last_operation='run_control_macro',last_result={'action':'run_control_macro','workbook_id':'native-book'});dialog.poll()
+            self.assertIs(dialog.body_tabs.currentWidget(),dialog.vba_scroll);self.assertIn('Wywołanie makra wróciło',dialog.vba_events.toPlainText());self.assertIn('Nie ustalono',dialog.vba_events.toPlainText())
+            next_prompt=dict(prompt,fingerprint='next-question',text='Inne pytanie?');scan.return_value=[next_prompt];dialog._last_scan=0;dialog.poll();self.wait(lambda:not dialog._scan_pending)
+            self.assertEqual(dialog.body_tabs.currentIndex(),1);self.assertIn('Inne pytanie?',dialog.vba_events.toPlainText());self.assertEqual(action.call_count,1)
+        def test_office_vba_late_answer_callback_cannot_append_to_new_session_diagnostics(self):
+            prompt=self.excel_prompt_fixture();dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);dialog._timer.stop();dialog.start_session();self.wait(lambda:not dialog._scan_pending);dialog.reset_vba_diagnostics(True)
+            gate=threading.Event();started=threading.Event();self.addCleanup(gate.set)
+            def blocked(*args):started.set();gate.wait(3);return {'ok':True,'sent':True}
+            action.side_effect=blocked;self.excel_button(dialog,'Nie').click();self.wait(started.is_set)
+            instances[0].snapshot.update(state='closed',owned=False,finished=True);dialog.poll();dialog.start_session();dialog.reset_vba_diagnostics(True);gate.set();self.wait(lambda:not dialog._tasks.pending)
+            self.assertNotIn('Wysłano odpowiedź',dialog.vba_events.toPlainText());self.assertFalse(dialog._sent_prompts);self.assertEqual(len(instances),2)
+        def test_office_vba_stale_error_is_not_logged_while_pending_or_during_inspection(self):
+            from unittest import mock
+            dialog,controller=self.vba_source_session();controller.snapshot.update(error='Stary błąd makra',error_operation='run_control_macro',last_result={});dialog.poll();dialog.diagnostics_enabled.setChecked(True)
+            gate=threading.Event();started=threading.Event();self.addCleanup(gate.set);original_submit=controller.submit
+            def delayed(*args):started.set();gate.wait(3);return original_submit(*args)
+            with mock.patch.object(controller,'submit',side_effect=delayed):
+                dialog.run_control_macro();self.wait(started.is_set);dialog.poll();self.assertTrue(dialog._command_pending);self.assertNotIn('Stary błąd',dialog.vba_events.toPlainText());gate.set();self.wait(lambda:not dialog._command_pending)
+            controller.snapshot.update(state='ready',error='Nowy błąd makra',error_operation='run_control_macro',last_result={});dialog.poll();self.assertIn('Nowy błąd',dialog.vba_events.toPlainText());self.assertNotIn('Stary błąd',dialog.vba_events.toPlainText())
+            dialog.read_vba_source();self.wait(lambda:not dialog._command_pending);controller.snapshot.update(state='ready',error='Stary błąd makra',error_operation='run_control_macro',last_result={});dialog.poll()
+            self.assertNotIn('Błąd wywołania makra',dialog.vba_events.toPlainText());self.assertEqual(dialog._diag_macro_job,'');self.assertEqual(controller.calls[-1][0],'inspect_vba')
         def macro_pdf_session(self):
             payload=self.native_excel_payload();payload['snapshot']['controls'][0]['caption']='Generuj PDF';dialog,controller=self.native_session(payload)
             workspace=self.root/'macro-session';workspace.mkdir();controller.snapshot['workspace_path']=str(workspace);dialog.poll();self.wait(lambda:not dialog._scan_pending)
