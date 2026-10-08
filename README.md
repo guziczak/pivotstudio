@@ -138,6 +138,8 @@ Analiza rozpoczyna się od konkretnego wywołania `MsgBox` i najmniejszego powi�
 
 Kopia źródła i przygotowany plan są niezmienne i powiązane sumą SHA-256. Koordynator rozdziela stan połączenia, wynik wywołania makra i wynik dokumentu. Każda próba uruchomienia otrzymuje własny identyfikator; spóźnione odpowiedzi wcześniejszej próby są odrzucane. Samo odzyskanie połączenia nie uruchamia makra ponownie. Brak odpowiedzi po utracie połączenia oznacza nieznany wynik wykonania.
 
+Kopiowane szczegóły analizy obejmują również przygotowane propozycje: różnicę kodu, zachowane i pomijane wiersze, wpływ na wynik walidacji oraz możliwe i nieustalone wywołania. Pozwala to porównać analizę z późniejszą próbą bez przedstawiania statycznego źródła jako wykonywanego kodu.
+
 Pliki towarzyszące, np. szablon Worda, można wskazać przy otwieraniu sesji. Wybrane pliki są kopiowane obok skoroszytu z zachowaniem nazw; Pivot nie odgaduje wszystkich zależności VBA ani nie zmienia ścieżek zapisanych w makrze. Makro może uruchomić zainstalowanego Worda, ale jego okna i zapisy obsługuje sam Office. Pivot nie przejmuje ani nie zamyka cudzych procesów Worda.
 
 Standardowe okna komunikatów należące do tej sesji pojawiają się w ramce Pivot wraz z rzeczywistymi odpowiedziami. Przy pytaniu „Czy przerwać sprawdzanie?” odpowiedź **Nie** oznacza, że nie prosisz o przerwanie. Nie ma dodatkowego przycisku „Pomiń”. Aktywne pytanie ma pierwszeństwo przed wcześniejszym błędem, którego pełne szczegóły pozostają dostępne. To nie zmienia warunków w kodzie VBA i nie gwarantuje, że skrypt mimo błędu wygeneruje raport. Niestandardowe formularze obsługujesz w widocznym Excelu. Odpowiedź jest przekazywana wyłącznie po kliknięciu, po ponownym sprawdzeniu aktualnego okna i procesu.
