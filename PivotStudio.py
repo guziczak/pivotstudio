@@ -5992,7 +5992,7 @@ class ExcelSessionWorker:
         if self.book is not None:
             for candidate in self.excel.Workbooks:
                 if self.same_com(self.book,candidate):return
-        raise UserError('The bound workbook has been closed. Open a new session; writes were not retried.')
+        raise _ExcelDisconnected('The bound workbook has been closed. Reconnect to this session; writes were not retried.')
     def reconnect_workbook(self):
         """Read only: never attach to another Excel process or reopen a file."""
         if not self.owned_excel or not self.working_copy or not Path(self.working_copy).is_absolute():
@@ -6013,7 +6013,8 @@ class ExcelSessionWorker:
         except _ExcelDisconnected:raise
         except Exception as exc:raise _ExcelDisconnected('Nie udało się odczytać istniejącej sesji. '+excel_worker_error_text(exc)) from exc
         self.book=matches[0];self.sheet_refs.clear();self.control_refs.clear();self.vba_patch_plan=None;self.revision+=1
-        return self.connection_snapshot()
+        try:return self.connection_snapshot()
+        except Exception as exc:raise _ExcelDisconnected('Połączenie nie zostało potwierdzone po odświeżeniu obiektu skoroszytu. '+excel_worker_error_text(exc)) from exc
     def connection_snapshot(self):
         result=self.session_info();result.update(workbook_rebound=True,controls_invalidated=True)
         try:result['snapshot']=self.read_range({})
@@ -13267,6 +13268,16 @@ def native_ui_types():
             if first and not self._last_prompts:self.body_tabs.setCurrentIndex(0)
         def apply_native_result(self,result,allow_reveal=True):
             if not isinstance(result,dict):return
+            if result.get('controls_invalidated'):
+                self._queued=None;self._patch_plan={}
+                if self._patch_preview is not None:
+                    with contextlib.suppress(RuntimeError):self._patch_preview.reject()
+                if not isinstance(result.get('snapshot'),dict):
+                    self._native_loading=True
+                    try:
+                        self.native_controls.clear();self._native_controls=[];self._controls_sheet=None;self.native_model.set_snapshot({});self.native_table.clearSpans()
+                    finally:self._native_loading=False
+                    self.native_note.setText('Połączono ze skoroszytem. Odczytaj arkusz, aby odświeżyć dane i przyciski. '+str(result.get('snapshot_warning',''))[:1000])
             if isinstance(result.get('pdf_outputs'),dict):self.apply_macro_pdf_outputs(result['pdf_outputs'])
             if not allow_reveal:self._initial_control_pending=False
             view=result.get('snapshot');book_id=result.get('workbook_id') or self._native_book_id
@@ -13347,14 +13358,19 @@ def native_ui_types():
             if self._disposed or not self._controller:return
             try:snapshot=self._controller.poll()
             except Exception as exc:self.message.setText(safe_error(exc));self.remember_failure(safe_error(exc),operation='session');self.update_controls();return
-            previous=self.session_identity();self._snapshot=snapshot;identity=self.session_identity();state=snapshot.get('state')
+            previous=self.session_identity();previous_state=self._snapshot.get('state');self._snapshot=snapshot;identity=self.session_identity();state=snapshot.get('state')
+            if state=='disconnected' and previous_state!='disconnected':
+                self._queued=None;self._patch_plan={}
+                if self._patch_preview is not None:
+                    with contextlib.suppress(RuntimeError):self._patch_preview.reject()
+                    self.patch_note.setText('Utrata połączenia unieważniła podgląd zmiany. Po połączeniu przygotuj propozycję ponownie; ostatnie pytanie zostało zachowane.')
             completed_background=self._auto_read;preparation_needed=False
             if snapshot.get('dependency') and self.dependency_card.issue!=snapshot['dependency']:
                 self._availability.update(available=False,dependency=clone(snapshot['dependency']))
                 self.dependency_card.set_issue(snapshot['dependency']);preparation_needed=True
             if self._auto_read and state!='busy' and not self._command_pending:
                 # The automatic read has ended. Its failure is shown under the sheet, not as a command error.
-                self._auto_read=False;self._quiet_read_error=bool(snapshot.get('error')) and snapshot.get('error_operation')=='read_range'
+                self._auto_read=False;self._quiet_read_error=bool(snapshot.get('error')) and snapshot.get('error_operation')=='read_range' and state!='disconnected' and snapshot.get('error_code')!='workbook_reloaded'
             names={'starting':'Otwieranie kopii w Excelu…','ready':'Sesja Excela gotowa.','busy':'Excel wykonuje zadanie…','disconnected':'Utracono połączenie z Excelem.','closing':'Zamykanie własnej sesji Excela…','closed':'Sesja Excela zakończona.','error':'Nie udało się wykonać operacji Excela.'}
             status='Excel gotowy · odświeżam podgląd arkusza…' if self.background_read_active() else names.get(state,str(state or ''))
             self.state_note.setText(status+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
@@ -22133,6 +22149,33 @@ send('closed')
             controller=self.start();self.assertEqual(controller.poll()['last_operation'],'open');controller.submit('run_macro',{'name':'Fail'});state=self.wait(controller,lambda s:s['state']=='ready' and bool(s['error']));self.assertIn('synthetic',state['error']);self.assertEqual(state['error_operation'],'run_macro')
             out=self.root/'report.pdf';out.write_bytes(b'previous');controller.submit('export_pdf',{'destination':str(out)});state=self.wait(controller,lambda s:s['state']=='ready' and s['last_result'].get('destination')==str(out));self.assertTrue(out.read_bytes().startswith(b'%PDF-'));self.assertEqual(state['active_sheet'],'Raport');self.assertEqual(self.original.read_bytes(),self.before)
             self.assertEqual((state['error'],state['error_operation'],state['last_operation']),('','','export_pdf'))
+        def test_com_disconnect_blocks_commands_until_explicit_reconnect_without_replaying_macro(self):
+            controller=self.start()
+            with patch.object(controller,'_send') as send:
+                jid=controller.submit('run_macro',{'name':'GenerateDocument'});controller.dispatcher.join(2)
+                controller._consume({'session_id':controller.session_id,'event':'error','id':jid,'operation':'run_macro','message':'Połączenie utracone','code':'excel_disconnected'})
+                state=controller.poll();self.assertEqual(state['state'],'disconnected');self.assertTrue(state['alive']);self.assertFalse(controller.finished.is_set());self.assertEqual(send.call_count,1)
+                for action,args in (('run_macro',{'name':'GenerateDocument'}),('prepare_vba_patch',{'prompt_text':'Pytanie'}),('save_session',{}),('read_range',{})):
+                    with self.subTest(action=action),self.assertRaises(UserError):controller.submit(action,args)
+                reconnect=controller.submit('reconnect_workbook');controller.dispatcher.join(2);self.assertEqual(send.call_count,2);self.assertEqual(send.call_args.args[0]['action'],'reconnect_workbook')
+                result={'workbook_id':state['workbook_id'],'workbook_rebound':True,'snapshot':{'controls':[]}}
+                controller._consume({'session_id':controller.session_id,'event':'done','id':reconnect,'operation':'reconnect_workbook','result':result})
+                self.assertEqual(controller.poll()['state'],'ready');self.assertEqual(send.call_count,2);self.assertEqual(controller.poll()['last_result'],result)
+        def test_failed_reconnect_remains_disconnected_and_explicit_close_still_finishes(self):
+            controller=self.start();controller.state.update(state='disconnected',vba_patch={'token':'old'},vba_source={'modules':['old']})
+            with patch.object(controller,'_send'):
+                jid=controller.submit('reconnect_workbook');controller.dispatcher.join(2)
+                controller._consume({'session_id':controller.session_id,'event':'error','id':jid,'operation':'reconnect_workbook','message':'Nie znaleziono kopii','code':'operation_failed'})
+                state=controller.poll();self.assertEqual(state['state'],'disconnected');self.assertFalse(state['vba_patch']);self.assertFalse(state['vba_source'])
+                with self.assertRaises(UserError):controller.submit('run_macro',{'name':'GenerateDocument'})
+            controller.close();self.assertTrue(controller.finished.wait(4));self.assertEqual(self.original.read_bytes(),self.before)
+        def test_preflight_rebound_result_is_ready_but_clears_old_private_plans(self):
+            controller=self.start()
+            with patch.object(controller,'_send') as send:
+                jid=controller.submit('run_macro',{'name':'GenerateDocument'});controller.dispatcher.join(2);controller.state.update(vba_patch={'token':'old'},vba_source={'modules':['old']})
+                result={'workbook_rebound':True,'controls_invalidated':True,'snapshot':{'controls':[]}}
+                controller._consume({'session_id':controller.session_id,'event':'error','id':jid,'operation':'run_macro','message':'Odświeżono skoroszyt','code':'workbook_reloaded','result':result})
+                state=controller.poll();self.assertEqual(state['state'],'ready');self.assertEqual(state['error_code'],'workbook_reloaded');self.assertEqual(state['last_result'],result);self.assertFalse(state['vba_patch']);self.assertFalse(state['vba_source']);self.assertEqual(send.call_count,1)
         def test_busy_office_errors_are_explained_and_calls_are_retried_by_a_message_filter(self):
             for raw in ('Exception from HRESULT: 0x800AC472','Wywołanie zostało odrzucone przez wywoływanego. (Wyjątek od HRESULT: 0x80010001 (RPC_E_CALL_REJECTED))','(Exception from HRESULT: 0x8001010A (RPC_E_SERVERCALL_RETRYLATER))'):
                 self.assertIn('Excel jest zajęty',excel_session_error_text(raw))
@@ -22650,6 +22693,67 @@ send('closed')
             self.excel.Workbooks.values=[FakeCom(Name=self.book.Name,Worksheets=FakeCollection([self.sheet]))]
             with self.assertRaises(UserError):self.worker.apply_edits([self.edit()])
             self.assertEqual(self.cells['A1'].writes,[])
+        def lost_com(self,code=0x800401FD):
+            exc=RuntimeError(code-2**32,'Obiekt nie jest połączony z serwerem',None,None);exc.hresult=code-2**32;return exc
+        def disconnected_book(self):
+            exc=self.lost_com()
+            class Disconnected:
+                @property
+                def Name(inner):raise exc
+            return Disconnected()
+        def connection_ready(self):
+            self.worker.open_workbook(self.open_request());self.worker.owned_excel=True;self.book.FullName=str(self.path)
+            self.excel.handlers['Run']=lambda *_:None
+            return {'session_id':'fixture','workbook_id':'fixture-book','id':'connection-test'}
+        def test_disconnect_hresult_is_not_a_macro_validation_or_busy_error(self):
+            for code in (0x800401FD,0x80010108,0x80010007,0x80010012,0x800706BA,0x800706BE):
+                with self.subTest(code=hex(code)):
+                    error=excel_worker_error_fields(self.lost_com(code),'run_control_macro','ThisWorkbook.GenerateDocument',{'protected_view':True})
+                    self.assertEqual(error['code'],'excel_disconnected');self.assertIn('Połącz ponownie',error['message']);self.assertNotIn('Application.Caller',error['message'])
+            self.assertFalse(excel_connection_lost(self.lost_com(0x800A03EC)));self.assertFalse(excel_connection_lost(self.lost_com(0x8001010A)))
+            self.assertTrue(excel_connection_lost(RuntimeError(-2147220995,'localized',None,None)))
+        def test_stale_workbook_preflight_rebinds_exact_copy_but_never_replays_requested_macro(self):
+            command=self.connection_ready();old_sid=self.worker.sheet_id(self.sheet);self.worker.control_refs['old-control']={'shape':object()};self.worker.vba_patch_plan={'token':'old'}
+            self.worker.book=self.disconnected_book();self.excel.EnableEvents=False;self.excel.DisplayAlerts=False
+            with patch.object(self.worker,'read_range',return_value={'sheet_id':'new-sheet','controls':[]}) as read:
+                self.assertTrue(self.worker.handle_command(dict(command,action='run_macro',name='GenerateDocument')))
+            error=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(error['code'],'workbook_reloaded');self.assertIs(self.worker.book,self.book)
+            self.assertTrue(error['result']['controls_invalidated']);self.assertEqual(error['result']['snapshot']['sheet_id'],'new-sheet');self.assertNotIn(old_sid,self.worker.sheet_refs);self.assertFalse(self.worker.control_refs);self.assertIsNone(self.worker.vba_patch_plan)
+            self.assertFalse(self.excel.EnableEvents);self.assertFalse(self.excel.DisplayAlerts);self.assertFalse(any(name in ('Run','Quit') for name,_ in self.excel.calls));self.assertEqual(len(self.open_calls),1)
+            self.worker.handle_command(dict(command,id='next-explicit-command',action='run_macro',name='GenerateDocument'))
+            self.assertEqual(len([name for name,_ in self.excel.calls if name=='Run']),1)
+        def test_disconnect_during_run_keeps_worker_open_and_never_reexecutes_partial_macro(self):
+            command=self.connection_ready();runs=[]
+            def fail(name):runs.append(name);raise self.lost_com()
+            self.excel.handlers['Run']=fail
+            self.assertTrue(self.worker.handle_command(dict(command,action='run_macro',name='GenerateDocument')))
+            error=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(error['code'],'excel_disconnected');self.assertEqual(len(runs),1);self.assertFalse(any(name=='Quit' for name,_ in self.excel.calls))
+            with patch.object(self.worker,'read_range',return_value={'controls':[]}):self.worker.handle_command(dict(command,id='reconnect',action='reconnect_workbook'))
+            result=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(result['event'],'done');self.assertTrue(result['result']['workbook_rebound']);self.assertEqual(len(runs),1);self.assertEqual(len(self.open_calls),1)
+        def test_reconnect_rejects_namesake_foreign_path_ambiguous_copy_and_unowned_excel(self):
+            command=self.connection_ready();self.worker.book=self.disconnected_book();old=self.worker.book
+            foreign=FakeCom(Name=self.book.Name,FullName=str(self.path.parent/'other'/self.path.name),Worksheets=self.book.Worksheets)
+            twin=FakeCom(Name=self.book.Name,FullName=str(self.path),Worksheets=self.book.Worksheets)
+            for owned,books in ((True,[foreign]),(True,[self.book,twin]),(False,[self.book])):
+                with self.subTest(owned=owned,count=len(books)):
+                    self.worker.owned_excel=owned;self.excel.Workbooks.values=books
+                    self.assertTrue(self.worker.handle_command(dict(command,action='reconnect_workbook')))
+                    error=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(error['code'],'excel_disconnected');self.assertIs(self.worker.book,old)
+            self.assertEqual(len(self.open_calls),1);self.assertFalse(any(name in ('Run','Quit') for name,_ in self.excel.calls));self.assertEqual(self.cells['A1'].writes,[])
+        def test_reconnect_partial_snapshot_invalidates_controls_without_guessed_sheet_ids(self):
+            command=self.connection_ready();self.worker.control_refs['old']={'shape':object()}
+            with patch.object(self.worker,'read_range',side_effect=RuntimeError('viewport unavailable')):self.worker.handle_command(dict(command,action='reconnect_workbook'))
+            result=json.loads(self.output.getvalue().splitlines()[-1])['result'];self.assertTrue(result['controls_invalidated']);self.assertNotIn('snapshot',result);self.assertIn('viewport unavailable',result['snapshot_warning']);self.assertFalse(self.worker.control_refs)
+        def test_reconnect_metadata_failure_after_proxy_replacement_stays_disconnected(self):
+            command=self.connection_ready();self.worker.book=self.disconnected_book()
+            with patch.object(self.worker,'session_info',side_effect=RuntimeError('Office busy while listing sheets')):
+                self.worker.handle_command(dict(command,action='run_macro',name='GenerateDocument'))
+            error=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(error['code'],'excel_disconnected');self.assertFalse(any(name=='Run' for name,_ in self.excel.calls));self.assertTrue(self.worker.owned_excel)
+        def test_live_namesake_proxy_replacement_also_requires_fresh_ids_before_macro(self):
+            command=self.connection_ready();old_sid=self.worker.sheet_id(self.sheet)
+            self.worker.book=FakeCom(Name=self.book.Name,FullName=str(self.path),Worksheets=self.book.Worksheets)
+            with patch.object(self.worker,'read_range',return_value={'controls':[]}):self.worker.handle_command(dict(command,action='run_macro',name='GenerateDocument'))
+            error=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(error['code'],'workbook_reloaded');self.assertNotIn(old_sid,self.worker.sheet_refs);self.assertFalse(any(name=='Run' for name,_ in self.excel.calls))
         def test_edit_preflight_checks_every_expected_value_before_writing(self):
             edits=[self.edit(),self.edit('A2','text','=literal','99')]
             with self.assertRaises(UserError):self.worker.apply_edits(edits)
@@ -22804,7 +22908,7 @@ send('closed')
             self.fake_vba([('ThisWorkbook','Sub Print()\r\nEnd Sub')])
             def closed(*_):self.excel.Workbooks.values=[];return 'Sub Print()\r\nEnd Sub'
             self.book.VBProject.VBComponents.values[0].CodeModule.handlers['Lines']=closed;event=self.session_command('inspect_vba')
-            self.assertEqual(event['event'],'error');self.assertIn('bound workbook has been closed',event['message']);self.assertNotIn('result',event)
+            self.assertEqual(event['event'],'error');self.assertEqual(event['code'],'excel_disconnected');self.assertIn('Połącz ponownie',event['message']);self.assertNotIn('result',event)
             for name in ('AutomationSecurity','EnableEvents','DisplayAlerts'):self.assertFalse(hasattr(self.excel,name))
         def test_macro_diagnostics_emit_source_before_single_run_and_denial_does_not_block_run(self):
             self.worker.open_workbook(self.open_request());self.fake_vba([('ThisWorkbook','Sub Generate()\r\nEnd Sub')]);calls=[]
@@ -26798,7 +26902,7 @@ def ui_test():
             prompt=self.excel_prompt_fixture();dialog.render_prompts([prompt]);dialog.resize(900,760);QTest.qWait(60);app.processEvents()
             self.assertLessEqual(dialog.height(),760);self.assertEqual(dialog.body_tabs.currentIndex(),1);answer=self.excel_button(dialog,'Nie');self.assertTrue(dialog.prompt_scroll.viewport().rect().contains(answer.mapTo(dialog.prompt_scroll.viewport(),answer.rect().center())))
             dialog.body_tabs.setCurrentIndex(0);dialog.render_prompts([prompt]);self.assertEqual(dialog.body_tabs.currentIndex(),0)
-            prompt['fingerprint']='new-prompt';dialog.render_prompts([prompt]);self.assertEqual(dialog.body_tabs.currentIndex(),1);dialog.render_prompts([]);self.assertEqual(dialog.body_tabs.currentIndex(),0)
+            prompt['fingerprint']='new-prompt';dialog.render_prompts([prompt]);self.assertEqual(dialog.body_tabs.currentIndex(),1);dialog.render_prompts([]);self.assertEqual(dialog.body_tabs.currentIndex(),1);self.assertEqual(dialog._patch_question['text'],prompt['text'])
         def test_office_screen_matrix_keeps_footer_inside_work_area_with_large_font_and_long_context(self):
             from unittest import mock
             areas=[QC.QRect(0,0,1366,728),QC.QRect(0,0,910,485),QC.QRect(0,0,683,364),QC.QRect(-1530,70,910,485)]
@@ -27004,7 +27108,9 @@ def ui_test():
             self.assertNotEqual(dialog.session_identity(),old_identity);self.assertIsNone(dialog._patch_question);self.assertEqual(dialog._patch_plan,{});self.assertFalse(dialog.patch_button.isEnabled());self.assertEqual(len(instances),2)
             self.assertFalse(any(call[0] in ('prepare_vba_patch','apply_vba_patch','run_macro','run_control_macro') for call in instances[1].calls))
         def test_office_vba_patch_disconnected_session_keeps_action_visible_with_recovery_reason(self):
-            dialog,controller,instances,scan,action,prompt=self.vba_patch_session();controller.snapshot.update(state='disconnected',operation='',last_result={},error='Utracono połączenie z obiektem skoroszytu.',error_code='excel_disconnected',error_operation='run_control_macro');dialog.poll();dialog.body_tabs.setCurrentIndex(1);app.processEvents();before=list(controller.calls)
+            dialog,controller,instances,scan,action,prompt=self.vba_patch_session();dialog.present_vba_patch(self.vba_patch_plan_fixture());self.assertIsNotNone(dialog._patch_preview);question=dict(dialog._patch_question)
+            controller.snapshot.update(state='disconnected',operation='',last_result={},error='Utracono połączenie z obiektem skoroszytu.',error_code='excel_disconnected',error_operation='run_control_macro');dialog.poll();dialog.body_tabs.setCurrentIndex(1);app.processEvents();before=list(controller.calls)
+            self.assertIsNone(dialog._patch_preview);self.assertEqual(dialog._patch_plan,{});self.assertEqual(dialog._patch_question,question)
             self.assertTrue(dialog.patch_button.isVisible());self.assertFalse(dialog.patch_button.isEnabled());self.assertTrue(dialog.patch_status.text().strip());self.assertFalse(dialog.prepare_vba_patch());self.assertEqual(controller.calls,before)
             self.assertTrue(dialog.reconnect_button.isVisible());self.assertTrue(dialog.reconnect_button.isEnabled());self.assertNotIn('Sesja Excela gotowa',dialog.state_note.text())
             dialog.reconnect_button.click();dialog.reconnect_button.click();self.wait(lambda:not dialog._command_pending)
@@ -27166,6 +27272,26 @@ def ui_test():
             controller.snapshot.update(state='ready',operation='',error=excel_session_error_text('(Exception from HRESULT: 0x8001010A (RPC_E_SERVERCALL_RETRYLATER))'),error_operation='read_range');dialog.poll();app.processEvents()
             self.assertIn('Nie odświeżono podglądu',dialog.native_note.text());self.assertEqual(dialog.message.text(),'');self.assertTrue(dialog.native_macro.isEnabled());self.assertFalse(dialog.notice_button.isVisible())
             dialog.refresh_native();self.wait(lambda:not dialog._command_pending);controller.snapshot.update(state='ready',operation='',error='Explicit failure',error_operation='read_range');dialog.poll();self.assertEqual(dialog.message.text(),'Explicit failure')
+        def test_office_background_read_disconnect_shows_recovery_instead_of_quiet_sheet_failure(self):
+            dialog,controller=self.native_session();dialog.message.clear();self.assertTrue(dialog.refresh_native(background=True));self.wait(lambda:not dialog._command_pending);self.assertTrue(dialog.background_read_active())
+            controller.snapshot.update(state='disconnected',operation='',last_result={},error='Utracono połączenie z obiektem skoroszytu.',error_code='excel_disconnected',error_operation='read_range');dialog.poll();app.processEvents()
+            self.assertFalse(dialog._quiet_read_error);self.assertFalse(dialog.background_read_active());self.assertTrue(dialog.failure_frame.isVisible());self.assertTrue(dialog.reconnect_button.isVisible());self.assertTrue(dialog.reconnect_button.isEnabled());self.assertIs(dialog.body_tabs.currentWidget(),dialog.prompt_scroll)
+            self.assertIn('Utracono połączenie',dialog.message.text());self.assertFalse(dialog.native_macro.isEnabled());self.assertFalse(any(call[0] in ('run_macro','run_control_macro','reconnect_workbook') for call in controller.calls))
+        def test_office_workbook_reloaded_without_snapshot_clears_stale_controls_queued_write_and_preview(self):
+            dialog,controller,instances,scan,action,prompt=self.vba_patch_session();dialog.present_vba_patch(self.vba_patch_plan_fixture());self.assertIsNotNone(dialog._patch_preview);self.assertGreater(dialog.native_model.rowCount(),0)
+            self.assertTrue(dialog.refresh_native(background=True));self.wait(lambda:not dialog._command_pending);self.assertTrue(dialog.submit('apply_edits',{'edits':[{'sheet':'Raport','address':'A3','value':'queued'}]}));self.assertEqual(dialog._queued[0],'apply_edits')
+            result={'workbook_id':'native-book','workbook_rebound':True,'controls_invalidated':True,'snapshot_warning':'Excel jest chwilowo zajęty.'}
+            controller.snapshot.update(state='ready',operation='',last_result=result,error='Skoroszyt został ponownie załadowany. Sprawdź odświeżony widok.',error_code='workbook_reloaded',error_operation='read_range');dialog.poll();app.processEvents()
+            self.assertIsNone(dialog._queued);self.assertEqual(dialog._patch_plan,{});self.assertIsNone(dialog._patch_preview);self.assertIsNotNone(dialog._patch_question);self.assertFalse(dialog._quiet_read_error);self.assertTrue(dialog.failure_frame.isVisible())
+            self.assertEqual(dialog.native_controls.count(),0);self.assertEqual(dialog._native_controls,[]);self.assertEqual(dialog.native_model.rowCount(),0);self.assertEqual(dialog.native_model.cells,{});self.assertFalse(dialog.native_macro.isEnabled());self.assertTrue(dialog.native_refresh.isEnabled())
+            self.assertFalse(any(call[0] in ('apply_edits','apply_vba_patch','run_macro','run_control_macro') for call in controller.calls))
+        def test_office_recovered_snapshot_replaces_control_handles_without_running_queued_macro(self):
+            dialog,controller=self.native_session();self.assertTrue(dialog.refresh_native(background=True));self.wait(lambda:not dialog._command_pending);dialog.run_control_macro();self.assertEqual(dialog._queued[0],'run_control_macro')
+            result=self.native_excel_payload();result.update(workbook_rebound=True,controls_invalidated=True);result['snapshot']['controls'][0]['id']='recovered-control';result['snapshot']['cells'][0].update(value=42,text='42 po ponownym połączeniu')
+            controller.snapshot.update(state='ready',operation='',last_result=result,error='Skoroszyt został ponownie załadowany. Sprawdź widok przed kolejną operacją.',error_code='workbook_reloaded',error_operation='read_range');dialog.poll();app.processEvents()
+            self.assertIsNone(dialog._queued);self.assertEqual(dialog.native_controls.count(),1);self.assertEqual(dialog.native_controls.currentData()['id'],'recovered-control');self.assertEqual(dialog._native_controls[0]['id'],'recovered-control');self.assertEqual(dialog.native_model.data(dialog.native_model.index(0,0)),'42 po ponownym połączeniu');self.assertTrue(dialog.native_macro.isEnabled())
+            self.assertFalse(any(call[0]=='run_control_macro' for call in controller.calls));dialog.native_macro.click();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual([call for call in controller.calls if call[0]=='run_control_macro'],[('run_control_macro',{'workbook_id':'native-book','sheet_id':'sheet-1','control_id':'recovered-control'})])
         def test_office_several_controls_need_explicit_choice_and_vanished_choice_is_not_replaced(self):
             payload=self.native_excel_payload();payload['snapshot']['controls'].append(dict(payload['snapshot']['controls'][0],id='second-control',name='Button 2',caption='Zapisz do bazy'))
             dialog,controller=self.native_session(payload);self.assertEqual(dialog.native_controls.currentIndex(),-1);self.assertFalse(dialog.native_macro.isEnabled());self.assertTrue(dialog.native_reveal.isEnabled())
