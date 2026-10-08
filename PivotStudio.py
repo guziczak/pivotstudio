@@ -4561,6 +4561,54 @@ class _ExcelDispatch:
         return self._ole.QueryInterface(self._com.IID_IUnknown)==other._ole.QueryInterface(self._com.IID_IUnknown)
 
 
+def _excel_native_dispatch(pythoncom,hwnd,accessible=None):
+    """Acquire Excel's documented Window IDispatch, without a ROT lookup or launch."""
+    import ctypes as c
+    pointer=c.c_void_p();iid=(c.c_ubyte*16).from_buffer_copy(uuid.UUID('00020400-0000-0000-c000-000000000046').bytes_le)
+    function=accessible if accessible is not None else c.WinDLL('oleacc').AccessibleObjectFromWindow
+    function.argtypes=[c.c_void_p,c.c_uint32,c.c_void_p,c.POINTER(c.c_void_p)];function.restype=c.c_int32
+    # Microsoft documents EXCEL7 + OBJID_NATIVEOM as returning Excel.Window.
+    # ObjectFromAddress takes its own QI reference; always release the API's ref.
+    try:
+        result=function(hwnd,0xfffffff0,c.byref(iid),c.byref(pointer))
+        if result!=0 or not pointer.value:raise _ExcelDisconnected('Excel nie udostępnił obiektu istniejącego okna (0x%08X).'%(result&0xffffffff))
+        return _ExcelDispatch(pythoncom.ObjectFromAddress(pointer.value,pythoncom.IID_IDispatch),pythoncom)
+    finally:
+        if pointer.value:
+            vtable=c.cast(pointer,c.POINTER(c.POINTER(c.c_void_p))).contents
+            c.WINFUNCTYPE(c.c_uint32,c.c_void_p)(vtable[2])(pointer)
+
+
+def excel_native_application(pythoncom,owned,native=None):
+    """Refresh only an originally owned, still-live Excel window's COM proxy."""
+    if owned is None or not owned.alive():raise _ExcelDisconnected('Własny proces Excel już nie działa. Nie uruchomiono nowej instancji.')
+    api=native if native is not None else _ExcelNativeWindows();pid=owned.pid;hwnd=owned.hwnd
+    def valid_root(root):return owned.alive() and _excel_native_target(api,pid,root) and api.class_name(root)=='XLMAIN'
+    def valid_child(root,child):return valid_root(root) and api.pid(child)==pid and api.root(child)==root and api.child(root,child) and api.class_name(child)=='EXCEL7'
+    # Excel SDI may replace the old root while preserving the owned process.
+    # The retained process HANDLE prevents a recycled PID from qualifying.
+    roots=[hwnd] if valid_root(hwnd) else [];deadline=time.monotonic()+1;last_error=None
+    windows,complete=api.windows(deadline=deadline,limit=1024)
+    if not complete:raise _ExcelDisconnected('Nie udało się odczytać pełnej listy okien własnej sesji Excel.')
+    roots.extend(root for root in windows if root not in roots and valid_root(root))
+    for root in roots:
+        children,complete=api.windows(root,deadline=deadline,limit=1024)
+        if not complete:raise _ExcelDisconnected('Nie udało się odczytać pełnej listy okien dokumentu Excel.')
+        for child in children:
+            if not valid_child(root,child):continue
+            try:
+                window=_excel_native_dispatch(pythoncom,child)
+                if not valid_child(root,child):raise _ExcelDisconnected('Okno sesji Excel zmieniło się podczas odzyskiwania połączenia.')
+                application=window.Application
+                # Application.Hwnd can be another SDI root in this same process.
+                app_hwnd=int(application.Hwnd)
+                if not valid_child(root,child) or not valid_root(app_hwnd):raise _ExcelDisconnected('Odzyskany obiekt nie należy do własnej sesji Excel.')
+                return application
+            except Exception as exc:last_error=exc
+    detail=' '+excel_worker_error_text(last_error) if last_error is not None else ''
+    raise _ExcelDisconnected('Nie udało się odzyskać obiektu istniejącego okna Excel.'+detail)
+
+
 class _ExcelOleMessageFilter:
     """STA retry policy for calls COM explicitly rejected before execution.
 
@@ -5944,6 +5992,7 @@ class ExcelSessionWorker:
     def __init__(self,pythoncom,output,excel=None,session_id=''):
         self.pythoncom=pythoncom;self.output=output;self.excel=excel;self.book=None
         self.session_id=session_id;self.workbook_id=session_id+'-book';self.sheet_refs={};self.control_refs={}
+        self.owned_process=None
         self.revision=0;self.applied=0;self.layout_applied=0;self.layout_touched=0;self.owned_excel=False;self.working_copy='';self.original_path='';self.resumed=False;self.open_events_enabled=False;self.handoff_incomplete=False;self.pdf_observer=None;self.last_macro='';self.vba_patch_plan=None
     def send(self,event,**fields):
         data=dumps(dict(fields,event=event,session_id=self.session_id))
@@ -5997,22 +6046,33 @@ class ExcelSessionWorker:
         """Read only: never attach to another Excel process or reopen a file."""
         if not self.owned_excel or not self.working_copy or not Path(self.working_copy).is_absolute():
             raise _ExcelDisconnected('Nie potwierdzono własnej sesji ani pełnej ścieżki jej kopii.')
-        expected=os.path.normcase(os.path.abspath(self.working_copy));matches=[]
-        try:
-            books=list(itertools.islice(self.excel.Workbooks,101))
+        expected=os.path.normcase(os.path.abspath(self.working_copy));application=self.excel
+        def find_book(application):
+            matches=[];disconnected=None;books=list(itertools.islice(application.Workbooks,101))
             if len(books)>100:raise _ExcelDisconnected('Za dużo skoroszytów w sesji, aby potwierdzić właściwą kopię.')
             for book in books:
                 try:path=str(book.FullName)
                 except Exception as exc:
-                    if excel_connection_lost(exc):continue
+                    if excel_connection_lost(exc):disconnected=exc;continue
                     raise
                 if Path(path).is_absolute() and os.path.normcase(os.path.abspath(path))==expected:matches.append(book)
+            if not matches and disconnected is not None:raise disconnected
             if len(matches)!=1:raise _ExcelDisconnected('Nie znaleziono dokładnie jednej otwartej kopii sesji pod oczekiwaną ścieżką. Nowy Excel nie został uruchomiony.')
             # Force a server roundtrip before replacing any cached identities.
             str(matches[0].Name);int(matches[0].Worksheets.Count)
+            return matches[0]
+        try:
+            try:book=find_book(application)
+            except Exception as exc:
+                if isinstance(exc,_ExcelDisconnected) or not excel_connection_lost(exc):raise
+                # The application proxy can die too (for example when Office
+                # reloads a document after Enable Content). Reusing Workbooks
+                # on that proxy cannot reconnect; obtain a fresh native proxy.
+                application=excel_native_application(self.pythoncom,self.owned_process)
+                book=find_book(application)
         except _ExcelDisconnected:raise
         except Exception as exc:raise _ExcelDisconnected('Nie udało się odczytać istniejącej sesji. '+excel_worker_error_text(exc)) from exc
-        self.book=matches[0];self.sheet_refs.clear();self.control_refs.clear();self.vba_patch_plan=None;self.revision+=1
+        self.excel=application;self.book=book;self.sheet_refs.clear();self.control_refs.clear();self.vba_patch_plan=None;self.revision+=1
         try:return self.connection_snapshot()
         except Exception as exc:raise _ExcelDisconnected('Połączenie nie zostało potwierdzone po odświeżeniu obiektu skoroszytu. '+excel_worker_error_text(exc)) from exc
     def connection_snapshot(self):
@@ -6370,22 +6430,50 @@ class ExcelSessionWorker:
             if total>500*1024*1024:raise UserError('Pliki towarzyszące przekraczają 500 MiB.')
             result.append({'path':str(path),'name':name,'signature':_ExcelPdfObserver._signature(info)})
         return result
+    def vba_saved_patch_path(self):
+        """Validate the retained file without dereferencing a disconnected COM object."""
+        if not self.working_copy or not self.original_path:raise UserError('Nie potwierdzono oddzielnej zapisanej kopii sesji.')
+        working=Path(self.working_copy);original=Path(self.original_path)
+        if not working.is_absolute() or not original.is_absolute():raise UserError('Nie potwierdzono pełnej ścieżki zapisanej kopii sesji.')
+        self.vba_regular_file(working,256*1024*1024);working=_excel_retained_path(working);original=_excel_retained_path(original)
+        if working==original or (original.exists() and working.samefile(original)):raise UserError('Zapisana kopia sesji wskazuje oryginał. Zmiana została zatrzymana.')
+        return working
+    @staticmethod
+    def vba_patch_source_mode(command):
+        mode=command.get('source_mode','live')
+        if mode not in ('live','saved_file'):raise UserError('Nieprawidłowy wybór źródła zmiany VBA.')
+        return mode
+    @staticmethod
+    def vba_saved_macro(requested,working):
+        # The same workbook qualification rules, using the retained filename only.
+        match=re.fullmatch(r"(?:(?:'((?:[^']|'')+)'|([^'!]+))!)?([^\W\d]\w*(?:\.[^\W\d]\w*)?)",requested.strip())
+        if not match:return ''
+        qualifier=match[1].replace("''","'") if match[1] is not None else match[2]
+        if qualifier is not None and qualifier.replace('/','\\').casefold() not in {working.name.casefold(),str(working).replace('/','\\').casefold()}:return ''
+        return "'"+working.name.replace("'","''")+"'!"+match[3]
     def prepare_vba_patch(self,command):
         import difflib
-        self.vba_patch_plan=None;working=self.session_save_path()
+        self.vba_patch_plan=None;mode=self.vba_patch_source_mode(command);saved=mode=='saved_file';working=self.vba_saved_patch_path() if saved else self.session_save_path()
         if working.suffix.lower()!='.xlsm':raise UserError('Zmiana VBA wymaga kopii XLSM.')
         prompt=command.get('prompt_text');answer=command.get('answer_text','');requested=command.get('macro_name') or self.last_macro
         if not isinstance(prompt,str) or not prompt.strip() or len(prompt)>8000 or not isinstance(answer,str) or len(answer)>200:raise UserError('Przygotowanie zmiany wymaga tekstu ostatniego pytania.')
         if not isinstance(requested,str) or len(requested)>1000:raise UserError('Nieprawidłowa nazwa makra do analizy.')
-        name=self.macro_name(requested) if requested else ''
-        if requested and not name:raise UserError('Makro do analizy musi należeć do tej kopii skoroszytu.')
-        macro=self.qualified_macro(name) if name else '';workspace=working.parent;companions=self.vba_patch_companions(workspace)
+        macro=(self.vba_saved_macro(requested,working) if saved else self.qualified_macro(self.macro_name(requested)) if self.macro_name(requested) else '') if requested else ''
+        if requested and not macro:raise UserError('Makro do analizy musi należeć do tej kopii skoroszytu.')
+        workspace=working.parent;companions=self.vba_patch_companions(workspace)
         folder=Path(tempfile.mkdtemp(prefix='vba-edit-',dir=workspace));base=folder/'base';base.mkdir(mode=0o700);snapshot=base/working.name
-        previous_events=self.excel.EnableEvents
-        try:self.excel.EnableEvents=False;self.book.call('SaveCopyAs',str(snapshot))
-        finally:self.excel.EnableEvents=previous_events
-        self.session_save_path();self.vba_regular_file(snapshot,256*1024*1024);_vba_copy_zone(working,snapshot);source=excel_vba_package_read(snapshot)
-        token=uid();created=utcnow();preview={'token':token,'status':'unsupported','candidates':[],'rejections':[],'created_at':created,'workbook_id':self.workbook_id,'macro_name':macro,'answer_text':answer}
+        saved_mtime='';saved_hash=''
+        if saved:
+            info=self.vba_regular_file(working,256*1024*1024);signature=_ExcelPdfObserver._signature(info);saved_hash=file_digest(working);saved_mtime=dt.datetime.fromtimestamp(info.st_mtime,dt.timezone.utc).isoformat()
+            excel_copy_workbook(working,snapshot,threading.Event())
+            if _ExcelPdfObserver._signature(self.vba_regular_file(working,256*1024*1024))!=signature or file_digest(working)!=saved_hash or file_digest(snapshot)!=saved_hash:raise UserError('Zapisana kopia zmieniła się podczas odczytu. Przygotuj propozycję ponownie.')
+        else:
+            previous_events=self.excel.EnableEvents
+            try:self.excel.EnableEvents=False;self.book.call('SaveCopyAs',str(snapshot))
+            finally:self.excel.EnableEvents=previous_events
+            self.session_save_path()
+        self.vba_regular_file(snapshot,256*1024*1024);_vba_copy_zone(working,snapshot);source=excel_vba_package_read(snapshot)
+        token=uid();created=utcnow();preview={'token':token,'status':'unsupported','candidates':[],'rejections':[],'created_at':created,'workbook_id':self.workbook_id,'macro_name':macro,'answer_text':answer,'source_mode':mode,'saved_source_mtime':saved_mtime,'file_sha256':saved_hash,'source_note':'Ostatnia zapisana kopia sesji; niezapisane zmiany nie są uwzględnione.' if saved else 'Kopia bieżącego skoroszytu utworzona przez Excel.'}
         if source.get('status')!='available':
             preview['reason']=str(source.get('reason') or 'Nie odczytano pełnego, obsługiwanego źródła VBA.')[:1800];return preview
         expected=source.get('file_sha256','')
@@ -6407,12 +6495,14 @@ class ExcelSessionWorker:
             if len(dumps(proposed).encode('utf-8'))>256*1024:
                 preview.update(status='unsupported',candidates=[],reason='Podgląd zmiany przekracza limit. Nie przygotowano niepełnej propozycji.');candidates={};break
             preview['candidates'].append(item);candidates[cid]={'module':module,'old_source':old,'new_source':new}
-        self.session_save_path()
-        if candidates:self.vba_patch_plan={'token':token,'snapshot':str(snapshot),'sha256':expected,'candidates':candidates,'revision':self.revision,'companions':companions,'created_at':created}
+        if saved:self.vba_saved_patch_path()
+        else:self.session_save_path()
+        if candidates:self.vba_patch_plan={'token':token,'snapshot':str(snapshot),'sha256':expected,'candidates':candidates,'revision':self.revision,'companions':companions,'created_at':created,'source_mode':mode,'saved_source_mtime':saved_mtime,'source_note':preview['source_note']}
         return preview
     def apply_vba_patch(self,command):
-        working=self.session_save_path();plan=self.vba_patch_plan;token=command.get('token');cid=command.get('candidate_id')
+        mode=self.vba_patch_source_mode(command);saved=mode=='saved_file';working=self.vba_saved_patch_path() if saved else self.session_save_path();plan=self.vba_patch_plan;token=command.get('token');cid=command.get('candidate_id')
         if not plan or token!=plan['token'] or cid not in plan['candidates']:raise UserError('Propozycja zmiany jest nieaktualna albo została już zastosowana. Przygotuj ją ponownie.')
+        if plan.get('source_mode','live')!=mode:raise UserError('Propozycja dotyczy innego źródła. Przygotuj ją ponownie.')
         if plan['revision']!=self.revision:raise UserError('Skoroszyt zmienił się od przygotowania propozycji. Przygotuj ją ponownie.')
         snapshot=_excel_retained_path(plan['snapshot']);self.vba_regular_file(snapshot,256*1024*1024)
         if not snapshot.is_relative_to(working.parent) or file_digest(snapshot)!=plan['sha256']:raise UserError('Kopia przygotowana do zmiany została zmodyfikowana. Przygotuj propozycję ponownie.')
@@ -6429,8 +6519,9 @@ class ExcelSessionWorker:
             source=Path(item['path']);target=folder/item['name'];excel_copy_workbook(source,target,cancelled)
             if _ExcelPdfObserver._signature(self.vba_regular_file(source,500*1024*1024))!=item['signature'] or self.vba_regular_file(target,500*1024*1024).st_size!=item['signature'][2]:raise UserError('Plik towarzyszący zmienił się podczas kopiowania: '+item['name'])
             paths.append(str(target))
-        self.session_save_path()
-        return {'path':str(destination),'sha256':sha256,'label':'Zmieniona kopia — niezweryfikowana','verified':False,'snapshot_created_at':plan['created_at'],'companions':[item['name'] for item in plan['companions']],'companion_paths':paths}
+        if saved:self.vba_saved_patch_path()
+        else:self.session_save_path()
+        return {'path':str(destination),'sha256':sha256,'token':token,'candidate_id':cid,'label':'Zmieniona kopia — niezweryfikowana','verified':False,'snapshot_created_at':plan['created_at'],'companions':[item['name'] for item in plan['companions']],'companion_paths':paths,'source_mode':mode,'source_note':plan.get('source_note',''),'saved_source_mtime':plan.get('saved_source_mtime','')}
     def invoke_macro(self,macro,extra,diagnostics=False,identity=None,action='run_macro'):
         self.last_macro=macro;self.vba_patch_plan=None
         if diagnostics:self.send('vba_source',id=identity,operation=action,report=self.inspect_vba(macro))
@@ -6445,13 +6536,13 @@ class ExcelSessionWorker:
     def handle_command(self,command):
         if command.get('session_id')!=self.session_id:raise UserError('Wrong session identity.')
         if command.get('action')=='close':return False
-        action=command.get('action');identity=command.get('id');self.applied=0;macro='';invocation={};extra={}
+        action=command.get('action');identity=command.get('id');self.applied=0;macro='';invocation={};extra={};file_only=action in ('prepare_vba_patch','apply_vba_patch') and command.get('source_mode')=='saved_file'
         self.send('busy',id=identity,operation=action)
         try:
             if type(command.get('diagnostics',False)) is not bool:raise UserError('Nieprawidłowa opcja diagnostyki VBA.')
             isolated=action in ('inspect_vba','prepare_vba_patch','apply_vba_patch','reconnect_workbook')
             if command.get('workbook_id')!=self.workbook_id:raise UserError('Wrong workbook identity.')
-            if action!='reconnect_workbook':self.preflight_connection()
+            if action!='reconnect_workbook' and not file_only:self.preflight_connection()
             if not isolated:self.excel.AutomationSecurity=2
             if self.handoff_incomplete and action in ('run_macro','run_control_macro','apply_edits','prepare_vba_patch','apply_vba_patch'):raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
             if action=='run_macro':
@@ -6491,13 +6582,14 @@ class ExcelSessionWorker:
                 extra.update(self.save_session())
             else:raise UserError('Unsupported session action.')
             if not isolated:self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
-            result=self.session_info();result.update(extra);self.send('done',id=identity,operation=action,result=result)
+            result={'workbook_id':self.workbook_id,'file_only':True,'source_mode':'saved_file','action':action} if file_only else self.session_info();result.update(extra);self.send('done',id=identity,operation=action,result=result)
         except Exception as exc:
             if action not in ('inspect_vba','prepare_vba_patch','apply_vba_patch','reconnect_workbook') and not excel_connection_lost(exc) and not isinstance(exc,_ExcelWorkbookRebound):
                 with contextlib.suppress(Exception):self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
             outcome={'result':{'pdf_outputs':extra['pdf_outputs']}} if 'pdf_outputs' in extra else {}
             if isinstance(exc,_ExcelWorkbookRebound):outcome['result']=exc.result
-            self.send('error',id=identity,operation=action,applied=self.applied,retry_safe=False,**outcome,**self.error_fields(exc,action,macro,invocation))
+            fields=excel_worker_error_fields(exc,action,macro,{'working_copy':self.working_copy,'source_mode':'saved_file'}) if file_only else self.error_fields(exc,action,macro,invocation)
+            self.send('error',id=identity,operation=action,applied=self.applied,retry_safe=False,**outcome,**fields)
         return True
     def close(self):
         if self.owned_excel and self.excel is not None:
@@ -6507,6 +6599,9 @@ class ExcelSessionWorker:
                     with contextlib.suppress(Exception):opened.call('Close',False)
             with contextlib.suppress(Exception):self.excel.call('Quit')
         self.control_refs.clear();self.sheet_refs.clear();self.book=None;self.excel=None;self.owned_excel=False;self.vba_patch_plan=None
+        if self.owned_process is not None:
+            with contextlib.suppress(Exception):self.owned_process.close()
+            self.owned_process=None
     def run(self,stdin,request=None,process_ids=None,window_pid=None):
         try:
             request=request if request is not None else self.read_request(stdin)
@@ -6520,6 +6615,9 @@ class ExcelSessionWorker:
             hwnd=int(self.excel.Hwnd);pid=int((window_pid or _ExcelNativeWindows().pid)(hwnd))
             if hwnd<=0 or pid<=0 or pid in previous:raise UserError('Excel did not create a separate process. Existing Excel windows were not changed.')
             self.owned_excel=True
+            # Retain the OS identity, not merely a recyclable PID, for native
+            # COM recovery. Injected non-COM test objects never open OS handles.
+            if isinstance(self.excel,_ExcelDispatch):self.owned_process=ExcelOwnedProcess(pid,hwnd,previous)
             self.send('created',id=request.get('id'),pid=pid,hwnd=hwnd)
             attach=self.read_request(stdin)
             if not attach or attach.get('action')!='attach' or attach.get('session_id')!=self.session_id:raise UserError('Session cancelled before opening the workbook.')
@@ -6728,7 +6826,7 @@ class ExcelSessionController:
         self.original=Path(os.path.abspath(os.path.expanduser(str(source_path))));self.root=Path(os.path.abspath(os.path.expanduser(str(root))));self.on_event=on_event
         self.session_id=uid();self.lock=threading.RLock();self.write_lock=threading.Lock();self.cancelled=threading.Event();self.finished=threading.Event()
         self.process=None;self.owned_process=None;self.thread=None;self.reaper=None;self.dispatcher=None;self.previous=set();self.pending=None;self.temp_root=None;self.staged=None;self._copy_cancel=None
-        self.resume_path=resume_path;self.session_file_lock=None;self.manifest={};self.resume_info=None;self._vba_requested_job=''
+        self.resume_path=resume_path;self.session_file_lock=None;self.manifest={};self.resume_info=None;self._vba_requested_job='';self._file_patch_job_state=None
         self.state={'session_id':self.session_id,'workbook_id':self.session_id+'-book','state':'new','job_id':'','operation':'','original_path':str(self.original),'source_path':str(self.original),'staged_path':'','working_copy':'','temp_root':'','workspace_path':'','last_saved_path':'','pid':0,'hwnd':0,'owned':False,'alive':False,'active_sheet':'','last_result':{},'last_operation':'','error':'','error_operation':'','events':[],'cancelled':False,'finished':False,'handoff_incomplete':False}
         self.state.update(error_details='',error_code='',macro_name='',resumed=resume_path is not None,externally_changed=False,vba_source={},vba_source_job='',vba_patch={},vba_patch_job='')
     def _event(self,event,**fields):
@@ -6908,7 +7006,7 @@ class ExcelSessionController:
         with self.lock:
             if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
             pending=self.pending if event=='done' else None
-            owned=self.owned_process;operation=self.state.get('operation')
+            owned=self.owned_process;operation=self.state.get('operation');file_patch_state=self._file_patch_job_state if self._file_patch_job_state and self._file_patch_job_state['id']==value.get('id') else None
         if event=='vba_source':
             if value.get('operation')!=operation or operation not in ('run_macro','run_control_macro') or value.get('id')!=self._vba_requested_job:return
             self._accept_vba_source(value.get('report'),value.get('id'))
@@ -6952,9 +7050,10 @@ class ExcelSessionController:
                 else:
                     result=value.get('result') or {};self.state.update(error='',error_operation='',error_details='',error_code='',macro_name='',last_result=clone(result),active_sheet=str(result.get('active_sheet','')))
                     if result.get('saved_path'):self.state['last_saved_path']=result['saved_path']
-                disconnected=event=='error' and (value.get('code')=='excel_disconnected' or operation=='reconnect_workbook')
-                if disconnected or (value.get('result') or {}).get('workbook_rebound'):self.state.update(vba_patch={},vba_patch_job='',vba_source={},vba_source_job='')
+                disconnected=(file_patch_state is not None and file_patch_state['state']=='disconnected') or (event=='error' and (value.get('code')=='excel_disconnected' or operation=='reconnect_workbook'))
+                if (disconnected and not file_patch_state) or (value.get('result') or {}).get('workbook_rebound'):self.state.update(vba_patch={},vba_patch_job='',vba_source={},vba_source_job='')
                 self.state.update(state='disconnected' if disconnected else 'ready',job_id='',operation='')
+                self._file_patch_job_state=None
         self._event(event,operation=value.get('operation','open'),message=value.get('message',''),details=str(value.get('details',''))[:16384],code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],result=value.get('result',{}),applied=value.get('applied',0),retry_safe=False)
     def _accept_vba_source(self,report,jid):
         # Source belongs only to the current in-memory view, never the event log.
@@ -6974,7 +7073,7 @@ class ExcelSessionController:
         token=report.get('token');candidates=report.get('candidates',[]);rejections=report.get('rejections',[])
         if not isinstance(token,str) or not re.fullmatch('[0-9a-f]{32}',token) or not isinstance(candidates,list) or len(candidates)>8 or not isinstance(rejections,list) or len(rejections)>24:return
         clean={key:report[key] for key in ('token','status','workbook_id') if key in report};clean['candidates']=[];seen=set()
-        for field,maximum in (('created_at',80),('macro_name',1000),('answer_text',200),('reason',1800)):
+        for field,maximum in (('created_at',80),('macro_name',1000),('answer_text',200),('reason',1800),('source_mode',20),('source_note',1800),('saved_source_mtime',80),('file_sha256',64)):
             value=report.get(field,'')
             if not isinstance(value,str) or len(value)>maximum:return
             clean[field]=value
@@ -7004,12 +7103,18 @@ class ExcelSessionController:
         if not isinstance(args,dict):raise UserError('Nieprawidłowe parametry sesji Excel.')
         with self.lock:
             reconnect=action=='reconnect_workbook' and self.state['state']=='disconnected'
-            if (self.state['state']!='ready' and not reconnect) or self.cancelled.is_set() or not self.owned_process or not self.owned_process.alive():raise UserError('Poczekaj na gotową, własną sesję Excel.')
+            file_only=action in ('prepare_vba_patch','apply_vba_patch') and args.get('source_mode')=='saved_file'
+            if file_only:
+                if self.state['state'] not in ('ready','disconnected') or self.cancelled.is_set() or self.process is None or self.process.poll() is not None:raise UserError('Poczekaj na zakończenie operacji. Odczyt zapisanej kopii wymaga działającego procesu sesji Pivota.')
+            elif (self.state['state']!='ready' and not reconnect) or self.cancelled.is_set() or not self.owned_process or not self.owned_process.alive():raise UserError('Poczekaj na gotową, własną sesję Excel.')
             if action not in ('run_macro','export_pdf','save_copy','save_working','save_session','read_range','list_sheets','apply_edits','activate_sheet','reveal_control','run_control_macro','show_excel','inspect_vba','prepare_vba_patch','apply_vba_patch','reconnect_workbook'):raise UserError('Nieobsługiwana akcja sesji Excel.')
             if self.state.get('handoff_incomplete') and action in ('run_macro','run_control_macro','apply_edits','prepare_vba_patch','apply_vba_patch'):raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
             workbook_id=self.state['workbook_id']
             if args.get('workbook_id',workbook_id)!=workbook_id:raise UserError('Polecenie dotyczy innego skoroszytu.')
             jid=uid();command={'action':action,'id':jid,'workbook_id':workbook_id}
+            if action in ('prepare_vba_patch','apply_vba_patch') and 'source_mode' in args:
+                if args['source_mode'] not in ('live','saved_file'):raise UserError('Nieprawidłowy wybór źródła zmiany VBA.')
+                command['source_mode']=args['source_mode']
             if action in ('run_macro','run_control_macro') and 'diagnostics' in args:
                 if type(args['diagnostics']) is not bool:raise UserError('Nieprawidłowa opcja diagnostyki VBA.')
                 command['diagnostics']=args['diagnostics']
@@ -7047,6 +7152,7 @@ class ExcelSessionController:
             if action in ('run_macro','run_control_macro','inspect_vba'):self.state.update(vba_source={},vba_source_job='')
             if action in ('run_macro','run_control_macro','prepare_vba_patch','reconnect_workbook'):self.state.update(vba_patch={},vba_patch_job='')
             self._vba_requested_job=jid if command.get('diagnostics') is True else ''
+            self._file_patch_job_state={'id':jid,'state':self.state['state']} if file_only else None
             self.state.update(state='busy',job_id=jid,operation=action,error='',error_operation='',error_details='',error_code='',macro_name='')
             self.dispatcher=threading.Thread(target=self._dispatch,args=(command,),name='pivot-excel-request',daemon=False);self.dispatcher.start()
         self._event('submitted',operation=action,id=jid);return jid
@@ -7071,7 +7177,9 @@ class ExcelSessionController:
                 with contextlib.suppress(OSError):Path(temp).unlink()
             with self.lock:
                 if self.pending and self.pending['id']==command['id']:self.pending=None
-                if not self.cancelled.is_set() and command['id']==self.state['job_id']:self.state.update(state='disconnected' if command['action']=='reconnect_workbook' else 'ready',job_id='',operation='',error=safe_error(exc),error_operation=command['action'])
+                if not self.cancelled.is_set() and command['id']==self.state['job_id']:
+                    previous=self._file_patch_job_state;disconnected=command['action']=='reconnect_workbook' or bool(previous and previous['id']==command['id'] and previous['state']=='disconnected')
+                    self.state.update(state='disconnected' if disconnected else 'ready',job_id='',operation='',error=safe_error(exc),error_operation=command['action']);self._file_patch_job_state=None
             self._event('error',message=safe_error(exc),operation=command['action'])
     def _publish(self,pending):
         if self.cancelled.is_set():raise Cancelled('Anulowano zapis.')
@@ -12685,6 +12793,7 @@ def native_ui_types():
             self._last_failure=None;self._last_failure_key=None;self._show_pending=False
             self._vba_report={};self._vba_job='';self._vba_ignored_job='';self._vba_prompt='';self._vba_macro='';self._diag_active=False;self._diag_terminal_key=None;self._diag_macro_job=''
             self._patch_question=None;self._patch_plan={};self._patch_result={};self._patch_preview=None;self._patch_open_dialog=None;self._patch_open_path=''
+            self._patch_run_request=None;self._generator_request=None;self._generator_stage=''
             self._macro_pdf_outputs=None;self._pdf_destination='';self._pdf_destination_confirmed=False;self._pdf_publish_pending=False;self._pdf_publish_cancel=threading.Event();self._pdf_attempt_destination=''
             self._session_preferences=excel_session_preferences(window.service.root);self._resume_path='';self._resume_source_path='';self._resume_info={};self._resume_check_pending=False
             self._office_context=None;self._native_book_id='';self._native_controls=[];self._native_loading=False;self._last_view_refresh=0.;self._initial_control_pending=False;self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._companion_paths=[]
@@ -12769,6 +12878,11 @@ def native_ui_types():
             self.patch_button=button('Pierdol to',self.prepare_vba_patch);self.patch_button.setToolTip('Znajdź warunek związany z ostatnim pytaniem i pokaż zmianę kodu. Zastosowanie utworzy osobną kopię skoroszytu.');patch_layout.addWidget(self.patch_button)
             self.patch_open_button=button('Otwórz zmienioną kopię w Pivocie',self.open_vba_patch_copy);patch_layout.addWidget(self.patch_open_button);self.patch_open_button.hide()
             self.prompt_layout.addWidget(self.patch_frame);self.patch_frame.hide()
+            self.generator_frame=QW.QGroupBox('Generator w zmienionej kopii');generator_layout=QW.QVBoxLayout(self.generator_frame)
+            self.generator_note=label('',True,True);self.generator_note.setTextFormat(Qt.TextFormat.PlainText);generator_layout.addWidget(self.generator_note)
+            self.generator_show=button('Pokaż Excel — włącz zawartość',lambda:self.show_excel(select_control=False));generator_layout.addWidget(self.generator_show)
+            self.generator_continue=button('Włączono zawartość — uruchom generator',self.continue_patched_generator);generator_layout.addWidget(self.generator_continue)
+            self.prompt_layout.addWidget(self.generator_frame);self.generator_frame.hide()
             self.macro_pdf_frame=QW.QGroupBox('Pliki PDF');pdf_results=QW.QVBoxLayout(self.macro_pdf_frame)
             self.macro_pdf_note=label('',True,True);self.macro_pdf_note.setTextFormat(Qt.TextFormat.PlainText);pdf_results.addWidget(self.macro_pdf_note)
             self.macro_pdf_files=QW.QComboBox();self.macro_pdf_files.setMinimumContentsLength(1);self.macro_pdf_files.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);self.macro_pdf_files.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed);pdf_results.addWidget(self.macro_pdf_files)
@@ -12843,25 +12957,28 @@ def native_ui_types():
         def reset_vba_patch(self,preserve_question=False):
             if self._patch_preview is not None:
                 with contextlib.suppress(RuntimeError):self._patch_preview.reject()
-            self._patch_preview=None;self._patch_question=self._patch_question if preserve_question else None;self._patch_plan={};self._patch_result={};self.patch_frame.hide();self.patch_open_button.hide()
+            self._patch_preview=None;self._patch_question=self._patch_question if preserve_question else None;self._patch_plan={};self._patch_result={};self._patch_run_request=None;self.patch_frame.hide();self.patch_open_button.hide()
             self.patch_note.setText('Zachowano pytanie z poprzedniej próby tego makra. Analiza będzie dotyczyć bieżącej kopii skoroszytu.' if self._patch_question else 'Po odczytaniu pytania makra możesz przygotować zmianę wybranego warunku VBA.')
         def remember_vba_question(self,snapshot,answer=''):
             identity=self.session_identity();text=str(snapshot.get('text') or '').strip()
             if not identity or not text or not snapshot.get('complete',True) or not snapshot.get('buttons'):return
             control=self.native_controls.currentData() or {}
-            self._patch_question={'identity':identity,'text':text[:8000],'answer':answer[:200],'macro_name':self._vba_macro or str(control.get('on_action') or control.get('macro_name') or '')}
+            self._patch_question={'identity':identity,'text':text[:8000],'answer':answer[:200],'macro_name':self._vba_macro or str(control.get('on_action') or control.get('macro_name') or ''),'sheet':self.native_sheets.currentText(),'control':clone(control)}
             self._patch_plan={};self._patch_result={};self.patch_open_button.hide()
             self.patch_note.setText(('Wybrano „'+answer+'”. ' if answer else 'Zapamiętano pytanie Excela. Odpowiedź wybrana poza Pivotem nie jest rejestrowana. ')+'„Pierdol to” przygotuje propozycję pominięcia warunku związanego z tym pytaniem w osobnej kopii.')
         def prepare_vba_patch(self):
             if not self._patch_question or self._last_prompts or self._action_pending:return False
-            if self._snapshot.get('state')!='ready' or self._command_pending or self._queued is not None:return False
+            if self._snapshot.get('state') not in ('ready','disconnected') or self._command_pending or self._queued is not None or self._snapshot.get('handoff_incomplete'):return False
             if self._patch_preview is not None:
                 self._patch_preview.raise_();self._patch_preview.activateWindow();return False
             question=self._patch_question
             if question.get('identity')!=self.session_identity():return False
             self._patch_plan={};self._patch_result={};self.patch_open_button.hide()
-            self.patch_note.setText('Przygotowuję kopię bieżącego skoroszytu i szukam warunku związanego z pytaniem…')
-            return self.submit('prepare_vba_patch',{'prompt_text':question['text'],'answer_text':question['answer'],'macro_name':question.get('macro_name','')})
+            args={'prompt_text':question['text'],'answer_text':question['answer'],'macro_name':question.get('macro_name','')}
+            saved=self._snapshot.get('state')=='disconnected'
+            if saved:args['source_mode']='saved_file'
+            self.patch_note.setText('Analizuję ostatnią zapisaną kopię sesji. Niezapisane zmiany z Excela nie są uwzględnione.' if saved else 'Przygotowuję kopię bieżącego skoroszytu i szukam warunku związanego z pytaniem…')
+            return self.submit('prepare_vba_patch',args)
         def present_vba_patch(self,plan):
             if not isinstance(plan,dict) or not self._patch_question:return
             self._patch_plan=clone(plan);self.patch_frame.show();self.body_tabs.setCurrentIndex(1)
@@ -12871,26 +12988,43 @@ def native_ui_types():
                 self.patch_note.setText('Nie utworzono zmienionej kopii. '+'\n'.join(str(item.get('reason',item)) if isinstance(item,dict) else str(item) for item in reasons)[:2500]);return
             if self._patch_preview is not None:return
             dialog=QW.QDialog(self);dialog.setWindowTitle('Pierdol to — podgląd zmiany VBA');dialog.setWindowModality(Qt.WindowModality.WindowModal);layout=QW.QVBoxLayout(dialog)
-            description=label('Zmiana pominie wskazany warunek w nowej kopii. Dokument może zawierać brakujące dane. Kopia pochodzi z chwili przygotowania: '+str(plan.get('created_at',''))+'. Nie zawiera późniejszych edycji w Excelu. Zastosowanie zmiany nie uruchamia makra.',True,True);layout.addWidget(description)
+            source_note=('Źródło: ostatnia zapisana kopia sesji. Niezapisane zmiany z Excela nie są uwzględnione. '+str(plan.get('source_note','')) if plan.get('source_mode')=='saved_file' else 'Źródło: bieżący skoroszyt z chwili przygotowania. Późniejsze edycje nie są uwzględnione.')
+            description=label('Zmiana pominie wskazany warunek w nowej kopii. Dokument może zawierać brakujące dane. '+source_note+' Przygotowano: '+str(plan.get('created_at',''))+'. Wybierz samo utworzenie kopii albo zastosowanie i jedną próbę generatora z wyborem miejsca zapisu PDF.',True,True);description.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(description)
             choice=QW.QComboBox();choice.setMinimumContentsLength(1);choice.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);choice.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed);layout.addWidget(choice)
             for item in candidates:choice.addItem(str(item.get('module',''))+'.'+str(item.get('procedure',''))+' · wiersz '+str(item.get('line','')),item)
             if len(candidates)>1:choice.setCurrentIndex(-1);choice.setPlaceholderText('Wybierz właściwy blok — pytanie pasuje do kilku miejsc')
             reason=label('',True,True);reason.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(reason)
             diff=QW.QPlainTextEdit();diff.setReadOnly(True);diff.setFont(QG.QFontDatabase.systemFont(QG.QFontDatabase.SystemFont.FixedFont));diff.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.NoWrap);diff.setAccessibleName('Proponowana zmiana VBA');layout.addWidget(diff,1)
-            buttons=QW.QDialogButtonBox();apply=buttons.addButton('Zastosuj w nowej kopii',QW.QDialogButtonBox.ButtonRole.AcceptRole);cancel=buttons.addButton('Anuluj',QW.QDialogButtonBox.ButtonRole.RejectRole);apply.setAutoDefault(False);cancel.setAutoDefault(False);layout.addWidget(buttons)
+            buttons=QW.QDialogButtonBox();apply=buttons.addButton('Zastosuj w nowej kopii',QW.QDialogButtonBox.ButtonRole.AcceptRole);run=buttons.addButton('Zastosuj i uruchom generator',QW.QDialogButtonBox.ButtonRole.ActionRole);cancel=buttons.addButton('Anuluj',QW.QDialogButtonBox.ButtonRole.RejectRole)
+            for b in (apply,run,cancel):b.setAutoDefault(False)
+            layout.addWidget(buttons)
+            working=Path(self._snapshot.get('working_copy') or self.file.text());requested=str((self._patch_question or {}).get('macro_name') or '')
+            qualified=ExcelSessionWorker.vba_saved_macro(requested,working);macro=qualified.rsplit('!',1)[-1] if qualified else ''
+            control=clone((self._patch_question or {}).get('control') or self.native_controls.currentData() or {})
+            sheet_name=str((self._patch_question or {}).get('sheet') or self.native_sheets.currentText())
+            control_macro=ExcelSessionWorker.vba_saved_macro(str(control.get('on_action') or control.get('macro_name') or ''),working)
+            can_run=bool(macro and sheet_name and control.get('name') and control.get('macro_supported') and control_macro.casefold()==qualified.casefold())
+            run.setToolTip('Uruchamia raz ten sam generator w zmienionej kopii. Excel może wymagać „Włącz zawartość”.' if can_run else 'Nie rozpoznano jednoznacznie przycisku i makra ostatniej próby. Możesz utworzyć kopię i wybrać generator w niej.')
             def selected(*_):
-                item=choice.currentData() or {};reason.setText(str(item.get('reason',''))+'\n'+'\n'.join(map(str,item.get('warnings',[]))));diff.setPlainText(str(item.get('diff') or item.get('unified_diff') or ('Przed:\n'+str(item.get('old_block',''))+'\n\nPo:\n'+str(item.get('new_block','')))));apply.setEnabled(bool(item.get('id')))
+                item=choice.currentData() or {};reason.setText(str(item.get('reason',''))+'\n'+'\n'.join(map(str,item.get('warnings',[]))));diff.setPlainText(str(item.get('diff') or item.get('unified_diff') or ('Przed:\n'+str(item.get('old_block',''))+'\n\nPo:\n'+str(item.get('new_block','')))));apply.setEnabled(bool(item.get('id')));run.setEnabled(bool(item.get('id')) and can_run)
             epoch=self._epoch;identity=self.session_identity();token=plan.get('token');self._patch_preview=dialog
-            def accepted():
+            def accepted(run_generator=False):
                 item=choice.currentData() or {}
                 if self._disposed or epoch!=self._epoch or identity!=self.session_identity() or self._patch_plan.get('token')!=token:return
-                if self.submit('apply_vba_patch',{'token':token,'candidate_id':item.get('id')}):dialog.accept()
+                if run_generator and (not can_run or not self.choose_macro_pdf_destination()):return
+                if self._disposed or epoch!=self._epoch or identity!=self.session_identity() or self._patch_plan.get('token')!=token:return
+                args={'token':token,'candidate_id':item.get('id')}
+                if plan.get('source_mode')=='saved_file':args['source_mode']='saved_file'
+                self._patch_run_request={'token':token,'candidate_id':item.get('id'),'macro':macro,'control_name':control.get('name'),'sheet':sheet_name,'destination':self._pdf_destination} if run_generator else None
+                if self.submit('apply_vba_patch',args):dialog.accept()
+                else:self._patch_run_request=None
             def finished(*_):
                 if self._patch_preview is dialog:self._patch_preview=None
                 dialog.deleteLater();self.update_controls()
-            choice.currentIndexChanged.connect(selected);apply.clicked.connect(accepted);cancel.clicked.connect(dialog.reject);dialog.finished.connect(finished);selected()
-            self.patch_note.setText('Sprawdź proponowaną zmianę. Dotychczasowa sesja i jej skoroszyt pozostają otwarte.');limited_dialog_size(dialog,860,580);dialog.open()
-        def open_vba_patch_copy(self):
+            choice.currentIndexChanged.connect(selected);apply.clicked.connect(lambda:accepted(False));run.clicked.connect(lambda:accepted(True));cancel.clicked.connect(dialog.reject);dialog.finished.connect(finished);selected()
+            self.patch_note.setText('Sprawdź proponowaną zmianę. '+source_note);limited_dialog_size(dialog,860,580);dialog.open()
+        def open_vba_patch_copy(self,run_request=None):
+            if not isinstance(run_request,dict):run_request=None
             result=self._patch_result;path=str(result.get('path') or result.get('patched_path') or '')
             if not path or self._closing or self._disposed:return
             revision=result.get('sha256','')
@@ -12900,8 +13034,40 @@ def native_ui_types():
             if not Path(path).is_file():self.patch_note.setText('Nie znaleziono zmienionej kopii: '+path);return
             dialog=ExcelSessionDialog(self._host_window,path);self._patch_open_dialog=dialog;self._patch_open_path=path
             dialog._office_context={'source_revision':revision}
+            if run_request:
+                dialog._office_context.update(sheet=run_request['sheet'],control={'name':run_request['control_name']});dialog._initial_control_pending=True
+                dialog._generator_request=clone(run_request);dialog._generator_stage='opening'
+                dialog.generator_note.setText('Otwieram zmienioną kopię. Następnie wykonam jedną próbę generatora.');dialog.generator_frame.show()
             dialog.setWindowTitle('Excel: kopia z pominiętą walidacją');dialog._companion_paths=list(result.get('companion_paths') or [str(Path(path).parent/name) for name in result.get('companions',[])]);dialog.diagnostics_enabled.setChecked(self.diagnostics_enabled.isChecked())
             dialog.show();dialog.start_session()
+        def continue_patched_generator(self):
+            if not self._generator_request or self._generator_stage!='needs_content' or self._snapshot.get('state') not in ('ready','disconnected') or self._command_pending or self._last_prompts or self._action_pending or self._closing:return False
+            self._generator_stage='reconnecting';self.generator_note.setText('Odnawiam połączenie z tą samą kopią po włączeniu zawartości…')
+            if self.submit('reconnect_workbook',{}):return True
+            self._generator_stage='needs_content';self.update_controls();return False
+        def advance_patched_generator(self):
+            request=self._generator_request;stage=self._generator_stage;state=self._snapshot.get('state')
+            if not request or self._disposed or self._closing or self._command_pending or self._action_pending or self._last_prompts or state in ('starting','busy','closing'):return
+            if stage not in ('opening','reconnecting','reading_sheet'):return
+            if state!='ready' or self._snapshot.get('error') or self._snapshot.get('handoff_incomplete'):
+                self._generator_stage='needs_content' if stage=='reconnecting' else 'failed'
+                self.generator_note.setText('Nie uruchomiono generatora. '+str(self._snapshot.get('error') or 'Kopia nie jest gotowa. Sprawdź komunikaty sesji.'));return
+            if not self._native_book_id:return
+            if self.native_sheets.currentText()!=request['sheet'] and stage!='reading_sheet':
+                index=self.native_sheets.findText(request['sheet'])
+                if index>=0:
+                    self._generator_stage='reading_sheet';self.generator_note.setText('Odczytuję arkusz generatora w tej samej kopii…')
+                    if self.submit('read_range',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.itemData(index),'top':1,'left':1,'rows':30,'cols':12}):return
+                    self._generator_stage='failed';self.generator_note.setText('Nie udało się odczytać arkusza generatora. Nie uruchomiono makra.');return
+            working=Path(self._snapshot.get('working_copy') or self.file.text())
+            matches=[(i,c) for i,c in enumerate(self._native_controls) if c.get('name')==request['control_name'] and c.get('macro_supported') and ExcelSessionWorker.vba_saved_macro(str(c.get('on_action') or c.get('macro_name') or ''),working).casefold()==ExcelSessionWorker.vba_saved_macro(request['macro'],working).casefold()]
+            if self.native_sheets.currentText()!=request['sheet'] or len(matches)!=1:
+                self._generator_stage='failed';self.generator_note.setText('Nie uruchomiono generatora: nie potwierdzono tego samego przycisku i makra w zmienionej kopii. Wybierz przycisk w arkuszu.');return
+            index,control=matches[0];self.native_controls.setCurrentIndex(index)
+            self._pdf_destination=request['destination'];self._pdf_destination_confirmed=True;self.pdf_target_path.setText(request['destination'])
+            self._generator_stage='running';self.generator_note.setText('Uruchamiam generator w zmienionej kopii. Zapis PDF zostanie potwierdzony dopiero po znalezieniu pliku.');self.body_tabs.setCurrentIndex(1)
+            if not self.submit('run_control_macro',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'control_id':control['id']}):
+                self._generator_stage='failed';self.generator_note.setText('Nie zlecono generatora. Sprawdź stan sesji przed kolejną próbą.')
         def available_work_area(self):
             handle=self.windowHandle();parent=self.parentWidget()
             screen=handle.screen() if self.isVisible() and handle else parent.screen() if parent else self.screen()
@@ -12940,9 +13106,10 @@ def native_ui_types():
         def copy_error_details(self):QW.QApplication.clipboard().setText(self.error_report())
         def show_error_details(self):
             if not self._last_failure:return
-            dialog=FormDialog('Szczegóły błędu sesji Excel',self);text=QW.QPlainTextEdit();text.setReadOnly(True);text.setPlainText(self.error_report())
-            text.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.WidgetWidth);text.setWordWrapMode(QG.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere);dialog.add_widget(text)
-            dialog.add_widget(button('Kopiuj szczegóły',self.copy_error_details));limited_dialog_size(dialog,720,480);dialog.exec()
+            dialog=QW.QDialog(self);dialog.setWindowTitle('Szczegóły błędu sesji Excel');layout=QW.QVBoxLayout(dialog)
+            if self._last_prompts or self._snapshot.get('state')=='busy':layout.addWidget(label('To szczegóły wcześniejszego błędu. Bieżące zadanie lub pytanie Excela jest pokazane w głównym oknie sesji.',True,True))
+            text=QW.QPlainTextEdit();text.setReadOnly(True);text.setPlainText(self.error_report());text.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.WidgetWidth);text.setWordWrapMode(QG.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere);layout.addWidget(text,1)
+            layout.addWidget(button('Kopiuj szczegóły',self.copy_error_details));layout.addWidget(button('Zamknij',dialog.accept));limited_dialog_size(dialog,720,480);dialog.exec()
         def remember_failure(self,message,details='',code='',operation=''):
             message=str(message or 'Nie udało się wykonać operacji Excela.');details=str(details or '')
             # Older workers can still expose raw COM tuples. Keep those in the
@@ -13123,10 +13290,16 @@ def native_ui_types():
             self.save_working_button.setEnabled(usable)
             self.save_session_button.setEnabled(usable)
             self.inspect_vba_button.setEnabled(bool(usable and not self._last_prompts));self.diagnostics_enabled.setEnabled(not self._closing and not self._command_pending and state not in ('busy','starting','closing'))
+            self.generator_frame.setVisible(bool(self._generator_request));waiting=self._generator_stage=='needs_content'
+            self.generator_show.setVisible(waiting);self.generator_continue.setVisible(waiting)
+            self.generator_show.setEnabled(bool(waiting and self._snapshot.get('owned') and not self._closing and not self._show_pending))
+            self.generator_continue.setEnabled(bool(waiting and state in ('ready','disconnected') and not self._closing and not self._command_pending and not self._last_prompts and not self._action_pending and not self._snapshot.get('handoff_incomplete')))
             self.patch_frame.setVisible(bool(active or self._patch_question) and not self._last_prompts)
-            self.patch_button.setEnabled(bool(ready and not self._action_pending and not self._last_prompts and not self._queued and not blocked and self._patch_question and self._patch_preview is None))
+            saved_patch=bool(state=='disconnected' and self._controller and not self._snapshot.get('finished') and not self._snapshot.get('handoff_incomplete') and not self._closing and not self._command_pending)
+            self.patch_button.setEnabled(bool((ready and not blocked or saved_patch) and not self._action_pending and not self._last_prompts and not self._queued and self._patch_question and self._patch_preview is None))
             self.patch_diagnostic_button.setVisible(bool(active or self._patch_question));self.patch_diagnostic_button.setEnabled(self.patch_button.isEnabled())
-            if state=='disconnected':patch_status='Utracono połączenie ze skoroszytem. Najpierw kliknij „Połącz ponownie z Excelem”.'
+            if state=='disconnected' and self._patch_question and not self._snapshot.get('handoff_incomplete'):patch_status='Excel jest rozłączony. „Pierdol to” użyje ostatniej zapisanej kopii sesji, bez niezapisanych zmian. Możesz przygotować zmianę bez ponownego łączenia.'
+            elif state=='disconnected':patch_status='Excel jest rozłączony. Nie ma zapamiętanego pytania lub kopia sesji jest niekompletna; zmiana VBA nie jest dostępna.'
             elif self._last_prompts or state=='busy' or self._command_pending:patch_status='Odpowiedz na pytania Excela i poczekaj na zakończenie bieżącej operacji.'
             elif not self._patch_question:patch_status='Pivot nie odczytał jeszcze pytania walidacji w tej sesji. Uruchom makro; odpowiedź możesz wybrać tutaj albo w Excelu.'
             elif blocked:patch_status='Najpierw rozwiąż problem sesji pokazany powyżej. Zmiana VBA wymaga kompletnej kopii skoroszytu.'
@@ -13180,7 +13353,10 @@ def native_ui_types():
             if self._snapshot.get('handoff_incomplete') and action in ('run_macro','run_control_macro','apply_edits'):
                 self.message.setText(EXCEL_HANDOFF_INCOMPLETE_MESSAGE);self.show_message();self.update_controls();return False
             reconnect=action=='reconnect_workbook' and self._snapshot.get('state')=='disconnected'
-            if self._command_pending or (self._snapshot.get('state')!='ready' and not reconnect):
+            saved_patch=action in ('prepare_vba_patch','apply_vba_patch') and args.get('source_mode')=='saved_file' and self._snapshot.get('state')=='disconnected'
+            if saved_patch and (self._last_prompts or self._action_pending or self._snapshot.get('handoff_incomplete')):return False
+            if saved_patch and action=='apply_vba_patch' and (self._patch_plan.get('source_mode')!='saved_file' or args.get('token')!=self._patch_plan.get('token')):return False
+            if self._command_pending or (self._snapshot.get('state')!='ready' and not reconnect and not saved_patch):
                 if background or self._queued is not None or not self.background_read_active():return False
                 self._queued=(action,clone(args));self.message.setText('Kończę odczyt arkusza w Excelu, potem wykonam polecenie.');self.update_controls();return True
             controller=self._controller;epoch=self._epoch;service=self._host_window.service;previous_result_key=self._last_result_key;self._command_pending=True;self._auto_read=bool(background);self._last_result_key=None
@@ -13210,6 +13386,10 @@ def native_ui_types():
             def failed(error):
                 if self._disposed or epoch!=self._epoch:return
                 self._command_pending=False;self._last_result_key=previous_result_key
+                if action=='apply_vba_patch':self._patch_run_request=None
+                if self._generator_request and self._generator_stage in ('running','reconnecting') and action in ('run_control_macro','reconnect_workbook'):
+                    self._generator_stage='needs_content' if action=='reconnect_workbook' else 'failed';self.generator_note.setText('Nie zlecono polecenia. '+str(error))
+                if self._generator_request and self._generator_stage=='reading_sheet' and action=='read_range':self._generator_stage='failed';self.generator_note.setText('Nie odczytano arkusza generatora. '+str(error))
                 if action in ('run_macro','run_control_macro'):self._pdf_attempt_destination=''
                 if background:self.poll();self.native_note.setText('Nie odświeżono podglądu: '+str(error));return
                 self._close_after_save=False;self.poll();self.message.setText(str(error));self.remember_failure(str(error),operation=action);self.update_controls()
@@ -13359,7 +13539,8 @@ def native_ui_types():
             try:snapshot=self._controller.poll()
             except Exception as exc:self.message.setText(safe_error(exc));self.remember_failure(safe_error(exc),operation='session');self.update_controls();return
             previous=self.session_identity();previous_state=self._snapshot.get('state');self._snapshot=snapshot;identity=self.session_identity();state=snapshot.get('state')
-            if state=='disconnected' and previous_state!='disconnected':
+            saved_result=isinstance(snapshot.get('last_result'),dict) and snapshot['last_result'].get('source_mode')=='saved_file' and snapshot.get('last_operation') in ('prepare_vba_patch','apply_vba_patch')
+            if state=='disconnected' and previous_state!='disconnected' and not saved_result:
                 self._queued=None;self._patch_plan={}
                 if self._patch_preview is not None:
                     with contextlib.suppress(RuntimeError):self._patch_preview.reject()
@@ -13373,16 +13554,17 @@ def native_ui_types():
                 self._auto_read=False;self._quiet_read_error=bool(snapshot.get('error')) and snapshot.get('error_operation')=='read_range' and state!='disconnected' and snapshot.get('error_code')!='workbook_reloaded'
             names={'starting':'Otwieranie kopii w Excelu…','ready':'Sesja Excela gotowa.','busy':'Excel wykonuje zadanie…','disconnected':'Utracono połączenie z Excelem.','closing':'Zamykanie własnej sesji Excela…','closed':'Sesja Excela zakończona.','error':'Nie udało się wykonać operacji Excela.'}
             status='Excel gotowy · odświeżam podgląd arkusza…' if self.background_read_active() else names.get(state,str(state or ''))
+            if state=='busy' and snapshot.get('operation') in ('prepare_vba_patch','apply_vba_patch'):status='Przygotowuję zmianę VBA…'
             self.state_note.setText(status+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
             self.update_vba_source(snapshot)
             result=snapshot.get('last_result')
             if result and snapshot.get('error') and not self._command_pending and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);self.apply_native_result(result,allow_reveal=False)
                 if isinstance(result.get('pdf_outputs'),dict):self._pdf_attempt_destination=''
-            if result and state=='ready' and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
+            if result and (state=='ready' or (state=='disconnected' and saved_result)) and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);destination=result.get('destination') if isinstance(result,dict) else None
                 operation=(result.get('action') or snapshot.get('last_operation') or snapshot.get('operation') or '') if isinstance(result,dict) else ''
-                if operation and operation not in ('open','read_range','activate_sheet','show_excel','reveal_control','inspect_vba') and not completed_background and not snapshot.get('handoff_incomplete'):self.clear_failure()
+                if operation and operation not in ('open','read_range','activate_sheet','show_excel','reveal_control','inspect_vba') and not completed_background and not snapshot.get('handoff_incomplete') and state!='disconnected':self.clear_failure()
                 if operation in ('save_session','save_working','save_copy') and isinstance(result,dict) and (result.get('saved_path') or destination):self.saved_copy_path=str(result.get('saved_path') or destination);self.saved_copy_revision=str(result.get('saved_revision',''))
                 if operation not in ('read_range','open'):
                     done={'show_excel':'Otwarto okno tej sesji Excela.','reveal_control':'Przycisk jest wskazany w Excelu. Kliknij „Uruchom” tutaj albo ten przycisk w Excelu.','run_control_macro':'Makro zakończyło działanie.','run_macro':'Makro zakończyło działanie.','apply_edits':'Zapisano zmianę komórki w Excelu.'}
@@ -13402,10 +13584,15 @@ def native_ui_types():
                     outputs=self._macro_pdf_outputs or {};found=outputs.get('files') or [];target=self._pdf_attempt_destination;self._pdf_attempt_destination=''
                     if target and len(found)==1 and outputs.get('complete') is True:self.publish_macro_pdf(found[0],outputs['scope'],target)
                     if self.body_tabs.currentWidget() is not self.vba_scroll or not self._diag_active:self.body_tabs.setCurrentIndex(1)
+                    if self._generator_request and self._generator_stage=='running':
+                        self._generator_stage='done';self.generator_note.setText('Generator zakończył próbę. '+('Znaleziono PDF; stan zapisu i miejsce docelowe są poniżej.' if found else 'Nie potwierdzono utworzenia PDF. Sprawdź pytania i komunikaty makra; nie ponawiam go automatycznie.'))
                 if operation=='prepare_vba_patch':self.present_vba_patch(snapshot.get('vba_patch') or result.get('vba_patch') or {})
                 elif operation=='apply_vba_patch':
                     self._patch_result=clone(result.get('vba_patch_applied') or result);path=str(self._patch_result.get('path') or self._patch_result.get('patched_path') or '')
                     self.patch_note.setText('Utworzono kopię z pominiętym warunkiem: '+path+'\nOtwórz ją w Pivocie i uruchom generator. Utworzenie PDF wymaga osobnego sprawdzenia.');self.patch_open_button.setVisible(bool(path));self.body_tabs.setCurrentIndex(1)
+                    request=self._patch_run_request;self._patch_run_request=None
+                    if request and request.get('token')==self._patch_result.get('token') and request.get('candidate_id')==self._patch_result.get('candidate_id'):
+                        self.patch_note.setText('Utworzono zmienioną kopię. Otwieram ją do jednej próby generatora i zapisu PDF: '+path);self.open_vba_patch_copy(request)
                 if self._close_after_save and operation in ('save_session','save_working','save_copy'):self._close_after_save=False;self.begin_close()
             elif not self._native_book_id and state=='ready' and snapshot.get('snapshot'):self.apply_native_result(snapshot)
             if snapshot.get('error'):
@@ -13417,6 +13604,10 @@ def native_ui_types():
                 else:
                     self.message.setText(str(snapshot['error']))
                     self.remember_failure(snapshot['error'],snapshot.get('error_details',''),snapshot.get('error_code',''),snapshot.get('error_operation',''))
+                if not self._command_pending and snapshot.get('error_operation') in ('prepare_vba_patch','apply_vba_patch'):self._patch_run_request=None;self.patch_note.setText('Nie przygotowano zmiany VBA. '+str(snapshot['error']))
+                if self._generator_request and self._generator_stage=='running' and not self._command_pending and state!='busy' and snapshot.get('error_operation') in ('run_macro','run_control_macro'):
+                    unavailable=snapshot.get('error_code')=='macro_unavailable';self._generator_stage='needs_content' if unavailable else 'failed'
+                    self.generator_note.setText('Excel nie udostępnił generatora. Pokaż tę kopię i sprawdź pasek zabezpieczeń. Jeśli jest „Włącz zawartość”, kliknij go w Excelu, a następnie „Włączono zawartość — uruchom generator” tutaj. Ta decyzja ponowi generator raz.' if unavailable else 'Próba generatora nie powiodła się. Sprawdź błąd i wynik przed ponowieniem; nie uruchamiam makra automatycznie.')
                 self._close_after_save=False
             if state=='ready' and self._last_failure and not self.background_read_active():
                 self.state_note.setText('Sesja Excela gotowa · ostatnia operacja nie powiodła się.'+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
@@ -13439,7 +13630,7 @@ def native_ui_types():
             if identity and state not in ('closed','error') and not self._scan_pending and not self._action_pending and time.monotonic()-self._last_scan>=.75:self.scan_prompts(identity)
             elif not identity and self._native_digest is not None:self._native_digest=None;self.render_prompts([])
             if preparation_needed:self.body_tabs.setCurrentWidget(self.options_scroll)
-            self.update_controls()
+            self.advance_patched_generator();self.update_controls()
             # Each read is hundreds of COM calls. Mirror Excel only while this view is looked at; never while Excel asks something.
             interval=10 if snapshot.get('error') else 3
             if (self._native_book_id and state=='ready' and not self.blocking_error() and not self._closing and not self._command_pending and self._queued is None and not self._last_prompts
@@ -22491,6 +22682,38 @@ send('closed')
                     with self.subTest(values=tuple(values)),self.assertRaises(UserError):controller.submit('apply_vba_patch',values)
                 send.reset_mock();jid=controller.submit('apply_vba_patch',{'token':'a'*32,'candidate_id':'b'*64,'destination':'ignored.xlsm'});controller.dispatcher.join(2)
                 send.assert_called_once();command=send.call_args.args[0];self.assertEqual(command['action'],'apply_vba_patch');self.assertNotIn('destination',command);self.assertIsNone(controller.pending);self.finish_vba_command(controller,jid,'apply_vba_patch')
+        def test_vba_saved_patch_remains_disconnected_with_preview_and_no_excel_process(self):
+            controller=self.start();controller.state['state']='disconnected';controller.owned_process.running=False
+            with patch.object(controller,'_send') as send:
+                jid=controller.submit('prepare_vba_patch',{'prompt_text':'Question','source_mode':'saved_file'});controller.dispatcher.join(2)
+                self.assertEqual(send.call_args.args[0]['source_mode'],'saved_file');report=self.patch_report(controller,source_mode='saved_file',source_note='Saved copy excludes unsaved changes',saved_source_mtime='2026-10-08T10:00:00+00:00',file_sha256='c'*64)
+                self.finish_vba_command(controller,jid,'prepare_vba_patch',{'source_mode':'saved_file','action':'prepare_vba_patch','vba_patch':report});state=controller.poll()
+                self.assertEqual(state['state'],'disconnected');self.assertEqual(state['vba_patch']['token'],report['token']);self.assertEqual(state['vba_patch']['source_note'],report['source_note']);self.assertEqual(state['vba_patch']['saved_source_mtime'],report['saved_source_mtime'])
+                jid=controller.submit('apply_vba_patch',{'token':'a'*32,'candidate_id':'b'*64,'source_mode':'saved_file'});controller.dispatcher.join(2)
+                self.finish_vba_command(controller,jid,'apply_vba_patch',{'source_mode':'saved_file','action':'apply_vba_patch','vba_patch_applied':{'path':'new-copy.xlsm'}})
+                self.assertEqual(controller.poll()['state'],'disconnected');self.assertFalse(controller.poll()['vba_patch']);self.assertEqual(send.call_count,2)
+        def test_vba_saved_patch_error_and_dispatch_failure_keep_disconnected_state(self):
+            controller=self.start();controller.state['state']='disconnected'
+            with patch.object(controller,'_send'):
+                jid=controller.submit('prepare_vba_patch',{'prompt_text':'Question','source_mode':'saved_file'});controller.dispatcher.join(2)
+                controller._consume({'session_id':controller.session_id,'id':jid,'operation':'prepare_vba_patch','event':'error','message':'Unsupported saved file'})
+                self.assertEqual(controller.poll()['state'],'disconnected');self.assertIn('Unsupported',controller.poll()['error'])
+            with patch.object(controller,'_send',side_effect=OSError('closed pipe')):
+                controller.submit('prepare_vba_patch',{'prompt_text':'Question','source_mode':'saved_file'});controller.dispatcher.join(2)
+                self.assertEqual(controller.poll()['state'],'disconnected');self.assertIn('closed pipe',controller.poll()['error'])
+        def test_vba_saved_patch_requires_explicit_mode_idle_state_and_live_worker(self):
+            controller=self.start()
+            with patch.object(controller,'_send'):
+                for invalid in ('automatic','',None,True):
+                    with self.subTest(mode=invalid),self.assertRaises(UserError):controller.submit('prepare_vba_patch',{'prompt_text':'Question','source_mode':invalid})
+                for state in ('busy','closing','closed','new'):
+                    controller.state['state']=state
+                    with self.subTest(state=state),self.assertRaises(UserError):controller.submit('prepare_vba_patch',{'prompt_text':'Question','source_mode':'saved_file'})
+                controller.state['state']='disconnected'
+                with self.assertRaises(UserError):controller.submit('prepare_vba_patch',{'prompt_text':'Question'})
+                with patch.object(controller.process,'poll',return_value=1),self.assertRaises(UserError):controller.submit('prepare_vba_patch',{'prompt_text':'Question','source_mode':'saved_file'})
+                controller.state['state']='ready';jid=controller.submit('prepare_vba_patch',{'prompt_text':'Question','source_mode':'saved_file'});controller.dispatcher.join(2);self.finish_vba_command(controller,jid,'prepare_vba_patch')
+                self.assertEqual(controller.poll()['state'],'ready')
         def test_vba_patch_preview_stays_out_of_result_history_callbacks_and_manifest(self):
             controller=self.start();callbacks=[];controller.on_event=callbacks.append
             with patch.object(controller,'_send'):
@@ -22749,6 +22972,82 @@ send('closed')
             with patch.object(self.worker,'session_info',side_effect=RuntimeError('Office busy while listing sheets')):
                 self.worker.handle_command(dict(command,action='run_macro',name='GenerateDocument'))
             error=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(error['code'],'excel_disconnected');self.assertFalse(any(name=='Run' for name,_ in self.excel.calls));self.assertTrue(self.worker.owned_excel)
+        def dead_application(self,error=None):
+            error=error or self.lost_com()
+            class DisconnectedApplication:
+                @property
+                def Workbooks(inner):raise error
+            return DisconnectedApplication()
+        def test_reconnect_refreshes_dead_application_from_native_window_without_replaying_macro(self):
+            command=self.connection_ready();self.worker.excel=self.dead_application();self.worker.book=self.disconnected_book()
+            owned=object();self.worker.owned_process=owned;self.worker.control_refs['old']={'shape':object()};self.excel.EnableEvents=False;self.excel.DisplayAlerts=False
+            with patch(__name__+'.excel_native_application',return_value=self.excel) as native,patch.object(self.worker,'read_range',return_value={'controls':[]}):
+                self.worker.handle_command(dict(command,action='run_macro',name='GenerateDocument'))
+            native.assert_called_once_with(self.worker.pythoncom,owned)
+            result=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(result['code'],'workbook_reloaded');self.assertIs(self.worker.excel,self.excel);self.assertIs(self.worker.book,self.book)
+            self.assertFalse(self.worker.control_refs);self.assertFalse(self.excel.EnableEvents);self.assertFalse(self.excel.DisplayAlerts);self.assertFalse(any(name in ('Run','Quit') for name,_ in self.excel.calls));self.assertEqual(len(self.open_calls),1)
+        def test_reconnect_does_not_refresh_application_for_busy_or_mismatched_workbook(self):
+            self.connection_ready()
+            for replacement in (self.dead_application(self.lost_com(0x8001010A)),self.excel):
+                self.worker.excel=replacement;self.book.FullName=str(self.path.parent/'foreign.xlsm')
+                with patch(__name__+'.excel_native_application') as native,self.assertRaises(_ExcelDisconnected):self.worker.reconnect_workbook()
+                native.assert_not_called()
+        def test_native_reconnect_failure_or_foreign_path_preserves_previous_references(self):
+            self.connection_ready();old=self.dead_application();book=self.disconnected_book();self.worker.excel=old;self.worker.book=book
+            for failure in (True,False):
+                self.book.FullName=str(self.path.parent/'foreign.xlsm')
+                with patch(__name__+'.excel_native_application',side_effect=_ExcelDisconnected('window unavailable') if failure else None,return_value=self.excel),self.assertRaises(_ExcelDisconnected):self.worker.reconnect_workbook()
+                self.assertIs(self.worker.excel,old);self.assertIs(self.worker.book,book)
+            self.assertEqual(len(self.open_calls),1);self.assertFalse(any(name in ('Run','Quit') for name,_ in self.excel.calls))
+        def native_reconnect_fixture(self):
+            nodes={10:(42,10,'XLMAIN'),11:(42,10,'EXCEL7'),20:(42,20,'XLMAIN'),21:(42,20,'EXCEL7'),30:(99,30,'XLMAIN'),31:(99,30,'EXCEL7')}
+            api=FakeCom(pid=lambda hwnd:nodes.get(hwnd,(0,0,''))[0],root=lambda hwnd:nodes.get(hwnd,(0,0,''))[1],class_name=lambda hwnd:nodes.get(hwnd,(0,0,''))[2],child=lambda root,hwnd:root!=hwnd and nodes.get(hwnd,(0,0,''))[1]==root)
+            api.windows=lambda parent=0,**kwargs:([hwnd for hwnd,(_,root,_) in nodes.items() if (root==parent and hwnd!=root) if parent] if parent else [hwnd for hwnd,(_,root,_) in nodes.items() if hwnd==root],True)
+            owned=FakeCom(pid=42,hwnd=10,alive=lambda:True);application=FakeCom(Hwnd=20)
+            return nodes,api,owned,application
+        def test_native_application_uses_only_owned_excel7_and_accepts_same_process_sdi_root(self):
+            nodes,api,owned,application=self.native_reconnect_fixture()
+            with patch(__name__+'._excel_native_dispatch',return_value=FakeCom(Application=application)) as acquire:
+                self.assertIs(excel_native_application(self.worker.pythoncom,owned,api),application)
+            acquire.assert_called_once_with(self.worker.pythoncom,11)
+        def test_native_application_finds_recreated_root_only_in_retained_owned_process(self):
+            nodes,api,owned,application=self.native_reconnect_fixture();nodes.pop(10);nodes.pop(11)
+            with patch(__name__+'._excel_native_dispatch',return_value=FakeCom(Application=application)) as acquire:
+                self.assertIs(excel_native_application(self.worker.pythoncom,owned,api),application)
+            acquire.assert_called_once_with(self.worker.pythoncom,21)
+        def test_native_application_never_attaches_to_exited_or_foreign_process(self):
+            for scenario in ('exited','foreign','no_owned_root','truncated'):
+                nodes,api,owned,application=self.native_reconnect_fixture()
+                if scenario=='exited':owned.alive=lambda:False
+                elif scenario=='foreign':application.Hwnd=30
+                elif scenario=='no_owned_root':nodes={k:v for k,v in nodes.items() if v[0]!=42};api.pid=lambda hwnd:nodes.get(hwnd,(0,0,''))[0]
+                else:api.windows=lambda *args,**kwargs:([],False)
+                with self.subTest(scenario=scenario),patch(__name__+'._excel_native_dispatch',return_value=FakeCom(Application=application)) as acquire,self.assertRaises(_ExcelDisconnected):excel_native_application(self.worker.pythoncom,owned,api)
+                if scenario!='foreign':acquire.assert_not_called()
+        def test_native_application_rechecks_owner_after_acquiring_dispatch(self):
+            nodes,api,owned,application=self.native_reconnect_fixture()
+            def changed(*_):owned.alive=lambda:False;return FakeCom(Application=application)
+            with patch(__name__+'._excel_native_dispatch',side_effect=changed),self.assertRaises(_ExcelDisconnected):excel_native_application(self.worker.pythoncom,owned,api)
+        @unittest.skipUnless(os.name=='nt','Windows native COM pointer boundary')
+        def test_native_dispatch_uses_nativeom_iid_and_releases_api_reference_on_wrap_failure(self):
+            import ctypes as c
+            for fails in (False,True):
+                releases=[];calls=[]
+                release=c.WINFUNCTYPE(c.c_uint32,c.c_void_p)(lambda this:releases.append(this) or 1)
+                table=(c.c_void_p*3)(None,None,c.cast(release,c.c_void_p).value)
+                class Interface(c.Structure):_fields_=[('vtable',c.POINTER(c.c_void_p))]
+                native_object=Interface(table);address=c.addressof(native_object)
+                def accessible(hwnd,object_id,iid,out):
+                    calls.append((hwnd,object_id,c.string_at(iid,16)));c.cast(out,c.POINTER(c.c_void_p))[0]=address;return 0
+                def wrap(pointer,iid):
+                    self.assertEqual((pointer,iid),(address,'dispatch'))
+                    if fails:raise RuntimeError('wrapper failed')
+                    return 'inert dispatch'
+                com=FakeCom(ObjectFromAddress=wrap,IID_IDispatch='dispatch')
+                if fails:
+                    with self.assertRaisesRegex(RuntimeError,'wrapper failed'):_excel_native_dispatch(com,11,accessible)
+                else:self.assertIsInstance(_excel_native_dispatch(com,11,accessible),_ExcelDispatch)
+                self.assertEqual(releases,[address]);self.assertEqual(calls,[(11,0xfffffff0,uuid.UUID('00020400-0000-0000-c000-000000000046').bytes_le)])
         def test_live_namesake_proxy_replacement_also_requires_fresh_ids_before_macro(self):
             command=self.connection_ready();old_sid=self.worker.sheet_id(self.sheet)
             self.worker.book=FakeCom(Name=self.book.Name,FullName=str(self.path),Worksheets=self.book.Worksheets)
@@ -22955,6 +23254,42 @@ send('closed')
         def prepared_patch(self):
             event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu',answer_text='Tak')
             self.assertEqual(event['event'],'done',event);report=event['result']['vba_patch'];self.assertEqual(len(report['candidates']),1,report);return report
+        def offline_patch_fixture(self,companions=()):
+            original=self.patch_fixture(companions)
+            class NoOffice:
+                def __getattribute__(inner,name):raise AssertionError('File-only patch touched Office: '+name)
+            self.worker.excel=NoOffice();self.worker.book=NoOffice()
+            self.enterContext(patch.object(self.worker,'preflight_connection',side_effect=AssertionError('COM preflight called')))
+            self.enterContext(patch.object(self.worker,'session_info',side_effect=AssertionError('COM session metadata called')))
+            self.enterContext(patch.object(self.worker,'session_save_path',side_effect=AssertionError('COM live workbook path called')))
+            return original
+        def prepared_saved_patch(self):
+            event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu',answer_text='Nie',source_mode='saved_file')
+            self.assertEqual(event['event'],'done',event);self.assertEqual(event['result']['source_mode'],'saved_file');self.assertEqual(event['result']['action'],'prepare_vba_patch');return event['result']['vba_patch']
+        def test_vba_saved_patch_prepare_and_apply_never_dereference_office(self):
+            companion=self.path.parent/'known.csv';companion.write_bytes(b'reference data');original=self.offline_patch_fixture([companion.name]);before=self.path.read_bytes();original_before=original.read_bytes()
+            plan=self.prepared_saved_patch();snapshot=Path(self.worker.vba_patch_plan['snapshot']);self.assertEqual(snapshot.read_bytes(),before);self.assertFalse(self.copy_events)
+            self.assertEqual(plan['source_mode'],'saved_file');self.assertEqual(plan['file_sha256'],file_digest(self.path));self.assertTrue(plan['saved_source_mtime']);self.assertIn('niezapisane',plan['source_note']);self.assertEqual(len(plan['candidates']),1)
+            event=self.session_command('apply_vba_patch',source_mode='saved_file',token=plan['token'],candidate_id=plan['candidates'][0]['id']);self.assertEqual(event['event'],'done',event)
+            output=event['result']['vba_patch_applied'];self.assertEqual(output['source_mode'],'saved_file');self.assertEqual(Path(output['path']).parent.joinpath(companion.name).read_bytes(),companion.read_bytes());self.assertEqual(original.read_bytes(),original_before);self.assertEqual(self.path.read_bytes(),before);self.assertFalse(output['verified'])
+        def test_vba_saved_patch_errors_never_probe_disconnected_office(self):
+            self.offline_patch_fixture();self.path.unlink()
+            event=self.session_command('prepare_vba_patch',prompt_text='Question',source_mode='saved_file');self.assertEqual(event['event'],'error');self.assertIsNone(self.worker.vba_patch_plan);self.assertFalse(self.copy_events);self.assertNotIn('File-only patch touched Office',event['details'])
+        def test_vba_saved_patch_rejects_other_workbook_and_source_mode_mismatch(self):
+            self.offline_patch_fixture();event=self.session_command('prepare_vba_patch',prompt_text='Question',macro_name="'foreign.xlsm'!Generate",source_mode='saved_file');self.assertEqual(event['event'],'error');self.assertFalse(self.copy_events)
+            plan=self.prepared_saved_patch();self.worker.vba_patch_plan['source_mode']='live'
+            event=self.session_command('apply_vba_patch',source_mode='saved_file',token=plan['token'],candidate_id=plan['candidates'][0]['id']);self.assertEqual(event['event'],'error');self.assertFalse(self.patch_calls)
+        def test_vba_saved_patch_refuses_original_alias_and_changed_saved_bytes(self):
+            original=self.offline_patch_fixture();working=self.worker.working_copy;self.worker.working_copy=str(original)
+            event=self.session_command('prepare_vba_patch',prompt_text='Question',source_mode='saved_file');self.assertEqual(event['event'],'error');self.worker.working_copy=working
+            copy=excel_copy_workbook
+            def race(source,destination,cancelled):
+                copy(source,destination,cancelled);Path(source).write_bytes(b'replaced saved workbook')
+            with patch(__name__+'.excel_copy_workbook',side_effect=race):event=self.session_command('prepare_vba_patch',prompt_text='Question',source_mode='saved_file')
+            self.assertEqual(event['event'],'error');self.assertIn('zmieniła',event['message']);self.assertIsNone(self.worker.vba_patch_plan)
+        def test_vba_saved_patch_keeps_frozen_snapshot_after_later_saved_file_changes(self):
+            self.offline_patch_fixture();plan=self.prepared_saved_patch();snapshot=Path(self.worker.vba_patch_plan['snapshot']);frozen=snapshot.read_bytes();self.path.write_bytes(b'new saved version after review')
+            event=self.session_command('apply_vba_patch',source_mode='saved_file',token=plan['token'],candidate_id=plan['candidates'][0]['id']);self.assertEqual(event['event'],'done',event);self.assertEqual(snapshot.read_bytes(),frozen);self.assertEqual(self.path.read_bytes(),b'new saved version after review');self.assertEqual(event['result']['vba_patch_applied']['saved_source_mtime'],plan['saved_source_mtime'])
         def test_prepare_vba_patch_captures_copy_without_saving_or_changing_live_workbook(self):
             original=self.patch_fixture();original_bytes=original.read_bytes();working_bytes=self.path.read_bytes();self.excel.EnableEvents=False;self.excel.DisplayAlerts=False;self.excel.AutomationSecurity=3
             plan=self.prepared_patch();snapshot=Path(self.worker.vba_patch_plan['snapshot'])
@@ -27111,7 +27446,7 @@ def ui_test():
             dialog,controller,instances,scan,action,prompt=self.vba_patch_session();dialog.present_vba_patch(self.vba_patch_plan_fixture());self.assertIsNotNone(dialog._patch_preview);question=dict(dialog._patch_question)
             controller.snapshot.update(state='disconnected',operation='',last_result={},error='Utracono połączenie z obiektem skoroszytu.',error_code='excel_disconnected',error_operation='run_control_macro');dialog.poll();dialog.body_tabs.setCurrentIndex(1);app.processEvents();before=list(controller.calls)
             self.assertIsNone(dialog._patch_preview);self.assertEqual(dialog._patch_plan,{});self.assertEqual(dialog._patch_question,question)
-            self.assertTrue(dialog.patch_button.isVisible());self.assertFalse(dialog.patch_button.isEnabled());self.assertTrue(dialog.patch_status.text().strip());self.assertFalse(dialog.prepare_vba_patch());self.assertEqual(controller.calls,before)
+            self.assertTrue(dialog.patch_button.isVisible());self.assertTrue(dialog.patch_button.isEnabled());self.assertIn('zapisanej kopii',dialog.patch_status.text());self.assertEqual(controller.calls,before)
             self.assertTrue(dialog.reconnect_button.isVisible());self.assertTrue(dialog.reconnect_button.isEnabled());self.assertNotIn('Sesja Excela gotowa',dialog.state_note.text())
             dialog.reconnect_button.click();dialog.reconnect_button.click();self.wait(lambda:not dialog._command_pending)
             self.assertEqual([call for call in controller.calls if call[0]=='reconnect_workbook'],[('reconnect_workbook',{})]);self.assertFalse(any(call[0] in ('prepare_vba_patch','apply_vba_patch','run_macro','run_control_macro') for call in controller.calls))
@@ -27127,6 +27462,107 @@ def ui_test():
             for revision in ('','wrong-hash',None):
                 dialog._patch_result={'path':str(copy),'sha256':revision};dialog.open_vba_patch_copy()
                 self.assertEqual(len(instances),1);self.assertIsNone(dialog._patch_open_dialog);self.assertIn('Brak potwierdzonej wersji',dialog.patch_note.text())
+        def test_office_vba_patch_saved_copy_previews_and_applies_while_excel_stays_disconnected(self):
+            dialog,controller,instances,scan,action,prompt=self.vba_patch_session()
+            controller.snapshot.update(state='disconnected',operation='',last_result={},error='Utracono połączenie.',error_code='excel_disconnected',error_operation='reconnect_workbook');dialog.poll()
+            dialog.patch_button.click();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual(controller.calls[-1],('prepare_vba_patch',{'prompt_text':prompt['text'],'answer_text':'Nie','macro_name':'ThisWorkbook.GenerateDocument','source_mode':'saved_file'}))
+            self.assertIn('Niezapisane',dialog.patch_note.text());self.assertNotIn('Excel wykonuje',dialog.state_note.text())
+            plan=dict(self.vba_patch_plan_fixture(),source_mode='saved_file',source_note='Zapis na dysku, bez zmian z pamięci Excela.')
+            result={'action':'prepare_vba_patch','source_mode':'saved_file','file_only':True,'workbook_id':'native-book'}
+            controller.snapshot.update(state='disconnected',operation='',last_operation='prepare_vba_patch',last_result=result,error='',error_code='',error_operation='',vba_patch=plan);dialog.poll();app.processEvents()
+            preview=dialog._patch_preview;self.assertIsNotNone(preview);self.assertEqual(dialog._patch_plan['source_mode'],'saved_file');self.assertTrue(any('Niezapisane zmiany' in label.text() for label in preview.findChildren(QW.QLabel)))
+            dialog.poll();self.assertIs(dialog._patch_preview,preview)
+            next(b for b in preview.findChildren(QW.QPushButton) if b.text()=='Zastosuj w nowej kopii').click();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual(controller.calls[-1],('apply_vba_patch',{'token':'b'*32,'candidate_id':'a'*64,'source_mode':'saved_file'}))
+            destination=self.root/'offline-patched.xlsm';destination.write_bytes(b'INERT SAVED COPY FIXTURE')
+            applied={'path':str(destination),'sha256':file_digest(destination),'source_mode':'saved_file'}
+            controller.snapshot.update(state='disconnected',operation='',last_operation='apply_vba_patch',last_result={'action':'apply_vba_patch','source_mode':'saved_file','file_only':True,'vba_patch_applied':applied},error='',vba_patch={});dialog.poll();app.processEvents()
+            self.assertTrue(dialog.patch_open_button.isVisible());self.assertEqual(dialog._patch_result['path'],str(destination));self.assertIn('Utworzono kopię',dialog.patch_note.text());self.assertFalse(dialog.native_macro.isEnabled());self.assertIn('Utracono',dialog.state_note.text());self.assertEqual(len(instances),1)
+            self.assertFalse(any(call[0] in ('reconnect_workbook','run_macro','run_control_macro') for call in controller.calls))
+        def test_office_vba_patch_failed_live_capture_stops_progress_and_incomplete_copy_stays_blocked(self):
+            dialog,controller,instances,scan,action,prompt=self.vba_patch_session();dialog.patch_button.click();self.wait(lambda:not dialog._command_pending)
+            controller.snapshot.update(state='disconnected',operation='',last_result={},error='Połączenie zostało utracone.',error_code='excel_disconnected',error_operation='prepare_vba_patch');dialog.poll()
+            self.assertIn('Nie przygotowano',dialog.patch_note.text());self.assertNotIn('Przygotowuję kopię',dialog.patch_note.text());self.assertTrue(dialog.patch_button.isEnabled())
+            controller.snapshot['handoff_incomplete']=True;dialog.poll();before=list(controller.calls);self.assertFalse(dialog.patch_button.isEnabled());self.assertFalse(dialog.prepare_vba_patch());self.assertEqual(controller.calls,before)
+        def test_office_error_details_are_read_only_and_offer_close_without_apply(self):
+            from unittest import mock
+            dialog,controller=self.vba_source_session();dialog.remember_failure('Poprzedni błąd','0x800A03EC','macro_unavailable','run_control_macro');controller.snapshot.update(state='busy',operation='run_control_macro');dialog.poll();seen={}
+            def inspect(detail):
+                seen['buttons']=[button.text() for button in detail.findChildren(QW.QPushButton)];seen['texts']=[text.toPlainText() for text in detail.findChildren(QW.QPlainTextEdit)];seen['readonly']=all(text.isReadOnly() for text in detail.findChildren(QW.QPlainTextEdit));seen['notes']=[label.text() for label in detail.findChildren(QW.QLabel)];return 0
+            with mock.patch.object(QW.QDialog,'exec',inspect):dialog.show_error_details()
+            self.assertEqual(seen['buttons'],['Kopiuj szczegóły','Zamknij']);self.assertTrue(seen['readonly']);self.assertIn('0x800A03EC',seen['texts'][0]);self.assertTrue(any('wcześniejszego błędu' in note for note in seen['notes']))
+        def patched_generator_fixture(self,source_mode='live'):
+            from unittest import mock
+            parent,controller,instances,scan,action,prompt=self.vba_patch_session();plan=dict(self.vba_patch_plan_fixture(),source_mode=source_mode)
+            if source_mode=='saved_file':
+                controller.snapshot.update(state='disconnected',last_result={},error='Excel disconnected',error_code='excel_disconnected',error_operation='run_control_macro');parent.poll()
+                parent.apply_native_result({'workbook_id':'native-book','controls_invalidated':True});self.assertFalse(parent._native_controls)
+            parent.present_vba_patch(plan);preview=parent._patch_preview;target=self.root/'patched-generator-result.pdf'
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(target),'')):
+                next(b for b in preview.findChildren(QW.QPushButton) if b.text()=='Zastosuj i uruchom generator').click()
+            self.wait(lambda:not parent._command_pending);self.assertEqual(controller.calls[-1][0],'apply_vba_patch');self.assertEqual(len(instances),1)
+            patched=self.root/'patched-generator.xlsm';patched.write_bytes(b'INERT PATCHED GENERATOR; NEVER RUN WITH OFFICE')
+            applied={'path':str(patched),'sha256':file_digest(patched),'token':plan['token'],'candidate_id':plan['candidates'][0]['id']}
+            result={'action':'apply_vba_patch','source_mode':source_mode,'vba_patch_applied':applied}
+            controller.snapshot.update(state='disconnected' if source_mode=='saved_file' else 'ready',operation='',last_operation='apply_vba_patch',last_result=result,error='',error_code='',error_operation='');parent.poll();app.processEvents()
+            self.assertEqual(len(instances),2);child=parent._patch_open_dialog;child._timer.stop();self.addCleanup(lambda:(child.dispose(),child.close()) if ui['qt_object_alive'](child) else None)
+            self.assertEqual(child._office_context['source_revision'],applied['sha256']);self.assertEqual(child._generator_stage,'opening');self.assertEqual(instances[1].calls[0][1]['context']['sheet'],'Raport')
+            self.assertFalse(any(c[0] in ('run_macro','run_control_macro') for c in instances[1].calls));return parent,child,instances[1],target
+        def patched_generator_ready(self,child,controller,action='open',macro='ThisWorkbook.GenerateDocument'):
+            payload=self.native_excel_payload();payload.update(action=action);payload['snapshot']['controls'][0]['on_action']=macro
+            controller.snapshot.update(state='ready',operation='',last_operation=action,last_result=payload,error='',error_code='',error_operation='');child.poll();self.wait(lambda:not child._command_pending)
+        def test_office_vba_patch_run_cancelled_destination_leaves_preview_and_never_applies(self):
+            from unittest import mock
+            parent,controller,instances,scan,action,prompt=self.vba_patch_session();parent.present_vba_patch(self.vba_patch_plan_fixture());preview=parent._patch_preview;before=list(controller.calls)
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=('','')):
+                next(b for b in preview.findChildren(QW.QPushButton) if b.text()=='Zastosuj i uruchom generator').click()
+            self.assertEqual(controller.calls,before);self.assertIs(parent._patch_preview,preview);self.assertIsNone(parent._patch_run_request);self.assertEqual(len(instances),1)
+        def test_office_vba_patch_run_once_in_new_copy_and_publishes_only_observed_pdf(self):
+            parent,child,controller,target=self.patched_generator_fixture();self.patched_generator_ready(child,controller)
+            self.assertEqual(child._generator_stage,'running');self.assertEqual(child._pdf_attempt_destination,str(target));self.assertFalse(target.exists())
+            for _ in range(4):child.poll();parent.poll()
+            runs=[c for c in controller.calls if c[0]=='run_control_macro'];self.assertEqual(len(runs),1);self.assertEqual(runs[0][1]['control_id'],'native-control')
+            workspace=self.root/'patched-session';workspace.mkdir();controller.snapshot['workspace_path']=str(workspace);descriptor=self.macro_pdf_file(workspace)
+            self.macro_pdf_finish(child,controller,workspace,[descriptor]);self.wait(lambda:not child._pdf_publish_pending)
+            self.assertEqual(child._generator_stage,'done');self.assertEqual(target.read_bytes(),Path(descriptor['path']).read_bytes());self.assertEqual(child.macro_pdf_location.text(),str(target))
+            child.poll();self.assertEqual(len([c for c in controller.calls if c[0]=='run_control_macro']),1)
+        def test_office_vba_patch_run_after_disconnection_uses_saved_copy_and_reports_no_pdf(self):
+            parent,child,controller,target=self.patched_generator_fixture('saved_file');self.assertEqual(parent._snapshot['state'],'disconnected');self.patched_generator_ready(child,controller)
+            workspace=self.root/'patched-session';workspace.mkdir();controller.snapshot['workspace_path']=str(workspace);self.macro_pdf_finish(child,controller,workspace,[])
+            self.assertEqual(child._generator_stage,'done');self.assertIn('Nie potwierdzono',child.generator_note.text());self.assertFalse(target.exists());self.assertFalse(child._pdf_publish_pending)
+        def test_office_vba_patch_run_content_retry_reconnects_and_runs_only_after_explicit_continue(self):
+            parent,child,controller,target=self.patched_generator_fixture();self.patched_generator_ready(child,controller)
+            controller.snapshot.update(state='ready',operation='',last_result={},error='Makra wyłączone lub niedostępne.',error_code='macro_unavailable',error_operation='run_control_macro');child.poll();app.processEvents()
+            self.assertEqual(child._generator_stage,'needs_content');self.assertTrue(child.generator_continue.isEnabled());self.assertIn('Włącz zawartość',child.generator_note.text())
+            for _ in range(3):child.poll()
+            self.assertEqual(len([c for c in controller.calls if c[0]=='run_control_macro']),1)
+            child.generator_continue.click();child.generator_continue.click();self.wait(lambda:not child._command_pending);self.assertEqual(controller.calls[-1],('reconnect_workbook',{}))
+            controller.snapshot.update(state='disconnected',operation='',last_result={},error='Brak połączenia.',error_code='excel_disconnected',error_operation='reconnect_workbook');child.poll()
+            self.assertEqual(child._generator_stage,'needs_content');self.assertEqual(len([c for c in controller.calls if c[0]=='run_control_macro']),1)
+            child.generator_continue.click();self.wait(lambda:not child._command_pending);self.assertEqual(controller.calls[-1][0],'reconnect_workbook')
+            self.patched_generator_ready(child,controller,'reconnect_workbook');self.assertEqual(child._generator_stage,'running');self.assertEqual(child._pdf_attempt_destination,str(target))
+            for _ in range(3):child.poll()
+            self.assertEqual(len([c for c in controller.calls if c[0]=='run_control_macro']),2);self.assertFalse(target.exists())
+        def test_office_vba_patch_run_refuses_changed_control_macro(self):
+            parent,child,controller,target=self.patched_generator_fixture();self.patched_generator_ready(child,controller,macro='ThisWorkbook.OtherGenerator')
+            self.assertEqual(child._generator_stage,'failed');self.assertIn('tego samego',child.generator_note.text());self.assertFalse(any(c[0] in ('run_macro','run_control_macro') for c in controller.calls));self.assertFalse(target.exists())
+        def test_office_vba_patch_run_returns_to_requested_sheet_after_content_reload(self):
+            parent,child,controller,target=self.patched_generator_fixture();self.patched_generator_ready(child,controller)
+            controller.snapshot.update(state='ready',operation='',last_result={},error='Makro niedostępne.',error_code='macro_unavailable',error_operation='run_control_macro');child.poll()
+            child.continue_patched_generator();self.wait(lambda:not child._command_pending)
+            payload=self.native_excel_payload();payload.update(action='reconnect_workbook',controls_invalidated=True,active_sheet='Inny');payload['sheets'].append({'id':'other-sheet','name':'Inny','visible':True});payload['snapshot'].update(sheet_id='other-sheet',sheet='Inny',controls=[])
+            controller.snapshot.update(state='ready',operation='',last_operation='reconnect_workbook',last_result=payload,error='',error_code='',error_operation='');child.poll();self.wait(lambda:not child._command_pending)
+            self.assertEqual(child._generator_stage,'reading_sheet');self.assertEqual(controller.calls[-1][0],'read_range');self.assertEqual(controller.calls[-1][1]['sheet_id'],'sheet-1');self.assertEqual(len([c for c in controller.calls if c[0]=='run_control_macro']),1)
+            self.patched_generator_ready(child,controller,'read_range');self.assertEqual(child._generator_stage,'running');self.assertEqual(len([c for c in controller.calls if c[0]=='run_control_macro']),2)
+        def test_office_vba_patch_run_foreign_apply_result_cannot_open_generator(self):
+            from unittest import mock
+            parent,controller,instances,scan,action,prompt=self.vba_patch_session();parent.present_vba_patch(self.vba_patch_plan_fixture());preview=parent._patch_preview
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(self.root/'target.pdf'),'')):
+                next(b for b in preview.findChildren(QW.QPushButton) if b.text()=='Zastosuj i uruchom generator').click()
+            self.wait(lambda:not parent._command_pending);copy=self.root/'foreign.xlsm';copy.write_bytes(b'INERT OTHER COPY')
+            result={'action':'apply_vba_patch','vba_patch_applied':{'path':str(copy),'sha256':file_digest(copy),'token':'c'*32,'candidate_id':'a'*64}}
+            controller.snapshot.update(state='ready',operation='',last_operation='apply_vba_patch',last_result=result,error='');parent.poll();self.assertEqual(len(instances),1);self.assertIsNone(parent._patch_run_request)
         def macro_pdf_session(self):
             payload=self.native_excel_payload();payload['snapshot']['controls'][0]['caption']='Generuj PDF';dialog,controller=self.native_session(payload)
             workspace=self.root/'macro-session';workspace.mkdir();controller.snapshot['workspace_path']=str(workspace);dialog.poll();self.wait(lambda:not dialog._scan_pending)
@@ -27327,7 +27763,7 @@ def ui_test():
                 self.assertEqual([b.text() for b in dialog.native_prompt_host.findChildren(QW.QPushButton) if b.isVisible()],['Tak','Nie'])
                 answer=self.excel_button(dialog,'Nie');dialog.prompt_scroll.ensureWidgetVisible(answer,4,4);app.processEvents()
                 self.assertTrue(dialog.prompt_scroll.viewport().rect().contains(QC.QRect(answer.mapTo(dialog.prompt_scroll.viewport(),QC.QPoint(0,0)),answer.size())))
-                with mock.patch.object(ui['FormDialog'],'exec',return_value=0) as opened:dialog.previous_failure_button.click();opened.assert_called_once()
+                with mock.patch.object(QW.QDialog,'exec',return_value=0) as opened:dialog.previous_failure_button.click();opened.assert_called_once()
                 dialog.copy_error_details();self.assertIn(details,QW.QApplication.clipboard().text());self.assertEqual(dialog.history.toPlainText(),'Zachowana historia sesji')
                 dialog.remember_failure('Nowszy błąd',details+'\nnew','operation_failed','read_range');self.assertFalse(dialog.failure_frame.isVisible());self.assertTrue(dialog.previous_failure_button.isVisible())
                 dialog.render_prompts([]);app.processEvents();self.assertTrue(dialog.failure_frame.isVisible());self.assertFalse(dialog.previous_failure_button.isVisible());self.assertEqual(dialog.failure_text.toPlainText(),'Nowszy błąd');self.assertIn('new',dialog.error_report())
