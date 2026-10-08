@@ -4272,8 +4272,8 @@ def database_saved_join(raw):
 def database_graph_layout(objects,relations,sizes,available_width=1200,compact=False):
     """Deterministic component-first layout using real node dimensions.
 
-    Linked nodes sit in breadth-first layers, with neighbour ordering and
-    connection-dependent gutters. Disconnected components pack into shelves.
+    Graph-distance stress keeps connected neighbourhoods together in two
+    dimensions. Real card bounds and routing gutters never overlap.
     The UI may preserve user positions instead of applying this suggestion.
     """
     lookup={o['id']:o for o in objects};neighbors={k:set() for k in lookup};incoming=collections.Counter()
@@ -4313,37 +4313,80 @@ def database_graph_layout(objects,relations,sizes,available_width=1200,compact=F
     blocks=[]
     for component in components:
         root=min(component,key=lambda k:(-len(neighbors[k]),-incoming[k],key(k)))
-        levels={root:0};q=collections.deque([root])
+        ordered=[];seen={root};q=collections.deque([root])
         while q:
-            parent=q.popleft()
-            for child in sorted(neighbors[parent],key=key):
-                if child not in levels:levels[child]=levels[parent]+1;q.append(child)
-        cols=collections.defaultdict(list)
-        for k in component:cols[levels.get(k,0)].append(k)
-        for level in cols:cols[level].sort(key=key)
-        # Alternating barycentre sweeps put neighbours opposite each other,
-        # rather than sorting every column alphabetically across the arrows.
-        for sweep in range(8):
-            ranks={oid:i for items in cols.values() for i,oid in enumerate(items)}
-            for level in sorted(cols,reverse=bool(sweep%2)):
-                def order(oid):
-                    adjacent=[ranks[n] for n in neighbors[oid] if levels[n]!=level]
-                    return (sum(adjacent)/len(adjacent) if adjacent else ranks[oid],key(oid))
-                cols[level].sort(key=order)
-                ranks.update({oid:i for i,oid in enumerate(cols[level])})
-        loads=collections.Counter()
-        for edge in relations:
-            if edge['source'] in component and edge['target'] in component:
-                lo,hi=sorted((levels[edge['source']],levels[edge['target']]))
-                for level in range(lo,hi):loads[level]+=max(1,len(edge.get('source_columns',[])))
-        heights={level:sum(sizes[k][1] for k in items)+sum(40+min(48,6*len(neighbors[k])) for k in items[:-1]) for level,items in cols.items()}
-        maxh=max(heights.values(),default=0);positions={};x=0
-        for level,items in sorted(cols.items()):
-            y=(maxh-heights[level])/2;w=max(sizes[k][0] for k in items)
-            for k in items:positions[k]=(x,y);y+=sizes[k][1]+40+min(48,6*len(neighbors[k]))
-            # The canvas may grow: dense FK corridors need their own lanes.
-            x+=w+(max(92,40+min(240,loads[level]*10)) if level<max(cols) else 0)
-        blocks.append((positions,x,maxh))
+            parent=q.popleft();ordered.append(parent)
+            for child in sorted(neighbors[parent],key=lambda oid:(-len(neighbors[oid]),key(oid))):
+                if child not in seen:seen.add(child);q.append(child)
+        if len(ordered)<=2:
+            positions={};x=0;maxh=max(sizes[oid][1] for oid in ordered)
+            for oid in ordered:positions[oid]=(x,(maxh-sizes[oid][1])/2);x+=sizes[oid][0]+92
+            blocks.append((positions,x-92,maxh));continue
+        count=len(ordered)
+        # Work in card-sized units: a wide, short card must not make the map
+        # prefer an arbitrarily tall column. Distances describe connectivity,
+        # not alphabetical ordering or one global BFS depth.
+        unit_x=sorted(sizes[oid][0] for oid in ordered)[count//2]+116
+        unit_y=sorted(sizes[oid][1] for oid in ordered)[count//2]+96
+        half_x=[(sizes[oid][0]+96+min(40,4*len(neighbors[oid])))/(2*unit_x) for oid in ordered]
+        half_y=[(sizes[oid][1]+76+min(32,3*len(neighbors[oid])))/(2*unit_y) for oid in ordered]
+        points=[(0.0,0.0)]+[(math.sqrt(i)*1.05*math.cos(i*2.399963229728653),math.sqrt(i)*1.05*math.sin(i*2.399963229728653)) for i in range(1,count)]
+        pairs=[];weights=[0.0]*count
+        # In sparse maps each actual FK should outweigh several indirect
+        # graph distances, otherwise a shortcut can stretch across the map.
+        direct_weight=2 if sum(len(neighbors[oid]) for oid in ordered)<4*count else 1
+        for i,oid in enumerate(ordered):
+            distances={oid:0};q=collections.deque([oid])
+            while q:
+                parent=q.popleft()
+                for child in sorted(neighbors[parent],key=key):
+                    if child not in distances:distances[child]=distances[parent]+1;q.append(child)
+            for j in range(i+1,count):
+                distance=distances[ordered[j]];weight=(direct_weight if distance==1 else 1)/(distance*distance)
+                pairs.append((i,j,1.3*distance,weight));weights[i]+=weight;weights[j]+=weight
+        for iteration in range(180):
+            force_x=[0.0]*count;force_y=[0.0]*count
+            for i,j,ideal,weight in pairs:
+                dx=points[i][0]-points[j][0];dy=points[i][1]-points[j][1];distance=max(.0001,math.hypot(dx,dy))
+                stress=weight*(1-ideal/distance);fx=dx*stress;fy=dy*stress
+                force_x[i]-=fx;force_x[j]+=fx;force_y[i]-=fy;force_y[j]+=fy
+            points=[(x+.65*force_x[i]/weights[i],y+.65*force_y[i]/weights[i]) for i,(x,y) in enumerate(points)]
+            # Project overlapping padded rectangles apart after each stress
+            # step. This keeps the optimization about actual readable cards.
+            for i in range(count):
+                for j in range(i+1,count):
+                    dx=points[j][0]-points[i][0];dy=points[j][1]-points[i][1]
+                    ox=half_x[i]+half_x[j]-abs(dx);oy=half_y[i]+half_y[j]-abs(dy)
+                    if ox<=0 or oy<=0:continue
+                    if ox<oy:
+                        shift=(ox+.002)*(.5 if dx>=0 else -.5);points[i]=(points[i][0]-shift,points[i][1]);points[j]=(points[j][0]+shift,points[j][1])
+                    else:
+                        shift=(oy+.002)*(.5 if dy>=0 else -.5);points[i]=(points[i][0],points[i][1]-shift);points[j]=(points[j][0],points[j][1]+shift)
+        # Settle any residual collision without depending on floating-point
+        # convergence. Higher-degree cards keep their optimized location;
+        # the nearest clear boundary is chosen for each remaining card.
+        import heapq
+        placed={}
+        for i in sorted(range(count),key=lambda n:(-len(neighbors[ordered[n]]),n)):
+            origin=points[i];queue=[(0.0,origin[0],origin[1])];visited=set();chosen=None
+            while queue and len(visited)<2000:
+                _,x,y=heapq.heappop(queue);point=(round(x,8),round(y,8))
+                if point in visited:continue
+                visited.add(point);collisions=[j for j,(px,py) in placed.items() if abs(x-px)<half_x[i]+half_x[j] and abs(y-py)<half_y[i]+half_y[j]]
+                if not collisions:chosen=(x,y);break
+                for j in collisions:
+                    px,py=placed[j]
+                    candidates=((px-half_x[i]-half_x[j]-.002,y),(px+half_x[i]+half_x[j]+.002,y),(x,py-half_y[i]-half_y[j]-.002),(x,py+half_y[i]+half_y[j]+.002))
+                    for cx,cy in candidates:heapq.heappush(queue,((cx-origin[0])**2+(cy-origin[1])**2,cx,cy))
+            if chosen is None:
+                chosen=(max((px+half_x[j] for j,(px,py) in placed.items()),default=0)+half_x[i]+.01,origin[1])
+            placed[i]=chosen
+        positions={oid:(placed[i][0]*unit_x-sizes[oid][0]/2,placed[i][1]*unit_y-sizes[oid][1]/2) for i,oid in enumerate(ordered)}
+        left=min(x for x,y in positions.values());top=min(y for x,y in positions.values())
+        # Shared grid coordinates create usable continuous routing corridors.
+        # Padding above includes the maximum24px relative rounding movement.
+        positions={oid:(round((x-left)/24)*24,round((y-top)/24)*24) for oid,(x,y) in positions.items()}
+        blocks.append((positions,max(x+sizes[oid][0] for oid,(x,y) in positions.items()),max(y+sizes[oid][1] for oid,(x,y) in positions.items())))
     margin=12 if compact else 24;gap=18 if compact else 36
     x=y=margin;shelf=0;result={};width=max(240 if compact else 660,float(available_width)-(margin if compact else 48))
     for positions,w,h in blocks:
@@ -4369,19 +4412,31 @@ def database_graph_routes(rectangles,connections):
         start,end=tuple(spec['start']),tuple(spec['end']);left,right=spec['source_side'],spec['target_side']
         stubs=[]
         for oid,point,side in ((spec['source'],start,left),(spec['target'],end,right)):
-            rank=ports[oid,side];ports[oid,side]+=1
-            # Ten-pixel lanes keep multiple relationships legible at normal zoom.
-            offset=pad+8+rank*10
+            ports[oid,side]+=1
+            # Sharing is unavoidable at the exact field port, but keep it
+            # short. Increasing this lead for every key made long shared bars
+            # which the corridor scorer never even saw.
+            offset=pad+8
             barriers=[l-point[0] if side=='right' else point[0]-r for other,(l,t,r,b) in rects.items()
                 if other!=oid and t<point[1]<b and (l>point[0] if side=='right' else r<point[0])]
             if barriers:offset=min(offset,max(pad,min(barriers)-2))
             x=point[0]+(offset if side=='right' else -offset)
             stubs.append((x,point[1]));xs.add(x);ys.add(point[1])
-        if start==end and stubs[0]==stubs[1]:stubs[1]=(stubs[1][0]+10,stubs[1][1]+8)
+        if start==end and stubs[0]==stubs[1]:stubs[1]=(stubs[1][0]+(12 if right=='right' else -12),stubs[1][1])
         prepared.append((start,end,*stubs));xs.update((stubs[0][0],stubs[1][0]));ys.update((stubs[0][1],stubs[1][1]))
     for oid,(l,t,r,b) in rects.items():
-        for lane in range(1,min(5,max(ports[oid,'left'],ports[oid,'right']))):ys.update((t-lane*10,b+lane*10))
-    xs.update((min(xs)-40,max(xs)+40));ys.update((min(ys)-40,max(ys)+40))
+        tracks=min(8,max(ports[oid,'left'],ports[oid,'right']))
+        for lane in range(1,tracks+1):
+            xs.update((l-8-lane*12,r+8+lane*12))
+            if lane<=4:ys.update((t-lane*12,b+lane*12))
+    for start,end,p,q in prepared:
+        # Nearby horizontal tracks let equal-height ports fan out immediately,
+        # instead of sending every parallel key around the entire table.
+        for point in (p,q):ys.update((point[1]-12,point[1]+12))
+        xs.update((start[0],end[0]))
+    xlo,xhi=min(xs),max(xs);ylo,yhi=min(ys),max(ys)
+    for lane in range(min(20,max(4,int(math.sqrt(len(connections)))*2))):
+        offset=24+lane*12;xs.update((xlo-offset,xhi+offset));ys.update((ylo-offset,yhi+offset))
     xx=sorted(xs);yy=sorted(ys);xi={v:i for i,v in enumerate(xx)};yi={v:i for i,v in enumerate(yy)}
     # Rectangles block intervals of grid rows/columns. Cache interval queries,
     # instead of testing every table again at every step of every arrow.
@@ -4394,6 +4449,8 @@ def database_graph_routes(rectangles,connections):
             else:result.append((a,b))
         return ([a for a,b in result],[b for a,b in result])
     rows=list(map(merged,rows));cols=list(map(merged,cols));clear_cache={};used=collections.Counter();crossings={};result=[]
+    close_x=[[(j,1-abs(v-x)/8) for j in range(bisect.bisect_right(xx,x-8),bisect.bisect_left(xx,x+8)) if j!=i for v in (xx[j],)] for i,x in enumerate(xx)]
+    close_y=[[(j,1-abs(v-y)/8) for j in range(bisect.bisect_right(yy,y-8),bisect.bisect_left(yy,y+8)) if j!=i for v in (yy[j],)] for i,y in enumerate(yy)]
     def clear(a,b):
         key=(min(a,b),max(a,b))
         if key in clear_cache:return clear_cache[key]
@@ -4403,14 +4460,30 @@ def database_graph_routes(rectangles,connections):
         answer=at<0 or ends[at]<=lo;clear_cache[key]=answer;return answer
     for start,end,p,q in prepared:
         source=(xi[p[0]],yi[p[1]]);target=(xi[q[0]],yi[q[1]])
+        penalty_cache={}
+        def congestion(a,b):
+            segment=(min(a,b),max(a,b))
+            if segment in penalty_cache:return penalty_cache[segment]
+            distance=abs(xx[a[0]]-xx[b[0]])+abs(yy[a[1]]-yy[b[1]])
+            nearby=0
+            if a[1]==b[1]:
+                for j,weight in close_y[a[1]]:nearby+=weight*used[(min(a[0],b[0]),j),(max(a[0],b[0]),j)]
+            else:
+                for j,weight in close_x[a[0]]:nearby+=weight*used[(j,min(a[1],b[1])),(j,max(a[1],b[1]))]
+            penalty=used[segment]*(distance*24+40)+nearby*(distance*12+20)
+            penalty_cache[segment]=penalty;return penalty
         # Most layer-to-layer links have a free vertical gutter. Resolve those
         # directly before searching the full visibility grid.
-        midpoint=(p[0]+q[0])/2;lanes=sorted(range(len(xx)),key=lambda n:(abs(xx[n]-midpoint),n))[:12]
-        lanes=list(dict.fromkeys([*lanes,source[0],target[0]]));fast=None;fast_cost=float('inf')
-        candidates=[[source,(lane,source[1]),(lane,target[1]),target] for lane in lanes]
+        midpoint=(p[0]+q[0])/2
+        # A nearest-only list misses the free tracks beside tall columns and
+        # repeatedly falls back to the very same long vertical trunk.
+        free_vertical=[n for n in range(len(xx)) if clear((n,source[1]),(n,target[1]))]
+        lanes=sorted(free_vertical,key=lambda n:(abs(xx[n]-midpoint),n))[:24]
+        lanes=list(dict.fromkeys([*lanes,source[0],target[0],0,len(xx)-1]));fast=None;fast_cost=float('inf')
+        candidates=[] if start==end else [[source,(lane,source[1]),(lane,target[1]),target] for lane in lanes]
         horizontal=sorted(range(len(yy)),key=lambda n:(abs(yy[n]-(p[1]+q[1])/2),n))[:12]
         horizontal=list(dict.fromkeys([*horizontal,0,len(yy)-1,source[1],target[1]]))
-        candidates.extend([source,(source[0],lane),(target[0],lane),target] for lane in horizontal)
+        candidates.extend([source,(source[0],lane),(target[0],lane),target] for lane in horizontal if start!=end or lane!=source[1])
         for corners in candidates:
             candidate=[source];score=0;direction=0
             for a,b in zip(corners,corners[1:]):
@@ -4422,42 +4495,60 @@ def database_graph_routes(rectangles,connections):
                 for value in steps:
                     other=(value,a[1]) if axis==1 else (a[0],value);old=candidate[-1]
                     distance=abs(xx[other[0]]-xx[old[0]])+abs(yy[other[1]]-yy[old[1]])
-                    score+=distance+used[min(old,other),max(old,other)]*(distance*4+14)
+                    score+=distance+congestion(old,other)
                     if crossings.get(other,0)&(2 if axis==1 else 1):score+=45
                     candidate.append(other)
             if score<fast_cost:fast_cost=score;fast=candidate
-        grid=fast if fast_cost<=abs(p[0]-q[0])+abs(p[1]-q[1])+320 else None
-        initial=(source[0],source[1],0);costs={initial:0};previous={};queue=[(abs(p[0]-q[0])+abs(p[1]-q[1]),0,initial)];last=None;expanded=0
+        direct=abs(p[0]-q[0])+abs(p[1]-q[1])
+        fast_length=sum(abs(xx[b[0]]-xx[a[0]])+abs(yy[b[1]]-yy[a[1]]) for a,b in zip(fast,fast[1:])) if fast is not None else float('inf')
+        # Prefer an extra bend through a nearby passage over circling the
+        # whole catalogue just because an outer L/U corridor is unobstructed.
+        grid=fast if fast_length<=direct*1.5+160 else None
+        # Search only obstacle corners when a simple corridor is impossible.
+        # The dense grid also includes every other arrow's port/lane; walking
+        # those irrelevant intermediate points exhausted the search budget on
+        # compact 2D maps and falsely marked reachable tables as blocked.
+        coarse_x=sorted({source[0],target[0],0,len(xx)-1}|{xi[x] for l,t,r,b in rects.values() for x in (l,r)})
+        coarse_y=sorted({source[1],target[1],0,len(yy)-1}|{yi[y] for l,t,r,b in rects.values() for y in (t,b)})
+        initial=(coarse_x.index(source[0]),coarse_y.index(source[1]),0)
+        costs={initial:0};previous={};queue=[(abs(p[0]-q[0])+abs(p[1]-q[1]),0,initial)];last=None;expanded=0
         while queue and grid is None:
             _,cost,state=heapq.heappop(queue)
             if cost!=costs.get(state):continue
-            x,y,direction=state;point=(x,y)
+            x,y,direction=state;point=(coarse_x[x],coarse_y[y])
             if point==target:last=state;break
             expanded+=1
             # The graph has a bounded UI catalogue, but pathological manual
             # overlaps must not hang its event loop.
-            if expanded>(3500 if fast is not None else 24000):break
+            if expanded>60000:break
             for nx,ny,axis in ((x-1,y,1),(x+1,y,1),(x,y-1,2),(x,y+1,2)):
-                if not (0<=nx<len(xx) and 0<=ny<len(yy)):continue
-                other=(nx,ny)
+                if not (0<=nx<len(coarse_x) and 0<=ny<len(coarse_y)):continue
+                other=(coarse_x[nx],coarse_y[ny])
                 if not clear(point,other):continue
-                distance=abs(xx[nx]-xx[x])+abs(yy[ny]-yy[y]);segment=(min(point,other),max(point,other))
-                penalty=used[segment]*(distance*4+14)+(28 if direction and direction!=axis else 0)
-                if crossings.get(other,0)&(2 if axis==1 else 1):penalty+=45
+                distance=abs(xx[other[0]]-xx[point[0]])+abs(yy[other[1]]-yy[point[1]])
+                penalty=28 if direction and direction!=axis else 0
                 new=cost+distance+penalty;nstate=(nx,ny,axis)
                 if new>=costs.get(nstate,float('inf')):continue
                 costs[nstate]=new;previous[nstate]=state
-                heapq.heappush(queue,(new+1.4*(abs(xx[nx]-q[0])+abs(yy[ny]-q[1])),new,nstate))
+                heapq.heappush(queue,(new+1.4*(abs(xx[other[0]]-q[0])+abs(yy[other[1]]-q[1])),new,nstate))
         if grid is None and last is None and fast is not None:grid=fast
         if grid is None and last is None:
             # No invented route through a card when the user overlaps ports.
             # The UI exposes this exceptional route as a dotted connection.
             result.append({'points':[start,end],'blocked':True});continue
         if grid is None:
-            grid=[]
-            while last is not None:grid.append((last[0],last[1]));last=previous.get(last)
-            grid.reverse()
-        for a,b in zip(grid,grid[1:]):
+            corners=[]
+            while last is not None:corners.append((coarse_x[last[0]],coarse_y[last[1]]));last=previous.get(last)
+            corners.reverse();grid=[source]
+            for a,b in zip(corners,corners[1:]):
+                axis=0 if a[1]==b[1] else 1;step=1 if b[axis]>a[axis] else -1
+                for value in range(a[axis]+step,b[axis]+step,step):grid.append((value,a[1]) if axis==0 else (a[0],value))
+        # Include the fixed leads in occupancy as well, so other routes cannot
+        # turn them into long shared trunks unnoticed by the scorer.
+        def lead(a,b):
+            lo,hi=sorted((xi[a[0]],xi[b[0]]));row=yi[a[1]]
+            return [((x,row),(x+1,row)) for x in range(lo,hi)]
+        for a,b in [*zip(grid,grid[1:]),*lead(start,p),*lead(q,end)]:
             used[min(a,b),max(a,b)]+=1;axis=1 if a[1]==b[1] else 2
             crossings[a]=crossings.get(a,0)|axis;crossings[b]=crossings.get(b,0)|axis
         points=[start,p]+[(xx[x],yy[y]) for x,y in grid[1:-1]]+[q,end];simplified=[]
@@ -4470,6 +4561,106 @@ def database_graph_routes(rectangles,connections):
                 simplified.pop()
             simplified.append(point)
         result.append({'points':simplified,'blocked':False})
+    return database_graph_separate_routes(rectangles,connections,result)
+
+
+def database_graph_separate_routes(rectangles,connections,routes):
+    """Move parallel trunks to separate lanes without moving card ports.
+
+    Every accepted change is a new orthogonal polyline checked against the
+    actual cards. Short port convergence is allowed; the router's obstruction
+    result is never hidden by a paint offset. Work is bounded and deterministic.
+    """
+    import bisect
+    if len(connections)!=len(routes):return routes
+    clearance=8.;lead=24.;bounds=[(key,float(x),float(y),float(x+w),float(y+h)) for key,(x,y,w,h) in rectangles.items()]
+    reserved=[[],[]];coordinates=[[],[]];result=[];budget=120000
+    def simplify(points):
+        clean=[]
+        for point in points:
+            point=tuple(point)
+            if clean and clean[-1]==point:continue
+            while len(clean)>1:
+                a,b=clean[-2:]
+                if not ((a[0]==b[0]==point[0]) or (a[1]==b[1]==point[1])):break
+                # Cancelling a collinear retrace cannot add an obstacle crossing.
+                clean.pop()
+            if clean and clean[-1]==point:continue
+            clean.append(point)
+        return clean
+    def segments(points):
+        for index,(a,b) in enumerate(zip(points,points[1:])):
+            if a[0]!=b[0] and a[1]!=b[1]:continue
+            axis=0 if a[1]==b[1] else 1;lo,hi=sorted((a[axis],b[axis]));coord=a[1-axis]
+            if index==0:
+                if a[axis]<b[axis]:lo+=lead
+                else:hi-=lead
+            if index==len(points)-2:
+                if b[axis]<a[axis]:lo+=lead
+                else:hi-=lead
+            if hi>lo:yield axis,coord,lo,hi
+    def penalty(points):
+        score=0.
+        for axis,coord,lo,hi in segments(points):
+            entries=reserved[axis];values=coordinates[axis]
+            for at in range(bisect.bisect_right(values,coord-clearance),bisect.bisect_left(values,coord+clearance)):
+                other,start,end=entries[at];overlap=min(hi,end)-max(lo,start)
+                if overlap>0:score+=overlap*(2-abs(coord-other)/clearance)
+        return score
+    def length(points):return sum(abs(a[0]-b[0])+abs(a[1]-b[1]) for a,b in zip(points,points[1:]))
+    def valid(points,spec):
+        if len(points)<2 or points[0]!=tuple(spec['start']) or points[-1]!=tuple(spec['end']):return False
+        for a,b in zip(points,points[1:]):
+            if a[0]!=b[0] and a[1]!=b[1]:return False
+            for oid,l,t,r,bot in bounds:
+                # Port leads may touch their own card boundary. Other cards
+                # retain six pixels of clearance, including around bends.
+                pad=0 if oid in (spec['source'],spec['target']) else 6
+                ll,tt,rr,bb=l-pad,t-pad,r+pad,bot+pad
+                if a[0]==b[0]:
+                    if ll<a[0]<rr and max(a[1],b[1])>tt and min(a[1],b[1])<bb:return False
+                elif tt<a[1]<bb and max(a[0],b[0])>ll and min(a[0],b[0])<rr:return False
+        return True
+    def shifted(points,index,delta):
+        a,b=points[index:index+2];axis=0 if a[1]==b[1] else 1;other=1-axis
+        aa=list(a);bb=list(b);aa[other]+=delta;bb[other]+=delta
+        prefix=points[:index];suffix=points[index+2:]
+        if index==0:
+            sign=1 if b[axis]>a[axis] else -1
+            if abs(b[axis]-a[axis])<=lead+1:return None
+            anchor=list(a);anchor[axis]+=sign*lead;aa[axis]=anchor[axis];prefix=[a,tuple(anchor)]
+        if index==len(points)-2:
+            sign=1 if a[axis]>b[axis] else -1
+            if abs(b[axis]-a[axis])<=lead+1:return None
+            anchor=list(b);anchor[axis]+=sign*lead;bb[axis]=anchor[axis];suffix=[tuple(anchor),b]
+        return simplify([*prefix,tuple(aa),tuple(bb),*suffix])
+    shifts=[sign*distance for distance in (8,10,12,16,20,24,30,40,50,60,80,100,120,160,240,320) for sign in (1,-1)]
+    for spec,route in zip(connections,routes):
+        if route.get('blocked'):
+            result.append(dict(route));continue
+        points=simplify(route['points']);original=length(points);route_budget=3000
+        if len(points)<=48 and valid(points,spec):
+            score=penalty(points)
+            for iteration in range(10):
+                if score<1 or budget<=0 or route_budget<=0:break
+                best=None;best_score=score;current_length=length(points)
+                order=sorted(range(len(points)-1),key=lambda i:-math.dist(points[i],points[i+1]))
+                for index in order:
+                    if budget<=0 or route_budget<=0:break
+                    for delta in shifts:
+                        if budget<=0 or route_budget<=0:break
+                        budget-=1;route_budget-=1;candidate=shifted(points,index,delta)
+                        if candidate is None:continue
+                        distance=length(candidate)
+                        if distance>original+max(240,original*.25):continue
+                        cost=penalty(candidate)+max(0,distance-current_length)*.3
+                        if cost>=best_score-.01 or not valid(candidate,spec):continue
+                        best=candidate;best_score=cost
+                if best is None:break
+                points=best;score=penalty(points)
+        result.append(dict(route,points=points))
+        for axis,coord,lo,hi in segments(points):reserved[axis].append((coord,lo,hi))
+        for axis in (0,1):reserved[axis].sort();coordinates[axis]=[item[0] for item in reserved[axis]]
     return result
 
 
@@ -17175,7 +17366,7 @@ def native_ui_types():
                 if not isinstance(zoom,(int,float)) or not math.isfinite(zoom):zoom=1.0
                 zoom=max(.15,min(3,float(zoom)));self.scale(zoom,zoom)
                 if isinstance(center,list) and len(center)==2 and all(isinstance(n,(int,float)) and math.isfinite(n) and abs(n)<1e7 for n in center):self.centerOn(QC.QPointF(*center))
-                else:
+                elif not self._center_linked_neighborhood():
                     rect=self._scene.itemsBoundingRect()
                     if rect.width()*zoom<=self.viewport().width() and rect.height()*zoom<=self.viewport().height():self.centerOn(rect.center())
                     else:self.centerOn(QC.QPointF(rect.left()+self.viewport().width()/2,rect.top()+self.viewport().height()/2))
@@ -17186,6 +17377,21 @@ def native_ui_types():
                 self.zoomChanged.emit(round(zoom*100));self._selection_changed()
             finally:self._restoring=False
             self.save_state()
+        def _center_linked_neighborhood(self):
+            """Open a useful connected area without shrinking readable cards."""
+            neighbors={oid:set() for oid in self._nodes}
+            for edge in self._links:
+                a,b=edge['source'],edge['target']
+                if a in neighbors and b in neighbors:neighbors[a].add(b);neighbors[b].add(a)
+            linked=[oid for oid in self._nodes if neighbors[oid]]
+            if not linked:return False
+            selected=[oid for oid in self.selected_ids() if neighbors[oid]]
+            hub=min(selected or linked,key=lambda oid:(-len(neighbors[oid]),database_label(self._nodes[oid]._object).casefold(),oid))
+            rect=self._nodes[hub].sceneBoundingRect();neighborhood=QC.QRectF(rect)
+            for oid in neighbors[hub]:neighborhood=neighborhood.united(self._nodes[oid].sceneBoundingRect())
+            zoom=max(.01,self.transform().m11());width=self.viewport().width()/zoom;height=self.viewport().height()/zoom
+            if neighborhood.width()+32<=width and neighborhood.height()+32<=height:rect=neighborhood
+            self.centerOn(rect.center());return True
         def layout_width(self):
             # A tall map needs a vertical scrollbar after layout; reserve its
             # width up front so arranging at 100% does not add a horizontal one.
@@ -17212,8 +17418,9 @@ def native_ui_types():
             finally:self._building=False
             self._edge_timer.stop();self.redraw_edges()
             if not preserve:
-                rect=self._scene.itemsBoundingRect();height=self.viewport().height()
-                self.centerOn(QC.QPointF(rect.center().x(),rect.center().y() if rect.height()<=height else rect.top()+height/2-12))
+                if not self._center_linked_neighborhood():
+                    rect=self._scene.itemsBoundingRect();height=self.viewport().height()
+                    self.centerOn(QC.QPointF(rect.center().x(),rect.center().y() if rect.height()<=height else rect.top()+height/2-12))
                 self.zoomChanged.emit(100);self._selection_changed();self._edge_timer.stop();self.save_state()
         def showEvent(self,event):
             super().showEvent(event)
@@ -24838,12 +25045,43 @@ def database_join_test_suite():
             objs=[{'id':str(i),'name':f'T{i}','schema':'main'} for i in range(8)];sizes={o['id']:(230,160) for o in objs}
             edges=[{'source':str(i),'target':'0','source_columns':['A','B']} for i in range(1,8)]
             positions=database_graph_layout(objs,edges,sizes,700);root=positions['0']
-            self.assertGreater(positions['1'][0]-root[0]-230,92)
-            self.assertGreater(root[1],min(y for x,y in positions.values()))
+            self.assertTrue(any(x<root[0] for oid,(x,y) in positions.items() if oid!='0'))
+            self.assertTrue(any(x>root[0] for oid,(x,y) in positions.items() if oid!='0'))
+            self.assertLess(max(math.dist(root,positions[str(i)]) for i in range(1,8)),600)
             for i,a in enumerate(objs):
                 x,y=positions[a['id']]
                 for b in objs[i+1:]:
-                    xx,yy=positions[b['id']];self.assertTrue(x+230<=xx or xx+230<=x or y+160<=yy or yy+160<=y)
+                    xx,yy=positions[b['id']];self.assertTrue(x+290<=xx or xx+290<=x or y+205<=yy or yy+205<=y)
+        def test_graph_layout_surrounds_hub_and_shortens_star_connections(self):
+            objs=[{'id':str(i),'name':f'T{i:02d}','schema':'main'} for i in range(13)];sizes={o['id']:(230,160) for o in objs}
+            edges=[{'source':str(i),'target':'0'} for i in range(1,13)];positions=database_graph_layout(objs,edges,sizes,1100);hub=positions['0']
+            lengths=[math.dist(hub,positions[str(i)]) for i in range(1,13)]
+            # The former 12-card BFS column averaged 762px and peaked at1198.
+            self.assertLess(sum(lengths)/len(lengths),520);self.assertLess(max(lengths),650)
+            for axis in (0,1):
+                self.assertGreaterEqual(sum(positions[str(i)][axis]<hub[axis] for i in range(1,13)),3)
+                self.assertGreaterEqual(sum(positions[str(i)][axis]>hub[axis] for i in range(1,13)),3)
+            self.assertEqual(positions,database_graph_layout(list(reversed(objs)),list(reversed(edges)),sizes,1100))
+        def test_graph_layout_clusters_linked_communities_instead_of_names(self):
+            objs=[{'id':str(i),'name':f'T{i*7%16:02d}','schema':'main'} for i in range(16)];sizes={o['id']:(230,160) for o in objs}
+            pairs=[(i,j) for offset in (0,8) for i in range(offset,offset+8) for j in range(i+1,offset+8)]
+            edges=[{'source':str(a),'target':str(b)} for a,b in [*pairs,(7,8)]];positions=database_graph_layout(objs,edges,sizes,1100)
+            within=[math.dist(positions[str(a)],positions[str(b)]) for a,b in pairs]
+            between=[math.dist(positions[str(a)],positions[str(b)]) for a in range(8) for b in range(8,16)]
+            self.assertLess(sum(within)/len(within),.65*sum(between)/len(between))
+            self.assertLess(math.dist(positions['7'],positions['8']),1100)
+        def test_graph_layout_sparse_111_tables_keeps_links_short_and_has_clear_gutters(self):
+            objs=[{'id':str(i),'name':f'T{i}','schema':'main'} for i in range(111)];sizes={o['id']:(230,160) for o in objs}
+            pairs=[(i,(i-1)//3) for i in range(1,111)]+[(i*5%111,(i*5+2)%111) for i in range(19)]
+            edges=[{'source':str(a),'target':str(b)} for a,b in pairs];started=time.monotonic();positions=database_graph_layout(objs,edges,sizes,1200)
+            self.assertLess(time.monotonic()-started,3);self.assertEqual(len(positions),111)
+            lengths=[math.dist(positions[str(a)],positions[str(b)]) for a,b in pairs]
+            # The former layer layout averaged1121px on this sparse fixture.
+            self.assertLess(sum(lengths)/len(lengths),800);self.assertLess(max(lengths),1700)
+            for i,a in enumerate(objs):
+                x,y=positions[a['id']]
+                for b in objs[i+1:]:
+                    xx,yy=positions[b['id']];self.assertTrue(x+290<=xx or xx+290<=x or y+205<=yy or yy+205<=y)
         def assert_route_avoids_rect(self,route,rect):
             l,t,w,h=rect;r=l+w;b=t+h;self.assertFalse(route['blocked'],route)
             for a,z in zip(route['points'],route['points'][1:]):
@@ -24856,8 +25094,9 @@ def database_join_test_suite():
             routes=database_graph_routes(rectangles,connections)
             for route in routes:self.assert_route_avoids_rect(route,rectangles['middle'])
             self.assertEqual(routes,database_graph_routes(rectangles,connections))
-            vertical=[{a[0] for a,b in zip(route['points'],route['points'][1:]) if a[0]==b[0]} for route in routes]
-            self.assertEqual(len({tuple(sorted(x)) for x in vertical}),4)
+            # Disjoint intervals may legitimately use the same x coordinate.
+            # Check actual overlapping geometry, including horizontal trunks.
+            self.assertEqual(self.route_separation_shared_length(routes),0)
         def test_graph_routing_self_reference_and_moved_obstacle(self):
             rectangles={'a':(0,0,230,160),'b':(560,0,230,160),'middle':(290,220,160,240)}
             spec=dict(source='a',target='b',source_side='right',target_side='left',start=(230,55),end=(560,55))
@@ -24866,6 +25105,8 @@ def database_join_test_suite():
             loop=dict(source='a',target='a',source_side='right',target_side='right',start=(230,55),end=(230,100))
             route=database_graph_routes({'a':rectangles['a']},[loop])[0]
             self.assertGreaterEqual(len(route['points']),4);self.assert_route_avoids_rect(route,rectangles['a'])
+            loop['end']=loop['start'];route=database_graph_routes({'a':rectangles['a']},[loop])[0]
+            self.assertGreaterEqual(len(route['points']),5);self.assertEqual(route['points'][0],route['points'][-1]);self.assert_route_avoids_rect(route,rectangles['a'])
         def test_graph_routing_dense_catalogue_has_bounded_work_and_no_hidden_connections(self):
             objs=[{'id':str(i),'name':f'T{i}','schema':'main'} for i in range(32)];sizes={o['id']:(230,230) for o in objs}
             edges=[{'source':str(i),'target':str((i-1)//3)} for i in range(1,32)]+[{'source':str(1+(i*7)%31),'target':str((i*3)%32)} for i in range(98)]
@@ -24882,6 +25123,72 @@ def database_join_test_suite():
             tree=ast.parse(Path(__file__).read_text('utf-8'));cls=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='DatabaseGraph')
             method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='show_plan')
             self.assertFalse(any(isinstance(n,ast.Attribute) and n.attr in ('fit_map','fitInView') for n in ast.walk(method)))
+        @staticmethod
+        def route_separation_shared_length(routes):
+            segments=[];total=0
+            for identity,route in enumerate(routes):
+                for index,(a,b) in enumerate(zip(route['points'],route['points'][1:])):
+                    axis=0 if a[1]==b[1] else 1;lo,hi=sorted((a[axis],b[axis]))
+                    if index==0:
+                        if a[axis]<b[axis]:lo+=25
+                        else:hi-=25
+                    if index==len(route['points'])-2:
+                        if b[axis]<a[axis]:lo+=25
+                        else:hi-=25
+                    if hi>lo:segments.append((identity,axis,a[1-axis],lo,hi))
+            for index,a in enumerate(segments):
+                for b in segments[index+1:]:
+                    if a[0]!=b[0] and a[1]==b[1] and abs(a[2]-b[2])<8:
+                        overlap=min(a[4],b[4])-max(a[3],b[3])
+                        if overlap>=40:total+=overlap
+            return total
+        def test_route_separation_nested_parallel_trunks_get_distinct_geometric_lanes(self):
+            rectangles={str(i):(0,i*240,230,160) for i in range(10)};connections=[];routes=[]
+            for i in range(5):
+                start=(230,i*240+55);end=(230,(9-i)*240+55)
+                connections.append(dict(source=str(i),target=str(9-i),source_side='right',target_side='right',start=start,end=end))
+                routes.append(dict(points=[start,(270,start[1]),(270,end[1]),end],blocked=False))
+            before=clone([rectangles,connections,routes]);separated=database_graph_separate_routes(rectangles,connections,routes)
+            self.assertGreater(self.route_separation_shared_length(routes),1000);self.assertEqual(self.route_separation_shared_length(separated),0)
+            self.assertEqual(clone([rectangles,connections,routes]),before);self.assertEqual(separated,database_graph_separate_routes(rectangles,connections,routes))
+            for spec,route in zip(connections,separated):
+                self.assertEqual(route['points'][0],spec['start']);self.assertEqual(route['points'][-1],spec['end'])
+                for rectangle in rectangles.values():self.assert_route_avoids_rect(route,rectangle)
+        def test_route_separation_checks_obstacles_after_moving_the_trunk(self):
+            rectangles={'a':(0,0,230,160),'b':(0,400,230,160),'obstacle':(267,190,80,100)}
+            spec=dict(source='a',target='b',source_side='right',target_side='right',start=(230,55),end=(230,455))
+            routes=[dict(points=[spec['start'],(260,55),(260,455),spec['end']],blocked=False) for _ in range(2)]
+            separated=database_graph_separate_routes(rectangles,[spec,spec],routes)
+            self.assertEqual(self.route_separation_shared_length(separated),0)
+            for route in separated:
+                for rectangle in rectangles.values():self.assert_route_avoids_rect(route,rectangle)
+        def test_route_separation_long_port_segments_branch_without_moving_endpoints(self):
+            rectangles={'a':(0,0,230,160),'b':(800,0,230,160)}
+            spec=dict(source='a',target='b',source_side='right',target_side='left',start=(230,55),end=(800,55))
+            routes=[dict(points=[spec['start'],spec['end']],blocked=False) for _ in range(2)]
+            separated=database_graph_separate_routes(rectangles,[spec,spec],routes)
+            self.assertEqual(self.route_separation_shared_length(separated),0);self.assertGreater(len(separated[1]['points']),2)
+            for route in separated:
+                self.assertEqual(route['points'][0],spec['start']);self.assertEqual(route['points'][-1],spec['end'])
+                for rectangle in rectangles.values():self.assert_route_avoids_rect(route,rectangle)
+        def test_route_separation_preserves_blocked_route_and_hidden_obstacle_warning(self):
+            spec=dict(source='a',target='b',start=(0,0),end=(200,100));route={'points':[(0,0),(200,100)],'blocked':True,'reason':'overlapping cards'}
+            self.assertEqual(database_graph_separate_routes({},[spec],[route]),[route])
+        def test_route_separation_dense_catalogue_reduces_shared_corridors_without_crossing_cards(self):
+            from unittest.mock import patch
+            objs=[{'id':str(i),'name':f'T{i}','schema':'main'} for i in range(32)];sizes={o['id']:(230,230) for o in objs}
+            edges=[{'source':str(i),'target':str((i-1)//3)} for i in range(1,32)]+[{'source':str(1+(i*7)%31),'target':str((i*3)%32)} for i in range(98)]
+            positions=database_graph_layout(objs,edges,sizes,1500);rectangles={oid:(*point,*sizes[oid]) for oid,point in positions.items()};connections=[]
+            for index,edge in enumerate(edges):
+                a,b=rectangles[edge['source']],rectangles[edge['target']];left='right' if a[0]<=b[0] else 'left';right='right' if a[0]>=b[0] else 'left'
+                connections.append(dict(edge,source_side=left,target_side=right,start=(a[0]+(230 if left=='right' else 0),a[1]+50+(index%7)*23),end=(b[0]+(230 if right=='right' else 0),b[1]+50)))
+            with patch(__name__+'.database_graph_separate_routes',side_effect=lambda cards,ports,paths:paths):raw=database_graph_routes(rectangles,connections)
+            started=time.monotonic();separated=database_graph_separate_routes(rectangles,connections,raw)
+            self.assertLess(time.monotonic()-started,8);self.assertEqual(len(separated),len(raw));self.assertFalse(any(route['blocked'] for route in separated))
+            shared=self.route_separation_shared_length(raw);self.assertLessEqual(self.route_separation_shared_length(separated),max(80,shared*.35))
+            for spec,route in zip(connections,separated):
+                self.assertEqual(route['points'][0],spec['start']);self.assertEqual(route['points'][-1],spec['end'])
+                for rectangle in rectangles.values():self.assert_route_avoids_rect(route,rectangle)
         def test_graph_handles_enter_locally_and_preserves_same_plan(self):
             text=Path(__file__).read_text('utf-8');self.assertIn('openSelection.emit(self.selected_ids())',text);self.assertIn("(topology,source_key,view_key)==(self._plan_key,self._source_key,self._view_key)",text)
         def test_qt_names_are_not_shadowed(self):
@@ -26723,9 +27030,11 @@ def ui_test():
             self.window.resize(1100,760);requests[-1]['done'](self.persistent_oracle_catalog(source,objects));ex.tabs.setCurrentIndex(1);app.processEvents();self.wait(lambda:not ex.graph._initial_view)
             ex.merge_cached_structure(self.progressive_graph_payload([self.progressive_structure(o) for o in objects]));ex.graph.arrange_nodes(preserve=False);app.processEvents()
             nodes=list(ex.graph._nodes.values());self.assertTrue(all(220<=n.rect().width()<=250 for n in nodes))
-            columns=sorted({n.pos().x() for n in nodes});self.assertGreaterEqual(len(columns),2);self.assertGreater(columns[1]-columns[0],320)
+            hub=ex.graph._nodes[objects[0]['id']].sceneBoundingRect().center()
+            self.assertTrue(any(n.sceneBoundingRect().center().x()<hub.x() for n in nodes))
+            self.assertTrue(any(n.sceneBoundingRect().center().x()>hub.x() for n in nodes))
             for index,node in enumerate(nodes):
-                for other in nodes[index+1:]:self.assertFalse(node.sceneBoundingRect().intersects(other.sceneBoundingRect()))
+                for other in nodes[index+1:]:self.assertFalse(node.sceneBoundingRect().adjusted(-20,-20,20,20).intersects(other.sceneBoundingRect()))
             self.assertTrue(ex.graph_arrange.isVisible());self.assertTrue(all(edge._route and not edge._route['blocked'] for edge in ex.graph._edges))
             self.assertAlmostEqual(ex.graph.transform().m11(),1.0,places=3)
         def test_graph_arrange_uses_resized_canvas_and_releases_manual_positions(self):
@@ -27275,6 +27584,19 @@ def ui_test():
             position=node.pos();scale=ex.graph.transform().m11();ex.tabs.setCurrentIndex(0);ex.tabs.setCurrentIndex(1);app.processEvents()
             self.assertEqual(ex.graph._nodes[oid].pos(),position);self.assertAlmostEqual(ex.graph.transform().m11(),scale,places=4)
             self.assertFalse(ex.relation_view.isVisible())
+        def test_graph_new_and_arranged_camera_shows_hub_without_overriding_saved_center(self):
+            graph=ui['DatabaseGraph']();graph.resize(680,480);self.addCleanup(graph.close)
+            objects=[{'id':str(i),'name':f'T{i:02d}','schema':'main','kind':'table','coverage':{'columns':True},
+                'columns':[{'name':'ID','type':'NUMBER','pk_position':1},{'name':'PARENT_ID','type':'NUMBER','pk_position':0}]} for i in range(19)]
+            pairs=[(i,0) for i in range(1,10)]+[(i,10) for i in range(11,19)]+[(10,0)]
+            edges=[{'id':str(i),'name':'FK'+str(i),'source':str(a),'target':str(b),'source_columns':['PARENT_ID'],'target_columns':['ID'],'target_table':'T'+str(b)} for i,(a,b) in enumerate(pairs)]
+            graph.show_plan({'objects':objects,'relations':edges});graph.show();self.wait(lambda:not graph._initial_view)
+            self.assertAlmostEqual(graph.transform().m11(),1);self.assertTrue(graph.mapToScene(graph.viewport().rect()).boundingRect().contains(graph._nodes['0'].sceneBoundingRect()))
+            graph._nodes['10'].setSelected(True);graph.zoom_by(.5);graph.arrange_nodes(False);app.processEvents()
+            self.assertAlmostEqual(graph.transform().m11(),1);self.assertTrue(graph.mapToScene(graph.viewport().rect()).boundingRect().contains(graph._nodes['10'].sceneBoundingRect()))
+            graph.centerOn(graph._scene.sceneRect().topLeft());graph.save_state();saved=graph.mapToScene(graph.viewport().rect().center());graph._save_timer.stop()
+            graph._initial_view=True;graph._initialize_view();restored=graph.mapToScene(graph.viewport().rect().center())
+            self.assertLess((restored-saved).manhattanLength(),3)
         def test_graph_ctrl_click_and_enter_select_real_nodes(self):
             path,ex=self.open_database_fixture();ex.tabs.setCurrentIndex(1);app.processEvents();self.wait(lambda:not ex.graph._initial_view)
             objects={o['name']:o for o in ex.catalog['objects'] if o['kind']=='table'}
