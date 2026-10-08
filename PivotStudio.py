@@ -5809,12 +5809,14 @@ def _vba_plan_logical_lines(code):
 def _vba_plan_local_scalars(cleaned, start, end):
     # Never synthesize assignments to properties, globals, arrays or ByRef args.
     result={}
+    defaults=any(re.match(r'^Def(?:Bool|Byte|Int|Lng|LngLng|LngPtr|Cur|Sng|Dbl|Date|Str|Obj|Var)\b',line,re.I) for line in cleaned)
     for line in cleaned[start+1:end]:
         match=re.fullmatch(r"Dim\s+(.+)",line,re.I)
         if not match:continue
         for part in _vba_plan_split_args(match[1]):
             item=re.fullmatch(r"([A-Za-z_]\w*)(?:\s+As\s+(\w+))?",part,re.I)
-            if item and item[2] and item[2].casefold() in _VBA_PLAN_PRIMITIVE:result[item[1].casefold()]=item[2].casefold()
+            if item and item[2] and item[2].casefold() in _VBA_PLAN_PRIMITIVE|{'variant'}:result[item[1].casefold()]=item[2].casefold()
+            elif item and not item[2] and not defaults:result[item[1].casefold()]='variant'
     return result
 
 
@@ -6292,8 +6294,10 @@ def _vba_plan_helper_summary(procedure, cleaned, actuals, caller_symbols, caller
             raise ValueError('Pomocnik zawiera nieobsługiwane sterowanie lub operację o możliwych skutkach ubocznych: '+text[:200])
         variable = re.fullmatch(r'Dim\s+(.+)',text,re.I)
         if variable:
-            if any(not re.fullmatch(r'[A-Za-z_]\w*\s+As\s+(?:String|Boolean|Byte|Integer|Long|VbMsgBoxResult)',part,re.I) for part in _vba_plan_split_args(variable[1])):
+            if any(not re.fullmatch(r'[A-Za-z_]\w*(?:\s+As\s+(?:String|Boolean|Byte|Integer|Long|VbMsgBoxResult|Variant))?',part,re.I) for part in _vba_plan_split_args(variable[1])):
                 raise ValueError('Pomocnik deklaruje obiekt, tablicę lub nieobsługiwany stan.')
+            if any(re.fullmatch(r'[A-Za-z_]\w*',part) and part.casefold() not in types for part in _vba_plan_split_args(variable[1])):
+                raise ValueError('Typ niejawnej zmiennej pomocnika zależy od deklaracji DefType; nie przyjęto Variant bez dowodu.')
     constants = {'true':True,'false':False,'vbyes':6,'vbno':7,'vbyesno':4,'vbexclamation':48,'vbquestion':32,'vbcritical':16,'vbinformation':64,
                  'vbdefaultbutton1':0,'vbdefaultbutton2':256,'vbdefaultbutton3':512,'vbdefaultbutton4':768,'vbapplicationmodal':0,'vbsystemmodal':4096}
     if set(constants) & procedure.shadowed:raise ValueError('Pomocnik przesłania standardową stałą odpowiedzi lub stylu MsgBox.')
@@ -6301,7 +6305,9 @@ def _vba_plan_helper_summary(procedure, cleaned, actuals, caller_symbols, caller
     if len(question_nodes) != 1:raise ValueError('Pomocnik musi zawierać dokładnie jedno standardowe pytanie MsgBox z wynikiem.')
     summaries = []
     for response in (6,7):
-        values = {name:False if kind=='boolean' else 0 for name,kind in types.items() if kind!='string'}
+        # A fresh Variant is Empty, not numeric zero. It is usable here only
+        # after a supported assignment establishes its scalar runtime subtype.
+        values = {name:False if kind=='boolean' else 0 for name,kind in types.items() if kind not in ('string','variant')}
         bindings = {name:'""' for name,kind in types.items() if kind=='string'};bindings.update(parameter_bindings);messages = [];executed = 0
         def expression(text, allow_question=True):
             nonlocal executed
@@ -6397,7 +6403,7 @@ def _vba_plan_helper_summary(procedure, cleaned, actuals, caller_symbols, caller
                 if len(bound)>4096:raise ValueError('Przygotowany tekst pomocnika przekracza limit.')
                 bindings[name]=bound
             else:
-                value=expression(match[2]);converted=bool(value) if types[name]=='boolean' else -1 if value is True else 0 if value is False else value
+                value=expression(match[2]);converted=value if types[name]=='variant' else bool(value) if types[name]=='boolean' else -1 if value is True else 0 if value is False else value
                 limits={'byte':(0,255),'integer':(-32768,32767),'long':(-(2**31),2**31-1),'vbmsgboxresult':(-(2**31),2**31-1)}
                 if types[name] in limits and not limits[types[name]][0]<=converted<=limits[types[name]][1]:raise ValueError('Zapis lokalnej odpowiedzi przekracza zakres typu VBA.')
                 values[name]=converted
@@ -6440,10 +6446,14 @@ def _vba_plan_helper_summary(procedure, cleaned, actuals, caller_symbols, caller
 
 
 def _vba_plan_helper_continuation(cleaned, start, end, target, exit_text):
-    """Derive continuation from the first caller use, never identifier spelling."""
+    """Derive continuation from use, or prove no use before procedure exit."""
+    referenced=False
     for index in range(start,end):
         text=cleaned[index]
         if not re.search(r'\b'+re.escape(target)+r'\b',_vba_plan_masked(text),re.I):continue
+        overwrite=re.fullmatch(r'(?:Let\s+)?'+re.escape(target)+r'\s*=\s*(.+)',text,re.I)
+        if overwrite and not re.search(r'\b'+re.escape(target)+r'\b',_vba_plan_masked(overwrite[1]),re.I):continue
+        referenced=True
         conditional=re.fullmatch(r'If\s+(.+?)\s+Then(?:\s+(.+))?',text,re.I)
         if not conditional:break
         condition=_vba_plan_normal_spaces(conditional[1])
@@ -6457,7 +6467,59 @@ def _vba_plan_helper_continuation(cleaned, start, end, target, exit_text):
             following=[(position,cleaned[position]) for position in range(index+1,min(end,index+8)) if cleaned[position]]
             if len(following)>=2 and _vba_plan_normal_spaces(following[0][1])==exit_text and _vba_plan_normal_spaces(following[1][1])=='end if':return value,index
         break
+    if not referenced:
+        # Without jumps/loops/error transfers a lexical suffix covers every
+        # possible later local read. The caller separately proves local storage
+        # and excludes a Variant object or escaped reference before this point.
+        transfer=re.compile(r'^(?:GoTo|GoSub|Return|Resume|On\s+Error|For|Next|Do|Loop|While|Wend|Static)\b',re.I)
+        if all(not transfer.match(_vba_plan_masked(text)) and ':' not in _vba_plan_masked(text) and not text.startswith('#') for text in cleaned[start:end]):
+            return None,end
     raise ValueError('Nie potwierdzono w kodzie wywołującym, która wartość pomocnika oznacza kontynuację. Nazwa zmiennej ani odpowiedź z okna nie wystarcza.')
+
+
+def _vba_plan_helper_local_target(target, cleaned, start, position, end, locals_, program, module, scope_names):
+    """Prove that removing a helper assignment cannot write an object/global."""
+    kind=locals_.get(target.casefold())
+    if kind not in ('boolean','variant'):
+        details=[]
+        declaration=_VBA_PLAN_PROC.fullmatch(cleaned[start])
+        if declaration and target.casefold() in _vba_plan_names(declaration[3]):details.append('parametr: '+declaration[3][:260])
+        for text in cleaned[start+1:end]:
+            declared=re.match(r'^(?:Dim|Static|Const)\s+(.+)$',text,re.I)
+            if declared and target.casefold() in _vba_plan_names(declared[1]):details.append('deklaracja w procedurze: '+text[:260])
+        if not details:
+            occupied={index for key,procedure in program.items() if key[0]==module.casefold() for index in range(procedure.start,procedure.end+1)}
+            for index,text in enumerate(cleaned):
+                declared=re.match(r'^(?:Dim|Static|Public|Private|Global|Const)\s+(.+)$',text,re.I)
+                if index not in occupied and declared and target.casefold() in _vba_plan_names(declared[1]):details.append('deklaracja modułu: '+text[:260])
+        detail='; '.join(details[:3]) or 'brak deklaracji potwierdzającej lokalny zakres'
+        raise ValueError('Wynik pomocnika „'+target+'” nie ma potwierdzonej lokalnej zmiennej Boolean lub Variant. Typ: '+(kind or 'nieustalony')+'. '+detail+'. Parametr, pole i stan modułu nie są zmieniane.')
+    if re.search(r'\bStatic\b',cleaned[start],re.I):raise ValueError('Lokalny wynik pomocnika ma trwały stan Static; nie można pominąć jego zapisu.')
+    if any(re.match(r'^(?:GoTo|GoSub|Return|Resume|On\s+Error|For|Next|Do|Loop|While|Wend)\b',_vba_plan_masked(text),re.I) or ':' in _vba_plan_masked(text) or text.startswith('#') for text in cleaned[start+1:end]):
+        raise ValueError('Przepływ lokalnego wyniku obejmuje nieobsługiwane przejścia, pętle lub obsługę błędów.')
+    if kind=='boolean':return kind
+    name=target.casefold()
+    for text in cleaned[start+1:position]:
+        masked=_vba_plan_masked(text)
+        if not re.search(r'\b'+re.escape(target)+r'\b',masked,re.I):continue
+        declared=re.fullmatch(r'Dim\s+(.+)',text,re.I)
+        if declared and name in _vba_plan_names(declared[1]):continue
+        assignment=re.fullmatch(r'(?:Let\s+)?'+re.escape(target)+r'\s*=\s*(.+)',text,re.I)
+        if assignment:
+            expression=assignment[1]
+            if re.fullmatch(r'True|False|[+-]?\d+(?:\.\d+)?|"(?:[^"]|"")*"',expression,re.I):continue
+            if locals_.get(expression.casefold())=='boolean':continue
+            call=re.fullmatch(r'([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\((.*)\)',expression,re.I)
+            if call and not re.search(r'\b'+re.escape(target)+r'\b',_vba_plan_masked(call[2]),re.I):
+                names=call[1].split('.');key=(names[0].casefold(),names[1].casefold()) if len(names)==2 else (module.casefold(),names[0].casefold())
+                procedure=program.get(key)
+                declaration=_VBA_PLAN_PROC.fullmatch(procedure.statements[0].text) if procedure else None
+                if key[0]==module.casefold() and names[0].casefold() not in scope_names and declaration and (declaration[4] or '').casefold()=='boolean':continue
+            raise ValueError('Lokalny Variant mógł otrzymać obiekt lub nieustaloną wartość przed pytaniem; nie pominięto jego przypisania: '+text[:200])
+        condition=re.fullmatch(r'If\s+(.+?)\s+Then(?:\s+Exit\s+(?:Sub|Function))?',text,re.I)
+        if condition and _vba_plan_normal_spaces(condition[1]) in (name,'not '+name,name+' = true',name+' = false',name+' <> true',name+' <> false'):continue
+        raise ValueError('Lokalny Variant mógł zostać przekazany ByRef lub użyty poza obsługiwaną analizą: '+text[:200])
+    return kind
 
 
 def _vba_plan_helper_guard(module, code, lines, cleaned, physical_starts, declaration, proc_start, proc_end,
@@ -6490,11 +6552,15 @@ def _vba_plan_helper_guard(module, code, lines, cleaned, physical_starts, declar
     context={'module':module,'procedure':declaration[2],'helper_module':helper.module,'helper_procedure':helper.name,'helper_excerpt':helper_excerpt}
     focus=position;stage='Analiza pomocnika pytania'
     try:
+        relevances=[_vba_plan_helper_prompt_relevance(sources[entry[2].module][2],entry[2],_vba_plan_split_args(entry[1][3]),cleaned,block_start,entry[0],prompt) for entry in calls]
+        if all(value is False for value in relevances):
+            return {'unmatched':True,'helper_targets':[(item[2].module,item[2].name) for item in calls]}
+        if any(value is True for value in relevances):context['_exact_prompt_match']=True
         if len(calls)!=1:raise ValueError('Blok wywołuje kilka pomocników Boolean; nie ustalono pojedynczego wpływu kontroli.')
         if shadowed_call:raise ValueError('Nazwa pomocnika jest przesłonięta zmienną wywołującej procedury.')
         if helper.module.casefold()!=module.casefold():raise ValueError('Znaleziono źródło pomocnika w innym module. Bieżąca analiza potwierdza wyłącznie wywołania w tym samym module; widoczność i rodzaj modułu wymagają osobnego dowodu.')
         target=call[1];target_key=target.casefold()
-        if locals_.get(target_key)!='boolean':raise ValueError('Wynik pomocnika musi trafić do jawnej lokalnej zmiennej Boolean.')
+        _vba_plan_helper_local_target(target,cleaned,proc_start,position,proc_end,locals_,program,module,scope_names)
         if any(text.startswith('#') for text in cleaned):raise ValueError('Moduł zawiera dyrektywy kompilacji; nie ustalono wersji pomocnika.')
         preserved=[];false_assignments=[];bindings={}
         for index in range(block_start+1,block_end):
@@ -6522,10 +6588,12 @@ def _vba_plan_helper_guard(module, code, lines, cleaned, physical_starts, declar
         if not match:return {'unmatched':True,'helper_targets':[(item[2].module,item[2].name) for item in calls]}
         if match['kind'] not in ('literal_exact','literal_normalized'):
             raise ValueError('Dopasowano tylko wspólny fragment pytania pomocnika. Nie potwierdzono pełnej treści związanej z tym miejscem wywołania.')
+        context['_exact_prompt_match']=True
         stage='Wartość kontynuacji w kodzie wywołującym'
-        continuation,consumer=_vba_plan_helper_continuation(cleaned,block_end+1,proc_end,target,'exit '+declaration[1].casefold())
+        continuation,consumer=_vba_plan_helper_continuation(cleaned,position+1,proc_end,target,'exit '+declaration[1].casefold())
         stage='Wartość zwracana przez walidator'
-        semantic='Zmieniono tylko lokalny wynik wybranego pomocnika zgodnie z późniejszym warunkiem wyjścia.'
+        semantic=('Pominięto wyłącznie pytanie i zapis jego nieodczytywanego lokalnego wyniku.' if continuation is None else
+                  'Zmieniono tylko lokalny wynik wybranego pomocnika zgodnie z późniejszym warunkiem wyjścia.')
         if declaration[1].casefold()=='function':
             if (declaration[4] or '').casefold()!='boolean':raise ValueError('Walidator nie ma jawnego wyniku Boolean.')
             try:semantic=_vba_plan_boolean_success(cleaned,declaration,proc_start,block_start,block_end,proc_end)
@@ -6536,7 +6604,7 @@ def _vba_plan_helper_guard(module, code, lines, cleaned, physical_starts, declar
             raw=lines[index]
             if index in false_assignments or index==position:
                 indent=re.match(r'\s*',raw)[0].rstrip('\r\n')
-                if index==position:parts.append(indent+target+' = '+('True' if continuation else 'False')+ending)
+                if index==position and continuation is not None:parts.append(indent+target+' = '+('True' if continuation else 'False')+ending)
                 parts.extend((indent+"If False Then ' Pivot Studio: selected validation effect in reviewed copy"+ending,raw,indent+'End If'+ending))
             else:parts.append(raw)
         new=''.join(parts);key=(module.casefold(),declaration[2].casefold());path=call_paths.get(key,())
@@ -6545,8 +6613,9 @@ def _vba_plan_helper_guard(module, code, lines, cleaned, physical_starts, declar
                   'Aktywacja i wybór komórki pozostają w kolejności źródła i mogą uruchamiać zdarzenia Excela.']
         if not path:warnings.append('Nie potwierdzono bezpośredniej ścieżki od makra startowego do wywołującej procedury.')
         if len(old)>12000 or len(preserved)>254:raise ValueError('Podgląd pojedynczej kontroli przekracza limit.')
-        reason=('Odczytano pomocnik '+helper.name+': Tak → '+str(summary.yes_result)+', Nie → '+str(summary.no_result)+'. '
-                'Warunek wyjścia w wierszu '+str(physical_starts[consumer])+' potwierdza kontynuację przy '+target+' = '+str(continuation)+'. '
+        continuation_note=('Lokalny wynik '+target+' nie jest odczytywany przed końcem procedury; pominięto przypisanie bez wymuszania True/False.' if continuation is None else
+            'Warunek wyjścia w wierszu '+str(physical_starts[consumer])+' potwierdza kontynuację przy '+target+' = '+str(continuation)+'.')
+        reason=('Odczytano pomocnik '+helper.name+': Tak → '+str(summary.yes_result)+', Nie → '+str(summary.no_result)+'. '+continuation_note+' '
                 'Zachowano przygotowanie tekstu, aktywację, przewijanie i wybór komórki. '+semantic)
         evidence=_VbaPatchEvidence('summarized_message_helper',tuple(physical_starts[index] for index in sorted(set(preserved)|{block_start,block_end})),
                                   tuple(physical_starts[index] for index in sorted(false_assignments+[position])),reason,
@@ -6672,6 +6741,73 @@ def _vba_plan_rejection_context(lines, cleaned, physical_starts, index, block_st
     return {'line': first, 'end_line': last, 'block_line': physical_starts[block_start],
             'block_end_line': physical_starts[block_end] + len(lines[block_end].splitlines()) - 1,
             'stage': stage, 'statement': cleaned[index][:1800], 'excerpt': excerpt}
+
+
+def _vba_plan_helper_prompt_relevance(helper_cleaned, helper, actuals, caller_cleaned, block_start, call_position, prompt):
+    """Exclude only a provably different, fully literal helper prompt.
+
+    This is not a purity, scope or edit-safety proof. Unknown data/control flow
+    stays unknown and must pass the normal helper analysis before any proposal.
+    """
+    whitespace={'vbcrlf':'\r\n','vbcr':'\r','vblf':'\n','vbnewline':'\r\n','vbtab':'\t','vbnullstring':''}
+    if set(whitespace)&helper.shadowed or 'msgbox' in helper.shadowed:return None
+    def literal(expression,bindings):
+        try:tokens=_vba_plan_tokens(expression)
+        except ValueError:return None
+        if len(tokens)>256:return None
+        position=0
+        def read(depth=0):
+            nonlocal position
+            if depth>16 or position>=len(tokens):raise ValueError('text')
+            token=tokens[position];position+=1
+            if token=='(':
+                value=read(depth+1)
+                if position>=len(tokens) or tokens[position]!=')':raise ValueError('text')
+                position+=1
+            elif token.startswith('"'):value=token[1:-1].replace('""','"')
+            elif token.casefold() in bindings:value=bindings[token.casefold()]
+            else:value=whitespace.get(token.casefold())
+            if value is None:raise ValueError('dynamic')
+            while position<len(tokens) and tokens[position]=='&':
+                position+=1;value+=read(depth+1)
+                if len(value)>8192:raise ValueError('text limit')
+            return value
+        try:
+            value=read()
+            return value if position==len(tokens) else None
+        except ValueError:return None
+    def assign(text,bindings):
+        match=re.fullmatch(r'(?:Let\s+)?([A-Za-z_]\w*)\s*=\s*(.+)',text,re.I)
+        if match:bindings[match[1].casefold()]=literal(match[2],bindings);return True
+        return False
+    try:
+        declaration=_VBA_PLAN_PROC.fullmatch(helper_cleaned[helper.start])
+        parameters=_vba_plan_split_args(declaration[3]) if declaration and declaration[3].strip() else []
+        if len(parameters)!=len(actuals) or len(parameters)>4 or helper.end-helper.start>120:return None
+        caller_bindings={}
+        for text in caller_cleaned[block_start+1:call_position]:
+            if not text or _vba_plan_presentation(text):continue
+            if not assign(text,caller_bindings):caller_bindings.clear()
+        bindings={}
+        for parameter,actual in zip(parameters,actuals):
+            match=re.fullmatch(r'(?:(?:ByVal|ByRef)\s+)?([A-Za-z_]\w*)\s+As\s+String',parameter,re.I)
+            if not match:return None
+            bindings[match[1].casefold()]=literal(actual,caller_bindings)
+        question=re.compile(r'(?<![\w.])(?:VBA\.(?:Interaction\.)?)?MsgBox\s*\(',re.I)
+        questions=[index for index in range(helper.start+1,helper.end) if question.search(_vba_plan_masked(helper_cleaned[index]))]
+        if len(questions)!=1:return None
+        for index in range(helper.start+1,questions[0]):
+            text=helper_cleaned[index]
+            if not text or re.match(r'^Dim\b',text,re.I):continue
+            if re.match(r'^(?:If|Else|End|For|Next|Do|Loop|While|Wend|Select|Case|On|GoTo|GoSub|Exit|Resume|Return)\b',text,re.I) or ':' in _vba_plan_masked(text):return None
+            if not assign(text,bindings):bindings.clear()
+        call=re.fullmatch(r'(?:[A-Za-z_]\w*\s*=\s*)?(?:VBA\.(?:Interaction\.)?)?MsgBox\s*\((.*)\)',helper_cleaned[questions[0]],re.I)
+        if not call:return None
+        arguments=_vba_plan_split_args(call[1])
+        if not arguments:return None
+        message=literal(arguments[0],bindings)
+        return None if message is None else _vba_plan_normal(message)==_vba_plan_normal(prompt)
+    except (ValueError,IndexError):return None
 
 
 def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
@@ -7036,6 +7172,13 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
         other is not item and other['module']==item['module'] and
         other['start_offset']<item['start_offset'] and item['end_offset']<=other['end_offset']
         for other in candidates)]
+    uncertain_matches=[item for item in result['rejections'] if item.pop('_exact_prompt_match',False)]
+    if result['candidates'] and uncertain_matches:
+        # An unsupported occurrence of the same exact question remains a
+        # possible source of the observed dialog. Do not silently select the
+        # sole supported occurrence and describe it as unique.
+        result['candidates']=[]
+        result['rejections'].append({'reason':'Ten sam pełny komunikat występuje również w bloku, którego zmiany nie potwierdzono. Nie wybrano automatycznie innego miejsca; szczegóły wskazują nierozstrzygnięte wystąpienie.'})
     if result["candidates"]:
         result["status"] = "candidate" if len(result["candidates"]) == 1 else "ambiguous"
         for candidate in result["candidates"]:
@@ -24083,6 +24226,41 @@ def excel_vba_patch_test_suite():
             self.assertEqual(new[-2].strip().casefold(), 'end if')
             self.assertEqual(item['new_header'], item['old_header'])
 
+        def test_helper_prompt_excludes_unrelated_sites_before_result_type_checks(self):
+            unrelated=''.join('Function Other'+str(index)+'(ByVal invalid As Boolean) As Boolean\n'
+                ' Dim answer\n If invalid Then\n  Other'+str(index)+' = False\n'
+                '  Call SelectCell(ReportSheet, "Field", 1)\n'
+                '  answer = AskUser("Different validation '+str(index)+'")\n'
+                '  If Not answer Then Exit Function\n End If\nEnd Function\n' for index in range(20))
+            report=self.plan(self.helper_fixture()+unrelated)
+            self.assertEqual(report['status'],'candidate',report['rejections']);self.assertEqual(len(report['candidates']),1)
+            self.assertEqual(report['rejections'],[]);self.assertEqual(report['analysis']['matched_blocks'],1)
+
+        def test_helper_prompt_prefilter_keeps_unknown_message_diagnostics(self):
+            unknown='Function Other(ByVal invalid As Boolean, ByVal unknownText As String) As Boolean\n If invalid Then\n  answer = AskUser(unknownText)\n End If\nEnd Function\n'
+            report=self.plan(self.helper_fixture()+unknown)
+            self.assertEqual(len(report['candidates']),1);self.assertTrue(any(item.get('procedure')=='Other' for item in report['rejections']))
+
+        def test_helper_prompt_identical_messages_still_require_disambiguation(self):
+            source=self.helper_fixture();helper_start=source.rfind('\n',0,source.index('Function AskUser'))+1
+            # Keep one shared helper; both callers use the same full message.
+            duplicate=source[:helper_start].replace('GenerateDocument','GenerateOther').replace('CheckDocument','CheckOther')
+            report=self.plan(source+duplicate)
+            self.assertEqual(report['status'],'ambiguous',report['rejections']);self.assertEqual(len(report['candidates']),2)
+            self.assertTrue(all(not item['unique_prompt_candidate'] for item in report['candidates']))
+
+        def test_helper_prompt_prefilter_does_not_guess_conditional_text(self):
+            source=self.helper_fixture(helper_body=' Dim message As String\n Dim answer As Long\n message = detail\n If Len(detail) > 1 Then\n  message = "Different condition-dependent text"\n End If\n answer = MsgBox(message, vbYesNo)\n AskUser = (answer = vbNo)\n')
+            report=self.plan(source)
+            self.assertFalse(report['candidates']);self.assertTrue(report['rejections']);self.assertEqual(report['rejections'][0].get('helper_procedure'),'AskUser')
+
+        def test_helper_prompt_rejected_identical_site_cannot_make_other_site_unique(self):
+            source=self.helper_fixture();helper_start=source.rfind('\n',0,source.index('Function AskUser'))+1
+            duplicate=source[:helper_start].replace('GenerateDocument','GenerateOther').replace('CheckDocument','CheckOther').replace('  detail = ', '  WriteAuditRecord\n  detail = ')
+            report=self.plan(source+duplicate)
+            self.assertFalse(report['candidates']);self.assertTrue(any('Ten sam pełny komunikat' in item['reason'] for item in report['rejections']))
+            self.assertNotIn('_exact_prompt_match',dumps(report))
+
         def validator_fixture(self):
             return ('Sub GenerateDocument()\n If Not CheckDocument(False, False, False) Then Exit Sub\n ExportDocument\nEnd Sub\n'
                     'Function CheckDocument(ByVal firstInvalid As Boolean, ByVal selectedInvalid As Boolean, ByVal lastInvalid As Boolean) As Boolean\n'
@@ -24170,6 +24348,102 @@ def excel_vba_patch_test_suite():
             for body in (' AskUser = (MsgBox(detail & " Czy przerwac sprawdzanie?", vbYesNo) = vbNo)\n',
                          ' If MsgBox(detail & " Czy przerwac sprawdzanie?", vbYesNo) = vbNo Then AskUser = True\n'):
                 with self.subTest(body=body):self.assertEqual(self.plan(self.helper_fixture(body))['status'],'candidate')
+
+        def implicit_helper_fixture(self, caller_type='', answer_type=''):
+            body=(' AskUser = True\n Dim answer'+answer_type+', message As String\n'
+                  ' message = detail & " Czy przerwac sprawdzanie?"\n'
+                  ' answer = MsgBox(message, vbExclamation + vbYesNo, "Validation")\n'
+                  ' If answer = vbYes Then AskUser = False\n')
+            return self.helper_fixture(body).replace(' Dim continueRun As Boolean',' Dim continueRun'+caller_type).replace(' If Not continueRun Then Exit Function\n','')
+
+        def test_helper_implicit_and_explicit_variant_dead_result_preserves_other_checks(self):
+            for caller_type,answer_type in itertools.product(('',' As Variant',' As Boolean'),('',' As Variant',' As VbMsgBoxResult')):
+                with self.subTest(caller=caller_type,answer=answer_type):
+                    code=self.implicit_helper_fixture(caller_type,answer_type);result=self.plan(code)
+                    self.assertEqual(result['status'],'candidate');item=result['candidates'][0]
+                    self.assertNotIn('continueRun = True',item['new_block']);self.assertNotIn('continueRun = False',item['new_block'])
+                    self.assertIn('nie jest odczytywany',item['reason'])
+                    patched=code[:item['start_offset']]+item['new_block']+code[item['end_offset']:]
+                    self.assertEqual(patched.count('CheckDocument = True'),1)
+                    for first,selected,last in itertools.product((False,True),repeat=3):
+                        before,old_events=self.execute_validator_fixture(code,first,selected,last)
+                        after,new_events=self.execute_validator_fixture(patched,first,selected,last)
+                        self.assertEqual(before,not(first or selected or last));self.assertEqual(after,not(first or last))
+                        self.assertEqual(new_events,[event for event in old_events if event!='question'])
+
+        def test_helper_dead_result_at_procedure_end_needs_no_guessed_value_or_initialization(self):
+            code=self.implicit_helper_fixture().replace(' continueRun = True\n','').replace(' If lastInvalid Then\n  CheckDocument = False\n End If\n','')
+            item=self.plan(code)['candidates'][0]
+            self.assertNotIn('continueRun = True',item['new_block']);self.assertNotIn('continueRun = False',item['new_block'])
+            self.assertIn('AskUser = True',code[item['end_offset']:])
+            self.assertTrue(code[item['end_offset']:].startswith('End Function\n'))
+            # A declared Variant with an actual later exit consumer still uses
+            # the consumer-proven Boolean; dead-result handling is not a guess.
+            code=code.replace(' End If\nEnd Function\n',' End If\n If Not continueRun Then Exit Function\nEnd Function\n',1)
+            self.assertIn('continueRun = True',self.plan(code)['candidates'][0]['new_block'])
+
+        def test_helper_variant_object_escape_unknown_prior_write_and_static_scope_refuse(self):
+            base=self.implicit_helper_fixture()
+            for instruction in ('Set continueRun = CreateObject("Example.Component")','Mutate continueRun','continueRun = ReadUnknown()',
+                                'continueRun = AskUser(continueRun)','Consume VarPtr(continueRun)'):
+                with self.subTest(instruction=instruction):
+                    result=self.plan(base.replace(' continueRun = True',' '+instruction))
+                    self.assertFalse(result['candidates']);self.assertTrue(any('Variant' in item['reason'] for item in result['rejections']))
+            for changed in (base.replace('Function CheckDocument(','Static Function CheckDocument('),base.replace(' Dim continueRun',' Static continueRun'),
+                            base.replace(' CheckDocument = True',' CheckDocument = True\n On Error Resume Next'),
+                            base.replace(' CheckDocument = True',' CheckDocument = True\nretryHere:\n'),
+                            base.replace(' CheckDocument = True',' CheckDocument = True\n Do').replace('End Function\nPrivate Function',' Loop\nEnd Function\nPrivate Function')):
+                self.assertFalse(self.plan(changed)['candidates'])
+
+        def test_helper_variant_prior_boolean_returns_are_scoped_and_self_reference_refuses(self):
+            base=self.implicit_helper_fixture()
+            code=base.replace(' continueRun = True',' continueRun = AskUser("Earlier independent problem.")')
+            self.assertEqual(self.plan(code)['status'],'candidate')
+            code=base.replace(' continueRun = True',' continueRun = AskUser(continueRun)')
+            self.assertFalse(self.plan(code)['candidates'])
+            code=base.replace(' continueRun = True',' continueRun = UnknownModule.AskUser("Earlier independent problem.")')
+            self.assertFalse(self.plan(code)['candidates'])
+
+        def test_helper_result_liveness_includes_same_guard_and_later_reads(self):
+            base=self.implicit_helper_fixture()
+            for changed in (base.replace('  continueRun = AskUser(detail)','  continueRun = AskUser(detail)\n  detail = CStr(continueRun)'),
+                            base.replace(' If lastInvalid Then',' StoreAnswer continueRun\n If lastInvalid Then'),
+                            base.replace(' If lastInvalid Then',' CheckDocument = continueRun\n If lastInvalid Then')):
+                with self.subTest(code=changed):self.assertFalse(self.plan(changed)['candidates'])
+
+        def test_helper_repeated_identical_questions_remain_ambiguous_after_local_overwrite(self):
+            code=self.implicit_helper_fixture()
+            guard=re.search(r' If selectedInvalid Then\n.*?\n End If',code,re.S)[0]
+            code=code.replace(guard,guard+'\n'+guard.replace('selectedInvalid','secondInvalid'))
+            result=self.plan(code);self.assertEqual(result['status'],'ambiguous');self.assertEqual(len(result['candidates']),2)
+            self.assertTrue(all(item['unique_prompt_candidate'] is False for item in result['candidates']))
+            self.assertTrue(all('continueRun = True' not in item['new_block'] for item in result['candidates']))
+
+        def test_helper_multiple_calls_do_not_hide_match_after_unrelated_first_prompt(self):
+            code=self.implicit_helper_fixture().replace('  continueRun = AskUser(detail)',
+                '  continueRun = AskUser("Missing account description.")\n  continueRun = AskUser(detail)')
+            result=self.plan(code);self.assertFalse(result['candidates'])
+            self.assertTrue(any('kilka pomocników' in item['reason'] for item in result['rejections']))
+
+        def test_helper_variant_scope_diagnostics_distinguish_globals_parameters_and_unknowns(self):
+            base=self.implicit_helper_fixture();undeclared=base.replace(' Dim continueRun\n','')
+            cases=((undeclared,'brak deklaracji'),('Private continueRun As Variant\n'+undeclared,'deklaracja modułu'),
+                   (undeclared.replace('ByVal firstInvalid As Boolean','ByRef continueRun As Variant, ByVal firstInvalid As Boolean'),'parametr'),
+                   (base.replace(' Dim continueRun',' Dim continueRun As Object'),'deklaracja w procedurze'))
+            for code,note in cases:
+                with self.subTest(note=note):
+                    result=self.plan(code);self.assertFalse(result['candidates'])
+                    self.assertTrue(any(note in item['reason'] and 'continueRun' in item['reason'] for item in result['rejections']))
+
+        def test_helper_implicit_variant_def_type_and_uninitialized_reads_are_not_guessed(self):
+            for directive in ('DefBool A-Z','DefInt A-Z','DefStr A-Z','DefObj A-Z'):
+                with self.subTest(directive=directive):
+                    self.assertFalse(self.plan(directive+'\n'+self.implicit_helper_fixture(' As Variant'))['candidates'])
+                    self.assertFalse(self.plan(directive+'\n'+self.implicit_helper_fixture('', ' As Variant'))['candidates'])
+            explicit='DefBool A-Z\n'+self.implicit_helper_fixture(' As Variant',' As Variant')
+            self.assertEqual(self.plan(explicit)['status'],'candidate')
+            uninitialized=self.implicit_helper_fixture().replace(' answer = MsgBox',' If answer = vbYes Then AskUser = False\n answer = MsgBox')
+            self.assertFalse(self.plan(uninitialized)['candidates'])
 
         def test_shared_helper_matches_full_bound_prompt_and_only_selected_caller(self):
             code=self.helper_fixture();guard=re.search(r' If selectedInvalid Then\n.*?\n End If\n If Not continueRun Then Exit Function',code,re.S)[0]
