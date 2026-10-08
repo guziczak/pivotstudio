@@ -5906,8 +5906,14 @@ def _vba_plan_declared_symbols(declaration, cleaned, start, end):
 def _vba_plan_message(statement, symbols, shadowed, bindings=None):
     match = re.fullmatch(r"(?:Call\s+)?((?:VBA\.)?(?:Interaction\.)?MsgBox)\b\s*(.*)", statement, re.I)
     qualified=bool(match and match[1].casefold().startswith('vba.'))
-    if not match or (qualified and 'vba' in shadowed) or (not qualified and ('msgbox' in shadowed or 'msgbox' in symbols or '.' in match[1])):
-        raise ValueError("Blok nie zawiera pojedynczego standardowego MsgBox.")
+    if not match:
+        raise ValueError("Analizowana instrukcja nie ma obsługiwanej postaci wywołania MsgBox.")
+    if qualified and 'vba' in shadowed:
+        raise ValueError("Projekt zawiera deklarację „VBA”; nie potwierdzono, że analizowane wywołanie używa standardowej funkcji VBA.MsgBox.")
+    if not qualified and ('msgbox' in shadowed or 'msgbox' in symbols):
+        raise ValueError("Projekt zawiera deklarację „MsgBox”; nie potwierdzono, że analizowane wywołanie używa standardowej funkcji MsgBox.")
+    if not qualified and '.' in match[1]:
+        raise ValueError("Odwołanie „"+match[1]+"” nie wskazuje jednoznacznie standardowej funkcji VBA.MsgBox.")
     arguments = match[2].strip()
     if arguments.startswith("(") and arguments.endswith(")"):
         arguments = arguments[1:-1]
@@ -5980,6 +5986,25 @@ def _vba_plan_boolean_success(cleaned, declaration, proc_start, block_start, blo
     raise ValueError("Nie potwierdzono zwrócenia True po pominięciu warunku; samo usunięcie False/Exit Function mogłoby nadal zwrócić False.")
 
 
+def _vba_plan_rejection_context(lines, cleaned, physical_starts, index, block_start, block_end, stage):
+    """Small static source excerpt; never an executed-line trace or event-log text."""
+    first = physical_starts[index]
+    last = first + len(lines[index].splitlines()) - 1
+    physical = ''.join(lines[max(block_start, index - 2):min(block_end + 1, index + 3)]).splitlines()
+    offset = physical_starts[max(block_start, index - 2)]
+    # Long continuations should not hide the rejected statement below context.
+    if first - offset > 3:
+        physical = physical[first - offset - 3:]
+        offset = first - 3
+    selected = physical[:12]
+    excerpt = '\n'.join(('> ' if first <= offset + n <= last else '  ') + str(offset + n) + ': ' + text for n, text in enumerate(selected))
+    if len(physical) > 12:excerpt += '\n… dalsze wiersze pominięte'
+    if len(excerpt) > 3500:excerpt = excerpt[:3450] + '\n… fragment skrócony'
+    return {'line': first, 'end_line': last, 'block_line': physical_starts[block_start],
+            'block_end_line': physical_starts[block_end] + len(lines[block_end].splitlines()) - 1,
+            'stage': stage, 'statement': cleaned[index][:1800], 'excerpt': excerpt}
+
+
 def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
     """Return preview-only proposals; callers must revalidate before writing a COPY.
 
@@ -5992,12 +6017,17 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
     """
     result = {"status": "unsupported", "candidates": [], "rejections": [], "complete": True,
               "notice": "Propozycja statyczna do przeglądu. Nie ustala wykonanej gałęzi, nie uruchamia makra i nie zmienia pliku. Zastosowanie wymaga osobnej zgody i kopii skoroszytu."}
+    analysis = result['analysis'] = dict(modules=0, procedures=0, blocks=0, matched_blocks=0, candidates=0, rejections=0, complete=True)
+    def finish():
+        analysis.update(candidates=len(result['candidates']), rejections=len(result['rejections']), complete=result['complete'])
+        return result
     if not isinstance(modules, list) or not isinstance(prompt_text, str) or not isinstance(macro_name, str):
         result["rejections"].append({"reason": "Nieprawidłowe wejście planera."})
-        return result
+        result['complete'] = False
+        return finish()
     if len(_vba_plan_normal(prompt_text)) < 20 or len(prompt_text) > 8192:
         result["rejections"].append({"reason": "Potrzebny jest charakterystyczny tekst pytania; sama odpowiedź Tak/Nie nie wskazuje walidacji."})
-        return result
+        return finish()
     total = 0
     prepared = []
     shadowed = set()
@@ -6036,11 +6066,17 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                 except ValueError:
                     result['complete']=False
         prepared.append((module["name"], code, lines, cleaned))
+        analysis['modules'] += 1
     if len(modules) > 100:
         result["complete"] = False
     requested = macro_name.rsplit("!", 1)[-1].strip().strip("'").casefold()
 
     for module_name, code, lines, cleaned in prepared:
+        physical_starts = []
+        physical_line = 1
+        for raw in lines:
+            physical_starts.append(physical_line)
+            physical_line += len(raw.splitlines())
         proc_start = None
         declaration = None
         for proc_end, line in enumerate(cleaned):
@@ -6051,6 +6087,7 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                 declaration = _VBA_PLAN_PROC.fullmatch(line)
             if proc_start is None or not re.fullmatch(r"End\s+(Sub|Function)", line, re.I):
                 continue
+            analysis['procedures'] += 1
             try:
                 if _vba_plan_normal_spaces(line) != "end " + declaration[1].casefold():
                     raise ValueError("Niezgodny koniec procedury.")
@@ -6071,6 +6108,7 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                 inline_message = bool(direct_message and direct_response['tail'])
                 if not header and not inline_message:
                     continue
+                analysis['blocks'] += 1
                 depth = 1
                 block_end = block_start if inline_message else None
                 has_else = False
@@ -6087,8 +6125,9 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                         has_else = True
                 if block_end is None:
                     continue
-                body = [text for text in cleaned[block_start + 1:block_end] if text]
-                if inline_message:body=[direct_response['tail']]
+                body_indices = [position for position in range(block_start + 1, block_end) if cleaned[position]]
+                body = [cleaned[position] for position in body_indices]
+                if inline_message:body=[direct_response['tail']];body_indices=[block_start]
                 # Reject only blocks containing a related literal, so unrelated
                 # business code does not produce a wall of refusal messages.
                 literal_values = [match[1].replace('""', '"') for text in [cleaned[block_start]]+body for match in re.finditer(r'"((?:[^"]|"")*)"', text)]
@@ -6096,13 +6135,18 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                 literal_parts=[_vba_plan_normal(value) for value in literal_values]
                 if not any(len(value)>=20 and value in visible_prompt for value in literal_parts) and sum(len(value) for value in literal_parts if value and value in visible_prompt)<20:
                     continue
-                context = {"module": module_name, "procedure": declaration[2], "line": 1+sum(len(text.splitlines()) for text in lines[:block_start]), "end_line": sum(len(text.splitlines()) for text in lines[:block_end+1])}
+                analysis['matched_blocks'] += 1
+                context = {"module": module_name, "procedure": declaration[2], "line": physical_starts[block_start], "end_line": physical_starts[block_end]+len(lines[block_end].splitlines())-1}
+                focus = block_start
+                stage = 'Struktura warunku'
                 try:
                     if has_else:
                         raise ValueError("Else/ElseIf mogłoby wykonać inną pracę po zmianie warunku; nie proponuję takiej zmiany.")
                     if any(text.startswith("#") for text in cleaned):
                         raise ValueError("Moduł zawiera dyrektywy kompilacji; wybrana wersja kodu nie została potwierdzona.")
-                    if any(":" in _vba_plan_masked(text) for text in cleaned[block_start:block_end + 1]):
+                    colon_index = next((position for position in range(block_start, block_end + 1) if ":" in _vba_plan_masked(cleaned[position])), None)
+                    if colon_index is not None:
+                        focus = colon_index
                         raise ValueError("Etykiety lub wiele instrukcji w wierszu są poza obsługiwanym wzorcem.")
                     _vba_plan_split_args(direct_response['expression'] if direct_message else header[1])
                     # Preserve the original condition and its evaluation. It may
@@ -6117,43 +6161,55 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                     # Preserve local message construction; only its standard
                     # MsgBox and the proven early-return branch may be disabled.
                     if not direct_message:
-                        for statement in body:
+                        for position, statement in zip(body_indices, body):
                             assignment=re.fullmatch(r'(?:Let\s+)?([A-Za-z_]\w*)\s*=\s*(.+)',statement,re.I)
                             if not assignment or locals_.get(assignment[1].casefold())!='string':break
+                            focus = position;stage = 'Przygotowanie tekstu pytania'
                             _vba_plan_pure_expression(assignment[2],symbols,shadowed)
                             expression=' '.join(bindings.get(token.casefold(),token) for token in _vba_plan_tokens(assignment[2]))
                             if len(expression)>2048:raise ValueError('Treść komunikatu przekracza limit analizy.')
                             bindings[assignment[1].casefold()]=expression;prefix_count+=1
                         body=body[prefix_count:]
+                        body_indices=body_indices[prefix_count:]
                         if not body:raise ValueError('Brak komunikatu po przygotowaniu jego treści.')
                         if declaration[1].casefold()=='function' and re.fullmatch(re.escape(declaration[2])+r'\s*=\s*False',body[0],re.I):
-                            boolean_return=True;body=body[1:]
+                            boolean_return=True;body=body[1:];body_indices=body_indices[1:]
                     if not body:raise ValueError('Brak komunikatu walidacji.')
+                    focus = block_start if direct_message else body_indices[0]
+                    stage = 'Rozpoznanie wywołania komunikatu'
                     assignment=re.fullmatch(r'(?:Let\s+)?([A-Za-z_]\w*)\s*=\s*((?:VBA\.(?:Interaction\.)?)?MsgBox\s*\(.*\))',body[0],re.I) if not direct_message else None
                     if assignment:
                         response_name=assignment[1]
                         if locals_.get(response_name.casefold()) not in {'byte','integer','long','longlong','longptr','vbmsgboxresult'}:
                             raise ValueError('Wynik MsgBox musi być zapisany w lokalnej zmiennej liczbowej lub VbMsgBoxResult; nie zmieniam parametrów, obiektów ani zmiennych globalnych.')
                         inner=_vba_plan_response(body[1]) if len(body)>1 else None
-                        if not inner or inner['expression'].casefold()!=response_name.casefold():raise ValueError('Brak bezpośredniego sprawdzenia odpowiedzi zapisanej z MsgBox.')
+                        if not inner or inner['expression'].casefold()!=response_name.casefold():
+                            focus=body_indices[1] if len(body_indices)>1 else focus;stage='Sprawdzenie odpowiedzi'
+                            raise ValueError('Brak bezpośredniego sprawdzenia odpowiedzi zapisanej z MsgBox.')
                         message_expression,message_literals=_vba_plan_message(assignment[2],symbols,shadowed,bindings)
                         if inner['tail']:
-                            if len(body)!=2:raise ValueError('Po odpowiedzi MsgBox blok wykonuje dodatkową pracę.')
+                            if len(body)!=2:
+                                focus=body_indices[2];stage='Instrukcje po odpowiedzi'
+                                raise ValueError('Po odpowiedzi MsgBox blok wykonuje dodatkową pracę.')
                             remaining_body=[inner['tail']]
+                            remaining_indices=[body_indices[1]]
                         else:
                             if not re.fullmatch(r'End\s+If',body[-1],re.I):raise ValueError('Niepełny blok sprawdzenia odpowiedzi MsgBox.')
                             remaining_body=body[2:-1]
+                            remaining_indices=body_indices[2:-1]
                         response_assignment=response_name+' = '+str(inner['continue_answer'])
                         response_conditional=True
                     elif direct_message:
                         message_expression,message_literals=_vba_plan_message(direct_response['expression'],symbols,shadowed)
                         remaining_body=body
+                        remaining_indices=body_indices
                     elif len(body) == 1:
                         inner = _vba_plan_response(body[0])
                         if not inner or not inner['tail'] or _vba_plan_normal_spaces(inner['tail']) != exit_text:
                             raise ValueError("Brak prostego MsgBox i wyjścia z tej samej procedury.")
                         message_expression, message_literals = _vba_plan_message(inner['expression'], symbols, shadowed,bindings)
                         remaining_body = [inner['tail']]
+                        remaining_indices = [body_indices[0]]
                         response_conditional = True
                     elif len(body) >= 3 and re.fullmatch(r"End\s+If", body[-1], re.I):
                         inner = _vba_plan_response(body[0])
@@ -6161,23 +6217,30 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                             raise ValueError("Zagnieżdżony blok nie jest prostym pytaniem MsgBox z wyjściem.")
                         message_expression, message_literals = _vba_plan_message(inner['expression'], symbols, shadowed,bindings)
                         remaining_body = body[1:-1]
+                        remaining_indices = body_indices[1:-1]
                         response_conditional = True
                     else:
                         message_expression, message_literals = _vba_plan_message(body[0], symbols, shadowed,bindings)
                         remaining_body = body[1:]
+                        remaining_indices = body_indices[1:]
                     if response_conditional and {"vbyes", "vbno"} & shadowed:
                         raise ValueError("Nazwy odpowiedzi MsgBox są przesłonięte przez kod projektu.")
                     remaining = [_vba_plan_normal_spaces(text) for text in remaining_body]
                     if declaration[1].casefold() == "function" and remaining and re.fullmatch(re.escape(declaration[2]) + r"\s*=\s*False", remaining_body[0], re.I):
                         boolean_return = True
                         remaining = remaining[1:]
+                        remaining_indices = remaining_indices[1:]
                     if remaining != [exit_text] and not (boolean_return and not remaining):
+                        stage = 'Instrukcje po komunikacie'
+                        focus = next((position for position, statement in zip(remaining_indices, remaining) if statement != exit_text), remaining_indices[-1] if remaining_indices else focus)
                         raise ValueError("Blok wykonuje dodatkowe przypisania, wywołania lub pracę, której nie wolno usunąć jako samej walidacji.")
+                    stage = 'Dopasowanie tekstu pytania'
                     match = _vba_plan_match_prompt(message_expression, message_literals, prompt_text)
                     if not match:
                         raise ValueError("Treść MsgBox nie daje jednoznacznego, charakterystycznego dopasowania do pytania.")
                     semantic_note = "Po pominięciu bloku wykonanie może przejść do kolejnych instrukcji tej procedury."
                     if declaration[1].casefold() == "function":
+                        stage = 'Wartość zwracana przez funkcję'
                         if (declaration[4] or "").casefold() != "boolean":
                             raise ValueError("Nie potwierdzono semantyki wartości zwracanej przez funkcję inną niż Boolean.")
                         semantic_note = _vba_plan_boolean_success(cleaned, declaration, proc_start, block_start, block_end, proc_end)
@@ -6219,7 +6282,9 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                         result["candidates"].append(candidate)
                 except ValueError as error:
                     if len(result["rejections"]) < 24:
-                        result["rejections"].append(dict(context, reason=str(error)))
+                        rejection = dict(context, reason=str(error))
+                        rejection.update(_vba_plan_rejection_context(lines, cleaned, physical_starts, focus, block_start, block_end, stage))
+                        result["rejections"].append(rejection)
             proc_start = None
             declaration = None
         if proc_start is not None:
@@ -6241,7 +6306,9 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
             candidate["unique_prompt_candidate"] = len(result["candidates"]) == 1
             if len(result["candidates"]) > 1:
                 candidate["warnings"].append("Ten tekst pasuje do kilku bloków. Samo pytanie nie pozwala wybrać właściwego.")
-    return result
+    elif not result['rejections']:
+        result['reason'] = 'Nie znaleziono obsługiwanego bloku If zawierającego charakterystyczny tekst pytania. Treść może powstawać w innej procedurze, zmiennej albo wywołaniu pomocniczym.'
+    return finish()
 
 
 def _vba_plan_normal_spaces(value):
@@ -6962,12 +7029,16 @@ class ExcelSessionWorker:
         expected=source.get('file_sha256','')
         if not isinstance(expected,str) or not re.fullmatch('[0-9a-f]{64}',expected):raise UserError('Nie potwierdzono skrótu kopii przygotowanej do zmiany.')
         modules=source.get('modules',[]);plan=plan_vba_validation_patch(modules,macro_name=macro,prompt_text=prompt);preview['status']=str(plan.get('status','unsupported'))[:100]
-        preview['reason']=str(plan.get('reason',''))[:1800];preview['rejections']=[]
+        preview['reason']=str(plan.get('reason',''))[:1800];preview['rejections']=[];preview['analysis']=dict(plan.get('analysis',{}))
+        preview['file_sha256']=expected
         for item in plan.get('rejections',[])[:24]:
             record={'reason':str(item.get('reason',''))[:1800]} if isinstance(item,dict) else {'reason':str(item)[:1800]}
             if isinstance(item,dict):
-                for key in ('module','procedure','line'):
-                    if key in item:record[key]=str(item[key])[:128]
+                for key,maximum in (('module',128),('procedure',128),('stage',128),('statement',1800),('excerpt',3500)):
+                    if key in item:record[key]=str(item[key])[:maximum]
+                for key in ('line','end_line','block_line','block_end_line'):
+                    if type(item.get(key)) is int:record[key]=item[key]
+            if len(dumps(preview['rejections']+[record]).encode('utf-8'))>96*1024:break
             preview['rejections'].append(record)
         sources={item['name']:item['code'] for item in modules};candidates={}
         for candidate in plan.get('candidates',[])[:8]:
@@ -7586,7 +7657,33 @@ class ExcelSessionController:
             warnings=item.get('warnings',[])
             if not isinstance(warnings,list) or len(warnings)>10 or any(not isinstance(w,str) or len(w)>1800 for w in warnings):return
             entry['warnings']=list(warnings);clean['candidates'].append(entry)
-        clean['rejections']=[{'reason':str(item.get('reason',''))[:1800]} if isinstance(item,dict) else {'reason':str(item)[:1800]} for item in rejections]
+        clean['rejections']=[]
+        for item in rejections:
+            if not isinstance(item,dict):return
+            entry={}
+            for field,maximum in (('reason',1800),('module',128),('procedure',128),('stage',128),('statement',1800),('excerpt',3500)):
+                value=item.get(field,'')
+                if not isinstance(value,str) or len(value)>maximum:return
+                entry[field]=value
+            for field in ('line','end_line','block_line','block_end_line'):
+                if field not in item:continue
+                value=item[field]
+                if type(value) is not int or not 1<=value<=2147483647:return
+                entry[field]=value
+            if entry.get('end_line',entry.get('line',1))<entry.get('line',1):return
+            if entry.get('block_end_line',entry.get('block_line',1))<entry.get('block_line',1):return
+            clean['rejections'].append(entry)
+        analysis=report.get('analysis')
+        if analysis is not None:
+            if not isinstance(analysis,dict):return
+            clean['analysis']={}
+            for field in ('modules','procedures','blocks','matched_blocks','candidates','rejections'):
+                value=analysis.get(field,0)
+                if type(value) is not int or not 0<=value<=1000000:return
+                clean['analysis'][field]=value
+            complete=analysis.get('complete')
+            if type(complete) is not bool:return
+            clean['analysis']['complete']=complete
         if len(dumps(clean).encode('utf-8'))>256*1024:return
         with self.lock:
             if self.cancelled.is_set() or not jid or jid!=self.state['job_id'] or self.state.get('operation')!='prepare_vba_patch' or report.get('workbook_id')!=self.state['workbook_id']:return
@@ -13284,6 +13381,7 @@ def native_ui_types():
             self._scan_pending=False;self._action_pending=False;self._command_pending=False;self._sent_prompts={};self._retry_prompts=set();self._last_prompts=[];self._last_scan=0.;self._native_digest=None;self._event_seq=0;self._last_result_key=None
             self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
             self._last_failure=None;self._last_failure_key=None;self._show_pending=False
+            self._activity_records=[];self._activity_keys=[];self._activity_attempt=0
             self._vba_report={};self._vba_job='';self._vba_ignored_job='';self._vba_prompt='';self._vba_macro='';self._diag_active=False;self._diag_terminal_key=None;self._diag_macro_job=''
             self._patch_question=None;self._patch_plan={};self._patch_result={};self._patch_preview=None;self._patch_open_dialog=None;self._patch_open_path=''
             self._patch_run_request=None;self._generator_request=None;self._generator_stage=''
@@ -13383,7 +13481,14 @@ def native_ui_types():
             pdf_actions.addWidget(self.macro_pdf_save,0,0);pdf_actions.addWidget(self.macro_pdf_locate,0,1);pdf_results.addLayout(pdf_actions)
             self.macro_pdf_location=QW.QLineEdit();self.macro_pdf_location.setReadOnly(True);self.macro_pdf_location.setMinimumWidth(0);self.macro_pdf_location.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed);pdf_results.addWidget(self.macro_pdf_location)
             self.macro_pdf_open=button('Otwórz zapisany PDF',self.open_saved_macro_pdf);pdf_results.addWidget(self.macro_pdf_open);self.prompt_layout.addWidget(self.macro_pdf_frame);self.macro_pdf_frame.hide()
-            self.prompt_layout.addStretch()
+            self.activity_frame=QW.QGroupBox('Przebieg sesji');activity_layout=QW.QVBoxLayout(self.activity_frame)
+            activity_header=QW.QHBoxLayout();activity_header.addWidget(label('Obserwacje Pivota, bez śledzenia wykonanych linii VBA.',True,True),1)
+            self.activity_copy=button('Kopiuj log',self.copy_session_activity);self.activity_copy.setToolTip('Kopiuje przebieg sesji i dostępne szczegóły analizy VBA.');activity_header.addWidget(self.activity_copy);activity_layout.addLayout(activity_header)
+            self.activity_log=QW.QPlainTextEdit();self.activity_log.setReadOnly(True);self.activity_log.setAccessibleName('Chronologiczny przebieg sesji Excel');self.activity_log.setPlaceholderText('Tutaj pojawią się zlecenia, pytania, odpowiedzi i wyniki operacji.');self.activity_log.setMinimumHeight(90);self.activity_log.setMaximumHeight(360);activity_layout.addWidget(self.activity_log,1)
+            self.patch_diagnosis_toggle=QW.QToolButton();self.patch_diagnosis_toggle.setText('Szczegóły analizy VBA');self.patch_diagnosis_toggle.setCheckable(True);activity_layout.addWidget(self.patch_diagnosis_toggle,0,Qt.AlignmentFlag.AlignLeft)
+            self.patch_diagnosis=QW.QPlainTextEdit();self.patch_diagnosis.setReadOnly(True);self.patch_diagnosis.setAccessibleName('Statyczna diagnoza odmowy zmiany VBA');self.patch_diagnosis.setMinimumHeight(100);self.patch_diagnosis.setMaximumHeight(240);activity_layout.addWidget(self.patch_diagnosis)
+            activity_layout.removeWidget(self.activity_log);activity_layout.addWidget(self.activity_log,1)
+            self.patch_diagnosis_toggle.toggled.connect(self.toggle_patch_diagnosis);self.patch_diagnosis_toggle.hide();self.patch_diagnosis.hide();self.prompt_layout.addWidget(self.activity_frame,1)
             self.prompt_scroll=QW.QScrollArea();self.prompt_scroll.setWidgetResizable(True);self.prompt_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.prompt_scroll.setWidget(self.prompt_frame);self.body_tabs.addTab(self.prompt_scroll,'Komunikaty')
             self.history_toggle=QW.QToolButton();self.history_toggle.setText('Historia sesji');self.history_toggle.setCheckable(True);options.addWidget(self.history_toggle,0,Qt.AlignmentFlag.AlignLeft)
             self.history=QW.QPlainTextEdit();self.history.setReadOnly(True);self.history.setMaximumBlockCount(100);self.history.setMaximumHeight(110);self.history.hide();self.history_toggle.toggled.connect(self.history.setVisible);options.addWidget(self.history)
@@ -13420,6 +13525,68 @@ def native_ui_types():
             self.vba_locations.clear();self.vba_code.clear();self.vba_events.clear();self.vba_status.setText('Czekam na odczyt kodu VBA.' if active else 'Włącz odczyt przed kolejnym uruchomieniem lub odczytaj kod gotowej sesji.')
         def diagnostic_event(self,text):
             if self._diag_active:self.vba_events.appendPlainText(time.strftime('%H:%M:%S')+'  '+str(text)[:2000])
+        def activity_event(self,text,key=None):
+            if key is not None:
+                fingerprint=digest(key)
+                if fingerprint in self._activity_keys:return
+                self._activity_keys=(self._activity_keys+[fingerprint])[-320:]
+            entry=time.strftime('%H:%M:%S')+'  '+str(text).replace('\0','')[:4000]
+            bar=self.activity_log.verticalScrollBar();at_end=bar.value()>=bar.maximum()-2;position=bar.value();cursor=self.activity_log.textCursor();anchor,point=cursor.anchor(),cursor.position()
+            self._activity_records.append(entry);removed=0
+            while len(self._activity_records)>160 or sum(len(item)+1 for item in self._activity_records)>64000:removed+=len(self._activity_records.pop(0))+1
+            if removed:
+                self.activity_log.setPlainText('\n'.join(self._activity_records));cursor=self.activity_log.textCursor();cursor.setPosition(max(0,anchor-removed));cursor.setPosition(max(0,point-removed),QG.QTextCursor.MoveMode.KeepAnchor);self.activity_log.setTextCursor(cursor)
+            else:self.activity_log.appendPlainText(entry)
+            bar.setValue(bar.maximum() if at_end else min(position,bar.maximum()))
+        def copy_session_activity(self):
+            text=self.activity_log.toPlainText();diagnosis=self.patch_diagnosis.toPlainText()
+            QW.QApplication.clipboard().setText(text+('\n\n'+diagnosis if diagnosis else ''))
+        def clear_patch_diagnosis(self):
+            self.patch_diagnosis.clear();self.patch_diagnosis_toggle.setChecked(False);self.patch_diagnosis_toggle.hide();self.patch_diagnosis.hide()
+        def toggle_patch_diagnosis(self,visible):
+            self.patch_diagnosis.setVisible(visible)
+            if visible:QC.QTimer.singleShot(0,self.reveal_patch_diagnosis)
+        def reveal_patch_diagnosis(self):
+            if self._disposed or self._last_prompts or (self._last_failure and not self.foreground_command_active()) or not self.patch_diagnosis_toggle.isChecked() or not self.patch_diagnosis.toPlainText():return
+            self.prompt_layout.activate();self.activity_frame.layout().activate()
+            # ensureWidgetVisible on a text editor may reveal only its caret.
+            # Position the section explicitly so its copy control and source stay together.
+            top=self.activity_frame.mapTo(self.prompt_frame,QC.QPoint(0,0)).y()
+            self.prompt_scroll.verticalScrollBar().setValue(max(0,top-6))
+        @staticmethod
+        def activity_operation(action):
+            return {'open':'otwarcie kopii w Excelu','run_macro':'uruchomienie makra','run_control_macro':'uruchomienie makra przycisku','prepare_vba_patch':'analiza pominięcia walidacji','apply_vba_patch':'utworzenie zmienionej kopii','reconnect_workbook':'ponowne połączenie z tą kopią','inspect_vba':'odczyt kodu VBA','read_range':'odczyt arkusza','activate_sheet':'wybór arkusza','show_excel':'pokazanie okna Excela','reveal_control':'wskazanie przycisku w Excelu','apply_edits':'przeniesienie zmian komórek','export_pdf':'eksport arkusza do PDF','save_session':'zapis kopii sesji','save_working':'zapis stanu sesji','save_copy':'zapis osobnej kopii'}.get(action,str(action or 'operacja sesji'))
+        def record_patch_diagnosis(self,plan):
+            candidates=plan.get('candidates') or [];rejections=plan.get('rejections') or []
+            self.activity_event('Analiza VBA: '+('propozycje zmiany: '+str(len(candidates))+'. Zmiana wymaga wyboru w podglądzie.' if candidates else 'nie przygotowano zmiany. Powody odmowy: '+str(len(rejections))+'. Otwórz „Szczegóły analizy VBA”, aby zobaczyć odrzuconą instrukcję.'),key=('patch',self._activity_attempt,plan))
+            parts=['Statyczna analiza VBA — wskazane instrukcje pochodzą z odczytanego źródła. Nie ustalono, które linie wykonał Excel.'];metadata=[]
+            if plan.get('created_at'):metadata.append('Czas analizy: '+str(plan['created_at'])[:80])
+            metadata.append('Źródło: '+('ostatnia zapisana kopia sesji' if plan.get('source_mode')=='saved_file' else 'kopia bieżącego skoroszytu z chwili analizy'))
+            if plan.get('source_note'):metadata.append(str(plan['source_note'])[:1800])
+            if plan.get('macro_name'):metadata.append('Makro: '+str(plan['macro_name'])[:1000])
+            if plan.get('answer_text'):metadata.append('Zarejestrowana odpowiedź: '+str(plan['answer_text'])[:200]+' (nie potwierdza wykonanej gałęzi VBA).')
+            if plan.get('saved_source_mtime'):metadata.append('Czas zapisu źródła: '+str(plan['saved_source_mtime'])[:80])
+            if plan.get('file_sha256'):metadata.append('SHA-256 kopii: '+str(plan['file_sha256'])[:64])
+            analysis=plan.get('analysis')
+            if isinstance(analysis,dict):
+                names={'modules':'Moduły','procedures':'Procedury','blocks':'Bloki warunkowe','matched_blocks':'Bloki pasujące do pytania','candidates':'Propozycje zmiany','rejections':'Odmowy zmiany','complete':'Pełna analiza'}
+                counts=[names.get(key,str(key))+': '+('tak' if value else 'nie') if type(value) is bool else names.get(key,str(key))+': '+str(value)[:400] for key,value in list(analysis.items())[:24] if isinstance(value,(str,int,float,bool))]
+                metadata.append('Przebieg analizy:\n'+'\n'.join(counts))
+            for item in rejections[:24]:
+                if not isinstance(item,dict):parts.append(str(item)[:1800]);continue
+                location='.'.join(str(item.get(field) or '') for field in ('module','procedure')).strip('.')
+                if item.get('line'):location+=' · wiersz '+str(item['line'])+('–'+str(item['end_line']) if item.get('end_line') and item['end_line']!=item['line'] else '')
+                lines=[location,str(item.get('reason') or '')[:1800]]
+                if item.get('block_line'):lines.append('Blok walidacji: wiersze '+str(item['block_line'])+'–'+str(item.get('block_end_line') or item['block_line']))
+                if item.get('stage'):lines.append('Etap analizy: '+str(item['stage'])[:100])
+                if item.get('statement'):lines.append('Instrukcja: '+str(item['statement'])[:1800])
+                if item.get('excerpt'):lines.append('Fragment źródła (nie ślad wykonania):\n'+str(item['excerpt'])[:4000])
+                parts.append('\n'.join(line for line in lines if line))
+            if not rejections and plan.get('reason'):parts.append(str(plan['reason'])[:1800])
+            body='\n\n'.join(parts);tail='\n\n'+'\n'.join(metadata)[:6000];available=30000-len(tail)
+            if len(body)>available:body=body[:available-160]+'\n\nWidok szczegółów został skrócony. Pozostałe instrukcje nie mieszczą się w limicie podglądu.'
+            self.patch_diagnosis.setPlainText(body+tail);self.patch_diagnosis_toggle.show();self.patch_diagnosis_toggle.setChecked(not candidates);self.patch_diagnosis.setVisible(not candidates)
+            if not candidates:QC.QTimer.singleShot(0,self.reveal_patch_diagnosis)
         def read_vba_source(self):
             if self.submit('inspect_vba',{}):self.body_tabs.setCurrentWidget(self.vba_scroll)
         def update_vba_source(self,snapshot):
@@ -13451,6 +13618,7 @@ def native_ui_types():
             if self._patch_preview is not None:
                 with contextlib.suppress(RuntimeError):self._patch_preview.reject()
             self._patch_preview=None;self._patch_question=self._patch_question if preserve_question else None;self._patch_plan={};self._patch_result={};self._patch_run_request=None;self.patch_frame.hide();self.patch_open_button.hide()
+            self.clear_patch_diagnosis()
             self.patch_note.setText('Zachowano pytanie z poprzedniej próby tego makra. Analiza będzie dotyczyć bieżącej kopii skoroszytu.' if self._patch_question else 'Po odczytaniu pytania makra możesz przygotować zmianę wybranego bloku walidacji VBA.')
         def remember_vba_question(self,snapshot,answer=''):
             identity=self.session_identity();text=str(snapshot.get('text') or '').strip()
@@ -13458,6 +13626,7 @@ def native_ui_types():
             control=self.native_controls.currentData() or {}
             self._patch_question={'identity':identity,'text':text[:8000],'answer':answer[:200],'macro_name':self._vba_macro or str(control.get('on_action') or control.get('macro_name') or ''),'sheet':self.native_sheets.currentText(),'control':clone(control)}
             self._patch_plan={};self._patch_result={};self.patch_open_button.hide()
+            self.clear_patch_diagnosis()
             self.patch_note.setText(('Wybrano „'+answer+'”. ' if answer else 'Zapamiętano pytanie Excela. Odpowiedź wybrana poza Pivotem nie jest rejestrowana. ')+'„Pierdol to” przygotuje propozycję pominięcia bloku komunikatu i wyjścia związanego z tym pytaniem w osobnej kopii.')
         def prepare_vba_patch(self):
             if not self._patch_question or self._last_prompts or self._action_pending:return False
@@ -13468,6 +13637,7 @@ def native_ui_types():
             if question.get('identity')!=self.session_identity():return False
             self._patch_plan={};self._patch_result={};self.patch_open_button.hide()
             args={'prompt_text':question['text'],'answer_text':question['answer'],'macro_name':question.get('macro_name','')}
+            self.clear_patch_diagnosis()
             saved=self._snapshot.get('state')=='disconnected'
             if saved:args['source_mode']='saved_file'
             self.patch_note.setText('Analizuję ostatnią zapisaną kopię sesji. Niezapisane zmiany z Excela nie są uwzględnione.' if saved else 'Przygotowuję kopię bieżącego skoroszytu i szukam bloku walidacji związanego z pytaniem…')
@@ -13475,6 +13645,7 @@ def native_ui_types():
         def present_vba_patch(self,plan):
             if not isinstance(plan,dict) or not self._patch_question:return
             self._patch_plan=clone(plan);self.patch_frame.show();self.body_tabs.setCurrentIndex(1)
+            self.record_patch_diagnosis(plan)
             candidates=plan.get('candidates') or []
             if not candidates:
                 reasons=plan.get('rejections') or [plan.get('reason') or 'Nie znaleziono jednoznacznego bloku walidacji, który można pominąć.']
@@ -13488,7 +13659,7 @@ def native_ui_types():
                     locations=grouped.setdefault(reason,[])
                     if location and location not in locations:locations.append(location)
                 descriptions=[('; '.join(locations)+': ' if locations else '')+reason for reason,locations in grouped.items()]
-                self.patch_note.setText('Nie utworzono zmienionej kopii. '+'\n'.join(descriptions)[:2500]);return
+                self.patch_note.setText('Nie utworzono zmienionej kopii. '+'\n'.join(descriptions)[:2500]);self.message.setText('Analiza zakończona bez propozycji zmiany VBA.');return
             if self._patch_preview is not None:return
             dialog=QW.QDialog(self);dialog.setWindowTitle('Pierdol to — podgląd zmiany VBA');dialog.setWindowModality(Qt.WindowModality.WindowModal);layout=QW.QVBoxLayout(dialog)
             source_note=('Źródło: ostatnia zapisana kopia sesji. Niezapisane zmiany z Excela nie są uwzględnione. '+str(plan.get('source_note','')) if plan.get('source_mode')=='saved_file' else 'Źródło: bieżący skoroszyt z chwili przygotowania. Późniejsze edycje nie są uwzględnione.')
@@ -13597,7 +13768,10 @@ def native_ui_types():
             self.fit_to_screen();QC.QTimer.singleShot(0,self._work_area_changed)
         def show_message(self):
             self.body_tabs.setCurrentIndex(1)
-            self.prompt_scroll.ensureWidgetVisible(self.native_prompt_host if self._last_prompts else self.failure_frame if self._last_failure and not self.foreground_command_active() else self.prompt_empty)
+            if self._last_prompts:self.prompt_scroll.ensureWidgetVisible(self.native_prompt_host)
+            elif self._last_failure and not self.foreground_command_active():self.prompt_scroll.ensureWidgetVisible(self.failure_frame)
+            elif self.patch_diagnosis_toggle.isChecked() and self.patch_diagnosis.toPlainText():QC.QTimer.singleShot(0,self.reveal_patch_diagnosis)
+            else:self.prompt_scroll.ensureWidgetVisible(self.prompt_empty)
         def foreground_command_active(self):
             return bool((self._command_pending or self._snapshot.get('state')=='busy') and not self.background_read_active())
         def update_failure_presentation(self):
@@ -13626,6 +13800,7 @@ def native_ui_types():
                 details='\n\n'.join(part for part in (message,details) if part)
                 message='Excel zgłosił problem z uruchomieniem makra. Nie wiadomo jeszcze, czy makro jest niedostępne, czy jego uruchomienie blokują ustawienia lub stan skoroszytu.'
             value={'message':message,'details':details,'code':str(code or ''),'operation':str(operation or '')};key=digest(value)
+            self.activity_event('Błąd — '+self.activity_operation(operation)+': '+message+(' [kod: '+str(code)+']' if code else ''),key=('failure',self._activity_attempt,key))
             if key==self._last_failure_key:return
             self._last_failure_key=key;self._last_failure=value;self.failure_text.setPlainText(message);self.update_failure_presentation()
             self.failure_frame.setTitle('Problem z uruchomieniem makra' if code=='macro_unavailable' else 'Ostatnia operacja nie powiodła się');self.macro_recovery.setVisible(code=='macro_unavailable')
@@ -13695,7 +13870,7 @@ def native_ui_types():
             path=QW.QFileDialog.getSaveFileName(self,'Zapis PDF wygenerowanego przez makro',initial,'PDF (*.pdf)')[0]
             if not path:return False
             if Path(path).suffix.lower()!='.pdf':self.message.setText('Wybierz plik z rozszerzeniem .pdf.');self.update_controls();return False
-            self._pdf_destination=path;self._pdf_destination_confirmed=True;self.pdf_target_path.setText(path);self.pdf_target_path.setToolTip(path);return True
+            self._pdf_destination=path;self._pdf_destination_confirmed=True;self.pdf_target_path.setText(path);self.pdf_target_path.setToolTip(path);self.activity_event('Wybrano miejsce zapisu PDF: '+path+'. Sam wybór nie potwierdza utworzenia dokumentu.');return True
         def reset_macro_pdf_results(self):
             self._macro_pdf_outputs=None;self.macro_pdf_files.clear();self.macro_pdf_note.clear();self.macro_pdf_location.clear();self.macro_pdf_location.hide();self.macro_pdf_open.hide();self.macro_pdf_frame.hide()
         def apply_macro_pdf_outputs(self,outputs):
@@ -13719,6 +13894,7 @@ def native_ui_types():
                 if not complete:text+=' Nie udało się sprawdzić wszystkich plików; wybierz wynik ręcznie.'
             elif outputs.get('status')=='not_observed':text='Nie znaleziono nowego ani zmienionego PDF w folderze sesji. Makro mogło zakończyć się bez dokumentu lub zapisać go gdzie indziej. Jeśli znasz jego lokalizację, kliknij „Wskaż PDF…”.'
             else:text='Nie udało się potwierdzić utworzenia PDF w folderze sesji. Jeśli plik jest już zapisany, wybierz go przez „Wskaż PDF…”.'
+            self.activity_event('Sprawdzenie PDF: '+text,key=('pdf',self._activity_attempt,self._macro_pdf_outputs))
             self.macro_pdf_note.setText(text);self.macro_pdf_frame.show();self.macro_pdf_files.setVisible(bool(files));self.macro_pdf_location.hide();self.macro_pdf_open.hide();self.update_controls()
         def save_selected_macro_pdf(self):
             item=self.macro_pdf_files.currentData()
@@ -13731,6 +13907,7 @@ def native_ui_types():
             if path and self.choose_macro_pdf_destination():self.publish_macro_pdf({'path':path},str(Path(path).parent),self._pdf_destination,manual=True)
         def publish_macro_pdf(self,item,scope,destination,manual=False):
             if self._pdf_publish_pending or self._disposed or self._closing:return
+            self.activity_event('Zapis PDF we wskazanym miejscu: '+str(destination)+(' (plik wskazany ręcznie).' if manual else '.'))
             self._pdf_publish_pending=True;self._pdf_attempt_destination='';self._pdf_destination_confirmed=False;self._pdf_publish_cancel.clear();epoch=self._epoch;service=self._host_window.service;item=clone(item);cancel=self._pdf_publish_cancel
             self.macro_pdf_frame.show();self.macro_pdf_note.setText('Zapisuję PDF w wybranym miejscu…');self.update_controls()
             def work():
@@ -13745,9 +13922,11 @@ def native_ui_types():
                 if self._disposed or epoch!=self._epoch:return
                 self._pdf_publish_pending=False;path=str(result['destination']);self.macro_pdf_location.setText(path);self.macro_pdf_location.setToolTip(path);self.macro_pdf_location.show();self.macro_pdf_open.show()
                 self.macro_pdf_note.setText('Zapisano PDF we wskazanym miejscu. Otwórz go i sprawdź treść dokumentu.');self.message.setText('Zapisano PDF: '+path);self.history.appendPlainText('Zapisano PDF: '+path);self.update_controls()
+                self.activity_event('Potwierdzono zapis PDF: '+path+'. Sprawdź treść dokumentu.')
             def failed(error):
                 if self._disposed or epoch!=self._epoch:return
                 self._pdf_publish_pending=False;self.macro_pdf_note.setText('Nie zapisano PDF we wskazanym miejscu: '+str(error));self.message.setText(self.macro_pdf_note.text());self.update_controls()
+                self.activity_event('Nie zapisano PDF: '+str(error))
             self._tasks.submit(work,done,failed,'Zapis PDF z makra')
         def open_saved_macro_pdf(self):
             path=self.macro_pdf_location.text()
@@ -13842,6 +14021,7 @@ def native_ui_types():
             path=self._resume_source_path if self._resume_path else self.file.text().strip()
             if not path or Path(path).suffix.lower() not in WORKBOOK_SUFFIXES:self.message.setText('Wybierz plik XLSM albo XLSX.');self.update_controls();return
             self._epoch+=1;self._event_seq=0;self._last_result_key=None;self._last_scan=0;self._native_digest=None;self._scan_pending=False;self._action_pending=False;self._show_pending=False;self._sent_prompts={};self._retry_prompts=set();self.history.clear();self.message.clear();self.clear_failure();self.render_prompts([])
+            self._activity_records=[];self._activity_keys=[];self._activity_attempt=0;self.activity_log.clear();self.activity_event(('Wznawiam zapisaną kopię: '+self._resume_path) if self._resume_path else 'Otwieram osobną kopię skoroszytu: '+path)
             self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
             self.reset_macro_pdf_results();self._pdf_attempt_destination=''
             self.reset_vba_diagnostics()
@@ -13880,6 +14060,10 @@ def native_ui_types():
             elif action=='inspect_vba':
                 self.reset_vba_diagnostics(True);control=self.native_controls.currentData() or {};self._vba_macro=self.macro_name.text().strip() or str(control.get('on_action') or control.get('macro_name') or '')
             if not background:self._quiet_read_error=False;self.message.clear();self.state_note.setText('Wysyłam polecenie do sesji…')
+            if not background:
+                self._activity_attempt+=1;detail=' · '+self._vba_macro if action in ('run_macro','run_control_macro') and self._vba_macro else ''
+                if action in ('prepare_vba_patch','apply_vba_patch'):detail=' · źródło: '+('ostatnia zapisana kopia sesji' if args.get('source_mode')=='saved_file' else 'bieżący skoroszyt')
+                self.activity_event('Zlecam: '+self.activity_operation(action)+detail+'.')
             self.update_controls()
             def work():
                 payload=dict(args)
@@ -13888,6 +14072,7 @@ def native_ui_types():
                 return controller.submit(action,payload)
             def done(job_id):
                 if self._disposed or epoch!=self._epoch:return
+                if not background:self.activity_event('Przyjęto zlecenie: '+self.activity_operation(action)+'. Czekam na wynik.')
                 if action in ('run_macro','run_control_macro'):
                     self._diag_macro_job=job_id;self.diagnostic_event('Zlecono uruchomienie makra. Samo zlecenie nie potwierdza wykonania jego instrukcji.')
                 self._command_pending=False;self.poll()
@@ -13957,7 +14142,7 @@ def native_ui_types():
         def apply_native_result(self,result,allow_reveal=True):
             if not isinstance(result,dict):return
             if result.get('controls_invalidated'):
-                self._queued=None;self._patch_plan={}
+                self._queued=None;self._patch_plan={};self.clear_patch_diagnosis()
                 if self._patch_preview is not None:
                     with contextlib.suppress(RuntimeError):self._patch_preview.reject()
                 if not isinstance(result.get('snapshot'),dict):
@@ -14047,9 +14232,11 @@ def native_ui_types():
             try:snapshot=self._controller.poll()
             except Exception as exc:self.message.setText(safe_error(exc));self.remember_failure(safe_error(exc),operation='session');self.update_controls();return
             previous=self.session_identity();previous_state=self._snapshot.get('state');self._snapshot=snapshot;identity=self.session_identity();state=snapshot.get('state')
+            if state=='ready' and previous_state in ('starting','new'):self.activity_event('Sesja Excela gotowa. Kopia: '+str(snapshot.get('working_copy') or 'utworzona dla tej sesji')+'.')
+            if state=='closed' and previous_state!='closed':self.activity_event('Sesja została zakończona.')
             saved_result=isinstance(snapshot.get('last_result'),dict) and snapshot['last_result'].get('source_mode')=='saved_file' and snapshot.get('last_operation') in ('prepare_vba_patch','apply_vba_patch')
             if state=='disconnected' and previous_state!='disconnected' and not saved_result:
-                self._queued=None;self._patch_plan={}
+                self._queued=None;self._patch_plan={};self.clear_patch_diagnosis()
                 if self._patch_preview is not None:
                     with contextlib.suppress(RuntimeError):self._patch_preview.reject()
                     self.patch_note.setText('Utrata połączenia unieważniła podgląd zmiany. Po połączeniu przygotuj propozycję ponownie; ostatnie pytanie zostało zachowane.')
@@ -14073,6 +14260,7 @@ def native_ui_types():
             if result and (state=='ready' or (state=='disconnected' and saved_result)) and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);destination=result.get('destination') if isinstance(result,dict) else None
                 operation=(result.get('action') or snapshot.get('last_operation') or snapshot.get('operation') or '') if isinstance(result,dict) else ''
+                if operation and operation!='open' and not completed_background:self.activity_event('Zakończono: '+self.activity_operation(operation)+'.'+(' Makro nie zostało ponowione.' if operation=='reconnect_workbook' else ''))
                 if operation and operation not in ('open','read_range','activate_sheet','show_excel','reveal_control','inspect_vba') and not completed_background and not snapshot.get('handoff_incomplete') and state!='disconnected':self.clear_failure()
                 if operation in ('save_session','save_working','save_copy') and isinstance(result,dict) and (result.get('saved_path') or destination):self.saved_copy_path=str(result.get('saved_path') or destination);self.saved_copy_revision=str(result.get('saved_revision',''))
                 if operation not in ('read_range','open'):
@@ -14098,6 +14286,7 @@ def native_ui_types():
                 if operation=='prepare_vba_patch':self.present_vba_patch(snapshot.get('vba_patch') or result.get('vba_patch') or {})
                 elif operation=='apply_vba_patch':
                     self._patch_result=clone(result.get('vba_patch_applied') or result);path=str(self._patch_result.get('path') or self._patch_result.get('patched_path') or '')
+                    self.activity_event('Utworzono zmienioną kopię: '+path+'. Utworzenie PDF wymaga osobnego potwierdzenia.')
                     self.patch_note.setText('Utworzono kopię z pominiętym blokiem walidacji: '+path+'\nOtwórz ją w Pivocie i uruchom generator. Utworzenie PDF wymaga osobnego sprawdzenia.');self.patch_open_button.setVisible(bool(path));self.body_tabs.setCurrentIndex(1)
                     request=self._patch_run_request;self._patch_run_request=None
                     if request and request.get('token')==self._patch_result.get('token') and request.get('candidate_id')==self._patch_result.get('candidate_id'):
@@ -14161,7 +14350,8 @@ def native_ui_types():
             key=digest([(item.get('hwnd'),item.get('fingerprint')) for item in items]) if items else None
             new_prompt=bool(key and key!=self._prompt_tab_key)
             if new_prompt:
-                for snapshot in items:self.remember_vba_question(snapshot)
+                for snapshot in items:
+                    self.remember_vba_question(snapshot);self.activity_event('Pytanie Excela — '+str(snapshot.get('title') or 'Excel')+': '+str(snapshot.get('text') or '')+'\nDostępne odpowiedzi: '+', '.join(str(item.get('text','')).replace('&','') for item in snapshot.get('buttons',[])))
             if new_prompt and self._diag_active:
                 self._vba_prompt='\n'.join(str(item.get('text','')) for item in items)[:8000]
                 self.diagnostic_event('Excel wyświetlił pytanie: '+self._vba_prompt);self.render_vba_source()
@@ -14193,23 +14383,28 @@ def native_ui_types():
             self._action_pending=True
             for control in self.native_prompt_host.findChildren(QW.QPushButton):control.setEnabled(False)
             pid,hwnd=identity[-2:];caption=str(native.get('text','')).replace('&','')
+            self.activity_event('Wybrano odpowiedź „'+caption+'”. Wysyłam wybór do okna Excela.')
             def done(result):
                 if self._disposed or identity!=self.session_identity():return
                 self.remember_vba_question(snapshot,caption)
+                self.activity_event('Potwierdzono wysłanie odpowiedzi „'+caption+'”. Czekam na dalszy wynik makra; nie ustalono wykonanej gałęzi VBA.')
                 self.diagnostic_event('Wysłano odpowiedź „'+caption+'” na pytanie: '+str(snapshot.get('text',''))+'. Nie potwierdza to wykonania konkretnej gałęzi VBA.')
                 self._action_pending=False;self._sent_prompts[snapshot['hwnd']]=(snapshot.get('fingerprint'),time.monotonic());self._retry_prompts.discard((snapshot['hwnd'],snapshot.get('fingerprint')));self._native_digest=None;self._last_scan=0;self.message.setText('Wysłano wybór „'+caption+'”. Czekam na odpowiedź Excela.');self.poll()
                 if self._diag_active and all(item.get('hwnd')==snapshot.get('hwnd') and item.get('fingerprint')==snapshot.get('fingerprint') for item in self._last_prompts):self.body_tabs.setCurrentWidget(self.vba_scroll)
             def failed(error):
                 if self._disposed or identity!=self.session_identity():return
+                self.activity_event('Nie wysłano odpowiedzi „'+caption+'”: '+str(error))
                 self._action_pending=False;self._native_digest=None;self._last_scan=0;self.message.setText(str(error));self.poll()
             self._tasks.submit(lambda:excel_native_dialog_action(pid,hwnd,snapshot,native['hwnd']),done,failed,'Odpowiedź w Excelu')
         def retry_prompt(self,snapshot):
             self._sent_prompts.pop(snapshot.get('hwnd'),None);self._retry_prompts.discard((snapshot.get('hwnd'),snapshot.get('fingerprint')));self.render_prompts(self._last_prompts)
         def stop_session(self):
             if not self._controller or self._disposed:return
+            self.activity_event('Zażądano przerwania własnej sesji Excela.')
             self._controller.cancel();self.message.setText('Przerywam własną sesję Excela…');self.poll()
         def begin_close(self):
             if self._closing or self._disposed:return
+            self.activity_event('Zażądano zamknięcia własnej sesji Excela.')
             self._closing=True;self._pdf_publish_cancel.set();self.message.setText('Zamykanie własnej sesji Excela…')
             try:self._controller.cancel() if self._snapshot.get('state') in ('starting','busy') else self._controller.close()
             except Exception as exc:self._closing=False;self.message.setText(safe_error(exc))
@@ -22667,6 +22862,80 @@ def excel_vba_patch_test_suite():
                 self.assertFalse(self.plan('Dim VBA As Object\n'+code)['candidates'])
                 self.assertFalse(plan_vba_validation_patch([{'name':'VBA','code':code}],prompt_text=self.prompt)['candidates'])
 
+        def test_message_rejection_distinguishes_unsupported_instruction_from_name_declaration(self):
+            statements=('answer = MsgBox("'+self.prompt+'")', 'ConfirmDocument("'+self.prompt+'")')
+            for statement in statements:
+                with self.subTest(statement=statement),self.assertRaises(ValueError) as failure:
+                    _vba_plan_message(statement,set(),set())
+                self.assertIn('nie ma obsługiwanej postaci',str(failure.exception))
+                self.assertNotIn('deklarację',str(failure.exception))
+            for symbols,shadowed in (({'msgbox'},set()),(set(),{'msgbox'})):
+                with self.subTest(symbols=symbols,shadowed=shadowed),self.assertRaises(ValueError) as failure:
+                    _vba_plan_message('MsgBox "'+self.prompt+'"',symbols,shadowed)
+                self.assertIn('deklarację „MsgBox”',str(failure.exception))
+                self.assertNotIn('nie ma obsługiwanej postaci',str(failure.exception))
+            with self.assertRaises(ValueError) as failure:
+                _vba_plan_message('VBA.MsgBox "'+self.prompt+'"',set(),{'vba'})
+            self.assertIn('deklarację „VBA”',str(failure.exception))
+
+        def test_message_rejection_preserves_valid_qualified_calls_and_argument_validation(self):
+            statement='VBA.MsgBox "'+self.prompt+'", , "Walidacja"'
+            expression,literals=_vba_plan_message(statement,{'msgbox'},{'msgbox'})
+            self.assertEqual(expression,'"'+self.prompt+'"');self.assertEqual(literals,[self.prompt])
+            with self.assertRaises(ValueError) as failure:
+                _vba_plan_message('Interaction.MsgBox "'+self.prompt+'"',set(),set())
+            self.assertIn('nie wskazuje jednoznacznie',str(failure.exception))
+            with self.assertRaises(ValueError) as failure:
+                _vba_plan_message('MsgBox "'+self.prompt+'" & WriteDocument()',set(),set())
+            self.assertIn('WriteDocument',str(failure.exception))
+
+        def test_planner_rejection_identifies_extra_assignment_and_custom_msgbox_separately(self):
+            code=self.code(['invalidFlag = True','MsgBox "'+self.prompt+'"','Exit Sub']).replace('    If','    Dim invalidFlag As Boolean\n    If',1)
+            result=self.plan(code);self.assertFalse(result['candidates'])
+            self.assertTrue(any('nie ma obsługiwanej postaci' in item['reason'] for item in result['rejections']))
+            custom=self.code()+'\nPrivate Function MsgBox(ByVal message As String) As Long\n    SaveDocument\n    MsgBox = 6\nEnd Function\n'
+            result=self.plan(custom);self.assertFalse(result['candidates'])
+            self.assertTrue(any('deklarację „MsgBox”' in item['reason'] for item in result['rejections']))
+
+        def test_rejection_exposes_actual_instruction_after_comments_and_continuations(self):
+            code=('Sub GenerateDocument(ByVal invalid As Boolean)\r\n'
+                  ' Dim message As String\r\n If invalid Then\r\n'
+                  '  message = "'+self.prompt+'"\r\n'
+                  "  ' blank and comment lines must not shift the diagnostic\r\n\r\n"
+                  '  ConfirmDocument _\r\n    message\r\n  Exit Sub\r\n End If\r\nEnd Sub\r\n')
+            result=self.plan(code);self.assertFalse(result['candidates'])
+            rejected=result['rejections'][0]
+            self.assertEqual((rejected['module'],rejected['procedure']),('ThisWorkbook','GenerateDocument'))
+            self.assertEqual((rejected['line'],rejected['end_line']),(7,8))
+            self.assertEqual((rejected['block_line'],rejected['block_end_line']),(3,10))
+            self.assertEqual(rejected['stage'],'Rozpoznanie wywołania komunikatu')
+            self.assertEqual(rejected['statement'],'ConfirmDocument message')
+            self.assertIn('> 7:   ConfirmDocument _',rejected['excerpt'])
+            self.assertIn('> 8:     message',rejected['excerpt'])
+            self.assertEqual(result['analysis'],dict(modules=1,procedures=1,blocks=1,matched_blocks=1,candidates=0,rejections=1,complete=True))
+
+        def test_rejection_points_to_extra_work_and_message_preparation(self):
+            code=self.code(['MsgBox "'+self.prompt+'"',"' context",'', 'SaveDocument','Exit Sub'])
+            rejected=self.plan(code)['rejections'][0]
+            self.assertEqual(rejected['statement'],'SaveDocument');self.assertEqual(rejected['line'],7)
+            self.assertEqual(rejected['stage'],'Instrukcje po komunikacie')
+            code=self.code(['message = "'+self.prompt+'" & FetchCaption()', 'MsgBox message','Exit Sub']).replace('    If','    Dim message As String\n    If',1)
+            rejected=self.plan(code)['rejections'][0]
+            self.assertEqual(rejected['stage'],'Przygotowanie tekstu pytania')
+            self.assertIn('FetchCaption()',rejected['statement']);self.assertEqual(rejected['line'],5)
+
+        def test_analysis_reports_no_matching_block_and_bounded_static_excerpt(self):
+            result=self.plan(self.code(),prompt='An unrelated question with sufficiently distinctive text.')
+            self.assertEqual(result['analysis']['blocks'],1);self.assertEqual(result['analysis']['matched_blocks'],0)
+            self.assertIn('Nie znaleziono',result['reason']);self.assertFalse(result['candidates'])
+            code=self.code(['UnknownDialog "'+self.prompt+'" & "'+('x'*5000)+'"','Exit Sub'])
+            rejected=self.plan(code)['rejections'][0]
+            self.assertLessEqual(len(rejected['statement']),1800);self.assertLessEqual(len(rejected['excerpt']),3500)
+            self.assertIn('fragment skrócony',rejected['excerpt'])
+            self.assertEqual(self.plan(self.code())['analysis']['candidates'],1)
+            incomplete=plan_vba_validation_patch([{'name':'broken','code':'MsgBox _\n'}],prompt_text=self.prompt)
+            self.assertFalse(incomplete['analysis']['complete']);self.assertFalse(incomplete['candidates'])
+
         def test_continuations_preserve_physical_lines_offsets_and_comments(self):
             code=self.code(['answer = VBA.MsgBox( _','"'+self.prompt+'", _','vbYesNo)', 'If answer = vbYes Then Exit Sub']).replace('    If','    Dim answer As Long\n    If',1).replace('Len(Trim(projectCode))','Len( _\n        projectCode)').replace('\n','\r\n')
             result=self.plan(code);self.assertEqual(result['status'],'candidate');item=result['candidates'][0]
@@ -23394,6 +23663,13 @@ send('closed')
         def patch_report(self,controller,**values):
             candidate={'id':'b'*64,'module':'ThisWorkbook','procedure':'GenerateDocument','line':4,'end_line':8,'old_block':'If invalid Then\nprivate-patch-source\nEnd If','new_block':'If False Then\nprivate-patch-source\nEnd If','unified_diff':'-If invalid Then\n+If False Then','reason':'Explicit selected validation','warnings':['Unverified copy']}
             return dict({'token':'a'*32,'status':'candidate','workbook_id':controller.poll()['workbook_id'],'created_at':utcnow(),'macro_name':'ThisWorkbook.GenerateDocument','answer_text':'Tak','reason':'','candidates':[candidate],'rejections':[]},**values)
+        def rejected_patch_report(self,controller,**values):
+            rejection={'reason':'Nieobsługiwana instrukcja komunikatu.','module':'ThisWorkbook','procedure':'GenerateDocument',
+                'stage':'Rozpoznanie wywołania komunikatu','statement':'Call ConfirmDocument("private-rejected-source")',
+                'excerpt':'42: Call ConfirmDocument( _\n43:     "private-rejected-source", _\n44:     "Nieprawidłowy dokument")',
+                'line':42,'end_line':44,'block_line':40,'block_end_line':50}
+            analysis={'modules':3,'procedures':5,'blocks':17,'matched_blocks':1,'candidates':0,'rejections':1,'complete':True}
+            return self.patch_report(controller,**dict({'status':'unsupported','candidates':[],'rejections':[rejection],'analysis':analysis},**values))
         def test_vba_patch_commands_validate_and_forward_only_data_for_one_operation(self):
             controller=self.start()
             with patch.object(controller,'_send') as send:
@@ -23444,6 +23720,48 @@ send('closed')
                 self.finish_vba_command(controller,jid,'prepare_vba_patch',{'workbook_id':controller.poll()['workbook_id'],'vba_patch':report});state=controller.poll()
                 self.assertEqual(state['vba_patch_job'],jid);self.assertEqual(state['vba_patch']['token'],'a'*32);self.assertIn('private-patch-source',dumps(state['vba_patch']));self.assertNotIn('old_source',dumps(state['vba_patch']));self.assertNotIn('full_source',state['vba_patch'])
                 self.assertNotIn('vba_patch',state['last_result']);self.assertNotIn('private-patch-source',dumps(state['events']));self.assertNotIn('private-patch-source',dumps(callbacks));self.assertNotIn('private-patch-source',(controller.temp_root/'session.json').read_text('utf-8'))
+                jid=controller.submit('prepare_vba_patch',{'prompt_text':'Question'});controller.dispatcher.join(2);report=self.rejected_patch_report(controller)
+                report['full_source']='discard-rejected-module';report['rejections'][0]['full_source']='discard-rejected-module'
+                self.finish_vba_command(controller,jid,'prepare_vba_patch',{'workbook_id':controller.poll()['workbook_id'],'vba_patch':report});state=controller.poll()
+                self.assertEqual(state['vba_patch_job'],jid);self.assertEqual(state['vba_patch']['status'],'unsupported')
+                self.assertEqual(state['vba_patch']['analysis'],report['analysis'])
+                expected={key:value for key,value in report['rejections'][0].items() if key!='full_source'}
+                self.assertEqual(state['vba_patch']['rejections'],[expected]);self.assertIn('private-rejected-source',dumps(state['vba_patch']))
+                self.assertNotIn('discard-rejected-module',dumps(state['vba_patch']));self.assertNotIn('vba_patch',state['last_result'])
+                for output in (state['last_result'],state['events'],callbacks):self.assertNotIn('private-rejected-source',dumps(output))
+                self.assertNotIn('private-rejected-source',(controller.temp_root/'session.json').read_text('utf-8'))
+        def test_vba_patch_rejection_diagnostics_reject_malformed_or_unbounded_reports(self):
+            controller=self.start()
+            with patch.object(controller,'_send'):
+                jid=controller.submit('prepare_vba_patch',{'prompt_text':'Question'});controller.dispatcher.join(2)
+                baseline=self.rejected_patch_report(controller);reports=[]
+                for field,value in (('modules',True),('procedures',-1),('blocks',1000001),('matched_blocks','1'),('candidates',None),('rejections',1.5),('complete',1),('complete',None)):
+                    report=clone(baseline);report['analysis'][field]=value;reports.append(report)
+                report=clone(baseline);report['analysis']=[];reports.append(report)
+                for field,value in (('line',True),('line',0),('line','42'),('end_line',41),('end_line',2147483648),('block_line',-1),('block_end_line',39),
+                                    ('module','m'*129),('procedure','p'*129),('stage','s'*129),('statement','x'*1801),('excerpt','x'*3501),('reason','x'*1801),('excerpt',{})):
+                    report=clone(baseline);report['rejections'][0][field]=value;reports.append(report)
+                reports.append(self.rejected_patch_report(controller,rejections=[baseline['rejections'][0]]*25))
+                reports.append(self.rejected_patch_report(controller,rejections=['not a structured rejection']))
+                large=clone(baseline);large['rejections']=[dict(baseline['rejections'][0],statement='\U0001F600'*1800,excerpt='\U0001F600'*3500,reason='\U0001F600'*1800) for _ in range(24)];reports.append(large)
+                for index,report in enumerate(reports):
+                    with self.subTest(index=index):
+                        controller._accept_vba_patch(report,jid);self.assertFalse(controller.poll()['vba_patch']);self.assertEqual(controller.poll()['job_id'],jid)
+                controller._accept_vba_patch(baseline,jid);self.assertEqual(controller.poll()['vba_patch']['rejections'],baseline['rejections'])
+                self.finish_vba_command(controller,jid,'prepare_vba_patch')
+        def test_rejected_vba_source_requires_current_job_operation_and_workbook(self):
+            controller=self.start()
+            with patch.object(controller,'_send'):
+                jid=controller.submit('prepare_vba_patch',{'prompt_text':'Question'});controller.dispatcher.join(2);report=self.rejected_patch_report(controller)
+                event={'session_id':controller.session_id,'event':'done','id':jid,'operation':'prepare_vba_patch','result':{'vba_patch':report}}
+                for changes in ({'session_id':'foreign-session'},{'id':'obsolete-job'}):
+                    controller._consume(dict(event,**changes));self.assertFalse(controller.poll()['vba_patch']);self.assertEqual(controller.poll()['job_id'],jid)
+                controller._accept_vba_patch(dict(report,workbook_id='foreign-book'),jid);self.assertFalse(controller.poll()['vba_patch'])
+                controller.state['operation']='read_range';controller._accept_vba_patch(report,jid);self.assertFalse(controller.poll()['vba_patch']);controller.state['operation']='prepare_vba_patch'
+                controller._consume(event);self.assertEqual(controller.poll()['vba_patch']['rejections'],report['rejections'])
+                next_job=controller.submit('prepare_vba_patch',{'prompt_text':'Different question'});controller.dispatcher.join(2)
+                controller._consume(event);self.assertFalse(controller.poll()['vba_patch']);self.assertEqual(controller.poll()['job_id'],next_job)
+                self.assertNotIn('private-rejected-source',dumps(controller.poll()['events']));self.finish_vba_command(controller,next_job,'prepare_vba_patch')
         def test_vba_patch_preview_requires_matching_session_job_operation_and_workbook(self):
             controller=self.start()
             with patch.object(controller,'_send'):
@@ -24139,6 +24457,25 @@ send('closed')
             self.patch_fixture()
             with patch(__name__+'.excel_vba_package_read',return_value={'status':'signed','modules':[],'reason':'Signed project is unsupported'}):event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu')
             self.assertEqual(event['event'],'done');self.assertEqual(event['result']['vba_patch']['status'],'unsupported');self.assertIn('Signed project',event['result']['vba_patch']['reason']);self.assertIsNone(self.worker.vba_patch_plan);self.assertFalse(self.patch_calls)
+        def test_worker_rejected_source_reaches_controller_with_physical_location_but_never_history(self):
+            original=self.offline_patch_fixture();before=self.path.read_bytes();callbacks=[]
+            self.patch_source=self.patch_source.replace('MsgBox "Nieprawidlowy numer projektu"',
+                'Call ConfirmDocument( _\r\n        "Nieprawidlowy numer projektu", _\r\n        "private-worker-rejected-source")')
+            event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu',source_mode='saved_file')
+            self.assertEqual(event['event'],'done',event);report=event['result']['vba_patch'];self.assertEqual(report['status'],'unsupported')
+            self.assertEqual(len(report['rejections']),1);rejection=report['rejections'][0]
+            self.assertEqual((rejection['module'],rejection['procedure']),('ThisWorkbook','GenerateDocument'))
+            self.assertEqual((rejection['line'],rejection['end_line']),(4,6));self.assertEqual((rejection['block_line'],rejection['block_end_line']),(3,8))
+            self.assertIn('ConfirmDocument',rejection['statement']);self.assertIn('private-worker-rejected-source',rejection['excerpt'])
+            self.assertTrue(rejection['stage']);self.assertEqual(report['analysis']['matched_blocks'],1);self.assertEqual(report['analysis']['candidates'],0);self.assertEqual(report['analysis']['rejections'],1)
+            controller=ExcelSessionController(original,self.path.parent/'unused-controller-root',on_event=callbacks.append)
+            controller.session_id='fixture';controller.state.update(session_id='fixture',workbook_id='fixture-book',job_id='prepare_vba_patch',operation='prepare_vba_patch',state='busy')
+            controller._consume(event);state=controller.poll()
+            self.assertEqual(state['vba_patch']['rejections'],report['rejections']);self.assertEqual(state['vba_patch']['analysis'],report['analysis'])
+            self.assertNotIn('vba_patch',state['last_result'])
+            for output in (state['last_result'],state['events'],callbacks):self.assertNotIn('private-worker-rejected-source',dumps(output))
+            self.assertNotIn('private-worker-rejected-source',(self.path.parent/'session.json').read_text('utf-8'))
+            self.assertIsNone(self.worker.vba_patch_plan);self.assertFalse(self.patch_calls);self.assertFalse(self.copy_events);self.assertEqual(self.path.read_bytes(),before)
         def test_inspect_vba_denied_falls_back_to_saved_file_without_saving_live_state(self):
             self.worker.open_workbook(self.open_request());before=self.path.read_bytes();code='Sub Stored()\r\nEnd Sub'
             def deny(_):raise PermissionError('Programmatic access is not trusted')
@@ -28401,6 +28738,78 @@ def ui_test():
             dialog.present_vba_patch({'status':'unsupported','candidates':[],'rejections':[first,dict(first),second,reason,{'reason':'Dodatkowe wyjście z procedury.'}]})
             text=dialog.patch_note.text();self.assertEqual(text.count(reason),1);self.assertIn('Validator.CheckProject · wiersz 18',text);self.assertIn('Validator.CheckProject · wiersz 23',text);self.assertIn('Dodatkowe wyjście',text)
             self.assertIsNone(dialog._patch_preview);self.assertEqual(controller.calls,before);self.assertEqual(len(instances),1)
+        def session_activity_prompt(self):
+            return {'pid':701,'main_hwnd':702,'hwnd':703,'title':'Walidacja raportu','text':'Brakuje kodu projektu. Czy zakończyć sprawdzanie?',
+                'buttons':[{'hwnd':704,'text':'Tak','id':6,'enabled':True},{'hwnd':705,'text':'Nie','id':7,'enabled':True}],'fingerprint':'neutral-report-question','complete':True,'enabled':True}
+        def test_office_activity_records_command_question_answer_pdf_and_reconnect_without_replay(self):
+            dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);controller.snapshot['workspace_path']=str(self.root)
+            dialog.run_control_macro();self.wait(lambda:not dialog._command_pending);dialog.render_prompts([self.session_activity_prompt()]);self.excel_button(dialog,'Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending);dialog.render_prompts([])
+            result={'action':'run_control_macro','pdf_outputs':{'scope':str(self.root),'files':[],'status':'not_observed','complete':True}}
+            controller.snapshot.update(state='ready',operation='',last_operation='run_control_macro',last_result=result,error='');dialog.poll();app.processEvents()
+            text=dialog.activity_log.toPlainText();events=['Zlecam: uruchomienie makra przycisku','Przyjęto zlecenie','Pytanie Excela','Wybrano odpowiedź „Nie”','Potwierdzono wysłanie odpowiedzi','Zakończono: uruchomienie makra przycisku','Sprawdzenie PDF: Nie znaleziono']
+            positions=[text.index(event) for event in events];self.assertEqual(positions,sorted(positions));self.assertFalse(dialog.diagnostics_enabled.isChecked());self.assertEqual(dialog.vba_events.toPlainText(),'')
+            dialog.poll();self.assertEqual(dialog.activity_log.toPlainText(),text)
+            controller.snapshot.update(state='disconnected',last_result={},error='Utracono połączenie.',error_code='excel_disconnected',error_operation='run_control_macro');dialog.poll();dialog.poll();self.assertEqual(dialog.activity_log.toPlainText().count('Błąd — uruchomienie makra przycisku'),1)
+            dialog.reconnect_excel();self.wait(lambda:not dialog._command_pending);controller.snapshot.update(state='ready',operation='',last_operation='reconnect_workbook',last_result={'action':'reconnect_workbook','reconnected':True},error='',error_code='',error_operation='');dialog.poll()
+            self.assertIn('Zakończono: ponowne połączenie z tą kopią. Makro nie zostało ponowione.',dialog.activity_log.toPlainText());self.assertEqual(len([call for call in controller.calls if call[0]=='run_control_macro']),1);self.assertFalse(any(call[0]=='inspect_vba' for call in controller.calls))
+        def test_office_activity_is_bounded_selectable_plain_text_and_copy_has_no_side_effects(self):
+            dialog,controller=self.native_session();before=list(controller.calls);dialog._activity_records=[];dialog.activity_log.clear()
+            for index in range(180):dialog.activity_event('Faza '+str(index)+' <b>tekst</b> & '+('x'*3900))
+            text=dialog.activity_log.toPlainText();self.assertLessEqual(len(text),64000);self.assertLessEqual(len(dialog._activity_records),160);self.assertNotIn('Faza 0 ',text);self.assertIn('Faza 179 <b>tekst</b> &',text);self.assertTrue(dialog.activity_log.isReadOnly())
+            cursor=dialog.activity_log.textCursor();cursor.setPosition(10);cursor.setPosition(20,ui['QtGui'].QTextCursor.MoveMode.KeepAnchor);dialog.activity_log.setTextCursor(cursor);selected=dialog.activity_log.textCursor().selectedText();dialog.activity_event('Dodatkowy wpis.');self.assertEqual(dialog.activity_log.textCursor().selectedText(),selected)
+            dialog.activity_copy.click();self.assertEqual(QW.QApplication.clipboard().text(),dialog.activity_log.toPlainText());self.assertEqual(controller.calls,before)
+        def test_office_activity_diagnosis_shows_static_statement_and_counts_without_persisting_code(self):
+            dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);dialog.remember_vba_question(self.session_activity_prompt(),'Nie');before=list(controller.calls)
+            statement='Call ShowPrompt("<b>brak kodu</b>")';excerpt='42: '+statement+'\n43: Exit Sub'
+            plan={'status':'unsupported','candidates':[],'created_at':'2026-10-08T12:10:00Z','source_mode':'saved_file','saved_source_mtime':'2026-10-08T12:00:00Z','file_sha256':'a'*64,'macro_name':'Validation.ExportReport','answer_text':'Nie','analysis':{'modules':3,'procedures':8,'blocks':12,'matched_blocks':2,'candidates':0,'rejections':1,'complete':True},
+                'rejections':[{'module':'Validation','procedure':'CheckReport','line':42,'end_line':43,'block_line':40,'block_end_line':44,'stage':'body','statement':statement,'excerpt':excerpt,'reason':'Nieobsługiwane wywołanie w bloku walidacji.'}]}
+            dialog.present_vba_patch(plan);app.processEvents();text=dialog.patch_diagnosis.toPlainText();self.assertTrue(dialog.patch_diagnosis.isReadOnly());self.assertTrue(dialog.patch_diagnosis.isVisible());self.assertIn('Moduły: 3',text);self.assertIn('Pełna analiza: tak',text);self.assertIn('Validation.CheckReport · wiersz 42–43',text);self.assertIn('wiersze 40–44',text);self.assertIn(statement,text);self.assertIn(excerpt,text);self.assertIn('Nie ustalono, które linie wykonał Excel',text)
+            log=dialog.activity_log.toPlainText();dialog.present_vba_patch(plan);self.assertEqual(dialog.activity_log.toPlainText(),log);dialog.activity_copy.click();self.assertIn(excerpt,QW.QApplication.clipboard().text());self.assertNotIn(statement,dialog.history.toPlainText());self.assertEqual(controller.snapshot['events'],[]);self.assertEqual(controller.calls,before)
+            for detail in ('2026-10-08T12:10:00Z','ostatnia zapisana kopia','2026-10-08T12:00:00Z','a'*64,'Validation.ExportReport','Zarejestrowana odpowiedź: Nie'):self.assertIn(detail,text)
+            self.assertLess(text.index(statement),text.index('Przebieg analizy:'))
+        def test_office_activity_new_question_invalidates_diagnosis_without_erasing_timeline(self):
+            dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);dialog.remember_vba_question(self.session_activity_prompt(),'Nie');before=list(controller.calls)
+            dialog.present_vba_patch({'status':'unsupported','candidates':[],'rejections':[{'reason':'Nieznane wywołanie.','statement':'Call PreviousValidation()','excerpt':'18: Call PreviousValidation()'}]});self.assertIn('PreviousValidation',dialog.patch_diagnosis.toPlainText());log=dialog.activity_log.toPlainText()
+            dialog.render_prompts([dict(self.session_activity_prompt(),fingerprint='next-validation',text='Brakuje opisu raportu. Czy zakończyć?')]);app.processEvents()
+            self.assertEqual(dialog.patch_diagnosis.toPlainText(),'');self.assertFalse(dialog.patch_diagnosis_toggle.isVisible());self.assertFalse(dialog.patch_diagnosis.isVisible());self.assertEqual(dialog._patch_plan,{});self.assertIn(log,dialog.activity_log.toPlainText());self.assertIn('Brakuje opisu raportu',dialog.activity_log.toPlainText());dialog.copy_session_activity();self.assertNotIn('PreviousValidation',QW.QApplication.clipboard().text());self.assertEqual(controller.calls,before)
+        def test_office_activity_diagnosis_invalidation_keeps_question_and_current_saved_file_result(self):
+            dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);dialog.remember_vba_question(self.session_activity_prompt(),'Nie');before=list(controller.calls)
+            plan={'status':'unsupported','candidates':[],'rejections':[{'reason':'Nieznana instrukcja.','statement':'Call ValidateReport()'}]}
+            dialog.present_vba_patch(plan);dialog.apply_native_result({'controls_invalidated':True});self.assertEqual(dialog.patch_diagnosis.toPlainText(),'');self.assertIsNotNone(dialog._patch_question)
+            dialog.present_vba_patch(plan);controller.snapshot.update(state='disconnected',last_result={},error='Utracono połączenie.',error_code='excel_disconnected',error_operation='read_range');dialog.poll();self.assertEqual(dialog.patch_diagnosis.toPlainText(),'');self.assertIsNotNone(dialog._patch_question)
+            controller.snapshot.update(state='busy',operation='prepare_vba_patch',error='');dialog.poll();saved=dict(plan,source_mode='saved_file',created_at='2026-10-08T13:00:00Z')
+            controller.snapshot.update(state='disconnected',operation='',last_operation='prepare_vba_patch',last_result={'action':'prepare_vba_patch','source_mode':'saved_file','vba_patch':saved},vba_patch=saved,error='',error_code='',error_operation='');dialog.poll()
+            self.assertIn('Call ValidateReport()',dialog.patch_diagnosis.toPlainText());self.assertIn('ostatnia zapisana kopia',dialog.patch_diagnosis.toPlainText());self.assertEqual(controller.calls,before)
+        def test_office_activity_long_diagnosis_retains_source_identity_and_marks_truncation(self):
+            dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);dialog.remember_vba_question(self.session_activity_prompt(),'Nie');before=list(controller.calls)
+            plan={'status':'unsupported','candidates':[],'created_at':'2026-10-08T14:00:00Z','file_sha256':'d'*64,'analysis':{'rejections':24,'complete':True},
+                'rejections':[{'module':'Validator','procedure':'Check'+str(index),'line':index+10,'reason':'Nieobsługiwany blok.','statement':'Call CheckValue()','excerpt':'x'*3500} for index in range(24)]}
+            dialog.present_vba_patch(plan);text=dialog.patch_diagnosis.toPlainText();self.assertLessEqual(len(text),30000);self.assertIn('Widok szczegółów został skrócony',text);self.assertIn('2026-10-08T14:00:00Z',text);self.assertIn('d'*64,text);self.assertIn('Odmowy zmiany: 24',text);self.assertIn('Call CheckValue()',text);self.assertEqual(controller.calls,before)
+        def test_office_activity_keeps_prompt_answers_and_footer_reachable_on_small_screen(self):
+            from unittest import mock
+            dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);before=list(controller.calls)
+            for index in range(80):dialog.activity_event('Zdarzenie '+str(index)+' '+('opis '*80))
+            available=QC.QRect(0,0,683,364)
+            with mock.patch.object(dialog,'available_work_area',return_value=available):
+                dialog.fit_to_screen(available);dialog.render_prompts([self.session_activity_prompt()]);dialog.show_message();app.processEvents();answer=self.excel_button(dialog,'Nie');dialog.prompt_scroll.ensureWidgetVisible(answer,4,4);app.processEvents()
+                self.assertTrue(dialog.prompt_scroll.viewport().rect().contains(QC.QRect(answer.mapTo(dialog.prompt_scroll.viewport(),QC.QPoint(0,0)),answer.size())));self.assertTrue(dialog.rect().contains(QC.QRect(dialog.close_button.mapTo(dialog,QC.QPoint(0,0)),dialog.close_button.size())))
+                self.assertLess(dialog.prompt_layout.indexOf(dialog.native_prompt_host),dialog.prompt_layout.indexOf(dialog.activity_frame));self.assertLess(dialog.prompt_layout.indexOf(dialog.failure_frame),dialog.prompt_layout.indexOf(dialog.activity_frame));self.assertEqual(controller.calls,before)
+        def test_office_activity_refusal_reveals_full_source_and_copy_after_pdf_poll_layout(self):
+            from unittest import mock
+            dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);area=QC.QRect(0,0,1280,900);statement='Call ShowPrompt(message)'
+            plan={'status':'unsupported','candidates':[],'rejections':[{'module':'Validator','procedure':'CheckReport','line':42,'end_line':42,'block_line':40,'block_end_line':44,'stage':'body','reason':'Nieobsługiwane wywołanie w bloku walidacji.','statement':statement,'excerpt':'40: If missingCode Then\n41:     message = "Brak kodu"\n42:     '+statement+'\n43:     Exit Sub\n44: End If'}]}
+            with mock.patch.object(dialog,'available_work_area',return_value=area):
+                dialog.fit_to_screen(area);dialog.resize(920,740);controller.snapshot.update(state='ready',operation='',workspace_path=str(self.root),last_operation='run_control_macro',last_result={'action':'run_control_macro','pdf_outputs':{'scope':str(self.root),'files':[],'status':'not_observed','complete':True}},error='');dialog.poll();dialog.remember_vba_question(self.session_activity_prompt(),'Nie')
+                self.assertTrue(dialog.prepare_vba_patch());self.wait(lambda:not dialog._command_pending);controller.snapshot.update(state='ready',operation='',last_operation='prepare_vba_patch',last_result={'action':'prepare_vba_patch','vba_patch':plan},vba_patch=plan,error='');dialog.poll();QTest.qWait(30);app.processEvents()
+                def source_visible():
+                    viewport=dialog.prompt_scroll.viewport();editor=dialog.patch_diagnosis;rect=QC.QRect(editor.mapTo(viewport,QC.QPoint(0,0)),editor.size());self.assertTrue(viewport.rect().contains(rect),(viewport.rect(),rect));self.assertGreaterEqual(rect.height(),140)
+                    found=editor.document().find(statement);self.assertFalse(found.isNull());line=editor.cursorRect(found);visible_line=QC.QRect(editor.viewport().mapTo(viewport,line.topLeft()),line.size());self.assertTrue(viewport.rect().contains(visible_line));self.assertTrue(editor.viewport().rect().contains(line))
+                    copy=QC.QRect(dialog.activity_copy.mapTo(viewport,QC.QPoint(0,0)),dialog.activity_copy.size());self.assertTrue(viewport.rect().contains(copy));self.assertGreater(dialog.prompt_scroll.verticalScrollBar().value(),0)
+                self.assertTrue(dialog.macro_pdf_frame.isVisible());self.assertIn('bez propozycji',dialog.message.text());source_visible()
+                dialog.prompt_scroll.verticalScrollBar().setValue(0);dialog.show_message();QTest.qWait(30);app.processEvents();source_visible()
+                dialog.patch_diagnosis_toggle.setChecked(False);dialog.prompt_scroll.verticalScrollBar().setValue(0);dialog.patch_diagnosis_toggle.setChecked(True);QTest.qWait(30);app.processEvents();source_visible()
+                dialog.reveal_patch_diagnosis();dialog.render_prompts([self.session_activity_prompt()]);dialog.show_message();QTest.qWait(30);app.processEvents();answer=self.excel_button(dialog,'Nie');dialog.prompt_scroll.ensureWidgetVisible(answer,4,4);app.processEvents();self.assertTrue(dialog.prompt_scroll.viewport().rect().contains(QC.QRect(answer.mapTo(dialog.prompt_scroll.viewport(),QC.QPoint(0,0)),answer.size())))
+                self.assertEqual([call[0] for call in controller.calls].count('prepare_vba_patch'),1);self.assertFalse(any(call[0] in ('run_macro','run_control_macro','inspect_vba') for call in controller.calls))
         def test_office_pending_saved_patch_keeps_disconnect_only_in_previous_error_details(self):
             from unittest import mock
             dialog,controller,instances,scan,action,prompt=self.vba_patch_session();details='COM disconnected during previous macro'
