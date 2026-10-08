@@ -4272,8 +4272,8 @@ def database_saved_join(raw):
 def database_graph_layout(objects,relations,sizes,available_width=1200,compact=False):
     """Deterministic component-first layout using real node dimensions.
 
-    Linked nodes sit in adjacent breadth-first layers. Disconnected components
-    pack into shelves; no scene-wide shrink is needed to read the labels.
+    Linked nodes sit in breadth-first layers, with neighbour ordering and
+    connection-dependent gutters. Disconnected components pack into shelves.
     The UI may preserve user positions instead of applying this suggestion.
     """
     lookup={o['id']:o for o in objects};neighbors={k:set() for k in lookup};incoming=collections.Counter()
@@ -4308,10 +4308,11 @@ def database_graph_layout(objects,relations,sizes,available_width=1200,compact=F
                 result[oid]=(12+slot*step,y)
             y+=max(sizes[oid][1] for oid in row)+24
         return result
+    if not any(neighbors.values()):
+        return database_graph_layout(objects,relations,sizes,available_width,compact=True)
     blocks=[]
     for component in components:
-        roots=[k for k in component if not incoming[k]]
-        root=min(roots or component,key=lambda k:(-len(neighbors[k]),key(k)))
+        root=min(component,key=lambda k:(-len(neighbors[k]),-incoming[k],key(k)))
         levels={root:0};q=collections.deque([root])
         while q:
             parent=q.popleft()
@@ -4319,18 +4320,156 @@ def database_graph_layout(objects,relations,sizes,available_width=1200,compact=F
                 if child not in levels:levels[child]=levels[parent]+1;q.append(child)
         cols=collections.defaultdict(list)
         for k in component:cols[levels.get(k,0)].append(k)
-        positions={};x=0;maxh=0
+        for level in cols:cols[level].sort(key=key)
+        # Alternating barycentre sweeps put neighbours opposite each other,
+        # rather than sorting every column alphabetically across the arrows.
+        for sweep in range(8):
+            ranks={oid:i for items in cols.values() for i,oid in enumerate(items)}
+            for level in sorted(cols,reverse=bool(sweep%2)):
+                def order(oid):
+                    adjacent=[ranks[n] for n in neighbors[oid] if levels[n]!=level]
+                    return (sum(adjacent)/len(adjacent) if adjacent else ranks[oid],key(oid))
+                cols[level].sort(key=order)
+                ranks.update({oid:i for i,oid in enumerate(cols[level])})
+        loads=collections.Counter()
+        for edge in relations:
+            if edge['source'] in component and edge['target'] in component:
+                lo,hi=sorted((levels[edge['source']],levels[edge['target']]))
+                for level in range(lo,hi):loads[level]+=max(1,len(edge.get('source_columns',[])))
+        heights={level:sum(sizes[k][1] for k in items)+sum(40+min(48,6*len(neighbors[k])) for k in items[:-1]) for level,items in cols.items()}
+        maxh=max(heights.values(),default=0);positions={};x=0
         for level,items in sorted(cols.items()):
-            y=0;w=max(sizes[k][0] for k in items)
-            for k in sorted(items,key=key):positions[k]=(x,y);y+=sizes[k][1]+30
-            maxh=max(maxh,y-30);x+=w+92
-        blocks.append((positions,max(0,x-92),maxh))
+            y=(maxh-heights[level])/2;w=max(sizes[k][0] for k in items)
+            for k in items:positions[k]=(x,y);y+=sizes[k][1]+40+min(48,6*len(neighbors[k]))
+            # The canvas may grow: dense FK corridors need their own lanes.
+            x+=w+(max(92,40+min(240,loads[level]*10)) if level<max(cols) else 0)
+        blocks.append((positions,x,maxh))
     margin=12 if compact else 24;gap=18 if compact else 36
     x=y=margin;shelf=0;result={};width=max(240 if compact else 660,float(available_width)-(margin if compact else 48))
     for positions,w,h in blocks:
         if x>margin and x+w>width:x=margin;y+=shelf+(24 if compact else 40);shelf=0
         for k,(px,py) in positions.items():result[k]=(x+px,y+py)
         x+=w+gap;shelf=max(shelf,h)
+    return result
+
+
+def database_graph_routes(rectangles,connections):
+    """Route field-to-field arrows together on a rectilinear visibility grid.
+
+    Cards are obstacles. Reused corridors and crossings cost extra, so parallel
+    keys take separate lanes where there is room. Only the short port stubs
+    may share a segment. Input/output are plain scene coordinates, without Qt.
+    """
+    import bisect,heapq
+    if not connections:return []
+    pad=12;rects={k:(float(x)-pad,float(y)-pad,float(x+w)+pad,float(y+h)+pad) for k,(x,y,w,h) in rectangles.items()}
+    ports=collections.Counter();prepared=[];xs=set();ys=set()
+    for l,t,r,b in rects.values():xs.update((l,r));ys.update((t,b))
+    for spec in connections:
+        start,end=tuple(spec['start']),tuple(spec['end']);left,right=spec['source_side'],spec['target_side']
+        stubs=[]
+        for oid,point,side in ((spec['source'],start,left),(spec['target'],end,right)):
+            rank=ports[oid,side];ports[oid,side]+=1
+            # Ten-pixel lanes keep multiple relationships legible at normal zoom.
+            offset=pad+8+rank*10
+            barriers=[l-point[0] if side=='right' else point[0]-r for other,(l,t,r,b) in rects.items()
+                if other!=oid and t<point[1]<b and (l>point[0] if side=='right' else r<point[0])]
+            if barriers:offset=min(offset,max(pad,min(barriers)-2))
+            x=point[0]+(offset if side=='right' else -offset)
+            stubs.append((x,point[1]));xs.add(x);ys.add(point[1])
+        if start==end and stubs[0]==stubs[1]:stubs[1]=(stubs[1][0]+10,stubs[1][1]+8)
+        prepared.append((start,end,*stubs));xs.update((stubs[0][0],stubs[1][0]));ys.update((stubs[0][1],stubs[1][1]))
+    for oid,(l,t,r,b) in rects.items():
+        for lane in range(1,min(5,max(ports[oid,'left'],ports[oid,'right']))):ys.update((t-lane*10,b+lane*10))
+    xs.update((min(xs)-40,max(xs)+40));ys.update((min(ys)-40,max(ys)+40))
+    xx=sorted(xs);yy=sorted(ys);xi={v:i for i,v in enumerate(xx)};yi={v:i for i,v in enumerate(yy)}
+    # Rectangles block intervals of grid rows/columns. Cache interval queries,
+    # instead of testing every table again at every step of every arrow.
+    rows=[sorted((l,r) for l,t,r,b in rects.values() if t<y<b) for y in yy]
+    cols=[sorted((t,b) for l,t,r,b in rects.values() if l<x<r) for x in xx]
+    def merged(intervals):
+        result=[]
+        for a,b in intervals:
+            if result and a<=result[-1][1]:result[-1]=(result[-1][0],max(b,result[-1][1]))
+            else:result.append((a,b))
+        return ([a for a,b in result],[b for a,b in result])
+    rows=list(map(merged,rows));cols=list(map(merged,cols));clear_cache={};used=collections.Counter();crossings={};result=[]
+    def clear(a,b):
+        key=(min(a,b),max(a,b))
+        if key in clear_cache:return clear_cache[key]
+        if a[1]==b[1]:lo,hi=sorted((xx[a[0]],xx[b[0]]));starts,ends=rows[a[1]]
+        else:lo,hi=sorted((yy[a[1]],yy[b[1]]));starts,ends=cols[a[0]]
+        at=bisect.bisect_left(starts,hi)-1
+        answer=at<0 or ends[at]<=lo;clear_cache[key]=answer;return answer
+    for start,end,p,q in prepared:
+        source=(xi[p[0]],yi[p[1]]);target=(xi[q[0]],yi[q[1]])
+        # Most layer-to-layer links have a free vertical gutter. Resolve those
+        # directly before searching the full visibility grid.
+        midpoint=(p[0]+q[0])/2;lanes=sorted(range(len(xx)),key=lambda n:(abs(xx[n]-midpoint),n))[:12]
+        lanes=list(dict.fromkeys([*lanes,source[0],target[0]]));fast=None;fast_cost=float('inf')
+        candidates=[[source,(lane,source[1]),(lane,target[1]),target] for lane in lanes]
+        horizontal=sorted(range(len(yy)),key=lambda n:(abs(yy[n]-(p[1]+q[1])/2),n))[:12]
+        horizontal=list(dict.fromkeys([*horizontal,0,len(yy)-1,source[1],target[1]]))
+        candidates.extend([source,(source[0],lane),(target[0],lane),target] for lane in horizontal)
+        for corners in candidates:
+            candidate=[source];score=0;direction=0
+            for a,b in zip(corners,corners[1:]):
+                axis=1 if a[1]==b[1] else 2
+                if a==b:continue
+                if not clear(a,b):score=float('inf');break
+                if direction and direction!=axis:score+=28
+                direction=axis;steps=range(a[0]+(1 if b[0]>a[0] else -1),b[0]+(1 if b[0]>a[0] else -1),1 if b[0]>a[0] else -1) if axis==1 else range(a[1]+(1 if b[1]>a[1] else -1),b[1]+(1 if b[1]>a[1] else -1),1 if b[1]>a[1] else -1)
+                for value in steps:
+                    other=(value,a[1]) if axis==1 else (a[0],value);old=candidate[-1]
+                    distance=abs(xx[other[0]]-xx[old[0]])+abs(yy[other[1]]-yy[old[1]])
+                    score+=distance+used[min(old,other),max(old,other)]*(distance*4+14)
+                    if crossings.get(other,0)&(2 if axis==1 else 1):score+=45
+                    candidate.append(other)
+            if score<fast_cost:fast_cost=score;fast=candidate
+        grid=fast if fast_cost<=abs(p[0]-q[0])+abs(p[1]-q[1])+320 else None
+        initial=(source[0],source[1],0);costs={initial:0};previous={};queue=[(abs(p[0]-q[0])+abs(p[1]-q[1]),0,initial)];last=None;expanded=0
+        while queue and grid is None:
+            _,cost,state=heapq.heappop(queue)
+            if cost!=costs.get(state):continue
+            x,y,direction=state;point=(x,y)
+            if point==target:last=state;break
+            expanded+=1
+            # The graph has a bounded UI catalogue, but pathological manual
+            # overlaps must not hang its event loop.
+            if expanded>(3500 if fast is not None else 24000):break
+            for nx,ny,axis in ((x-1,y,1),(x+1,y,1),(x,y-1,2),(x,y+1,2)):
+                if not (0<=nx<len(xx) and 0<=ny<len(yy)):continue
+                other=(nx,ny)
+                if not clear(point,other):continue
+                distance=abs(xx[nx]-xx[x])+abs(yy[ny]-yy[y]);segment=(min(point,other),max(point,other))
+                penalty=used[segment]*(distance*4+14)+(28 if direction and direction!=axis else 0)
+                if crossings.get(other,0)&(2 if axis==1 else 1):penalty+=45
+                new=cost+distance+penalty;nstate=(nx,ny,axis)
+                if new>=costs.get(nstate,float('inf')):continue
+                costs[nstate]=new;previous[nstate]=state
+                heapq.heappush(queue,(new+1.4*(abs(xx[nx]-q[0])+abs(yy[ny]-q[1])),new,nstate))
+        if grid is None and last is None and fast is not None:grid=fast
+        if grid is None and last is None:
+            # No invented route through a card when the user overlaps ports.
+            # The UI exposes this exceptional route as a dotted connection.
+            result.append({'points':[start,end],'blocked':True});continue
+        if grid is None:
+            grid=[]
+            while last is not None:grid.append((last[0],last[1]));last=previous.get(last)
+            grid.reverse()
+        for a,b in zip(grid,grid[1:]):
+            used[min(a,b),max(a,b)]+=1;axis=1 if a[1]==b[1] else 2
+            crossings[a]=crossings.get(a,0)|axis;crossings[b]=crossings.get(b,0)|axis
+        points=[start,p]+[(xx[x],yy[y]) for x,y in grid[1:-1]]+[q,end];simplified=[]
+        for point in points:
+            if simplified and point==simplified[-1]:continue
+            while len(simplified)>1 and ((simplified[-2][0]==simplified[-1][0]==point[0]) or (simplified[-2][1]==simplified[-1][1]==point[1])):
+                # Keep a reversal (self links) instead of erasing its endpoint.
+                a,b=simplified[-2:]
+                if (b[0]-a[0])*(point[0]-b[0])+(b[1]-a[1])*(point[1]-b[1])<0:break
+                simplified.pop()
+            simplified.append(point)
+        result.append({'points':simplified,'blocked':False})
     return result
 
 
@@ -5373,7 +5512,8 @@ _VBA_PLAN_PRIMITIVE = {"boolean", "byte", "integer", "long", "longlong", "longpt
               "single", "double", "currency", "decimal", "date", "string",
               "vbmsgboxresult", "vbmsgboxstyle"}
 _VBA_PLAN_PURE = {"len", "lenb", "trim", "ltrim", "rtrim", "ucase", "lcase", "isnumeric",
-         "isempty", "isnull", "strcomp", "instr", "left", "right", "mid"}
+         "isempty", "isnull", "strcomp", "instr", "left", "right", "mid", "chr", "chrw",
+         "cstr", "cbool", "cint", "clng", "cdbl", "csng", "cdate", "isdate", "iserror", "replace"}
 _VBA_PLAN_CONSTANTS = {"true", "false", "null", "empty", "vbcrlf", "vbcr", "vblf", "vbtab",
               "vbnewline", "vbnullstring", "vbyes", "vbno", "vbok", "vbcancel",
               "vbokonly", "vbokcancel", "vbyesno", "vbyesnocancel", "vbquestion",
@@ -5492,7 +5632,7 @@ def _vba_plan_pure_expression(expression, symbols, shadowed):
         elif position < len(tokens) and tokens[position] == "(":
             function = lower.rstrip("$")
             if function not in _VBA_PLAN_PURE or function in shadowed or lower in symbols:
-                raise ValueError("Wywołanie funkcji, której braku skutków ubocznych nie potwierdzono.")
+                raise ValueError("Argument pomijanego komunikatu wywołuje „" + token + "”; nie potwierdzono braku skutków ubocznych tego wywołania.")
             position += 1
             if position < len(tokens) and tokens[position] != ")":
                 parse(0, depth + 1)
@@ -5558,7 +5698,18 @@ def _vba_plan_match_prompt(expression, literals, prompt):
     if len(normalized) < 20:
         return None
     known_space = {"vbcrlf": "\r\n", "vbcr": "\r", "vblf": "\n", "vbnewline": "\r\n", "vbtab": "\t", "vbnullstring": ""}
-    tokens = _vba_plan_tokens(expression)
+    raw_tokens = _vba_plan_tokens(expression)
+    tokens = []
+    index = 0
+    while index < len(raw_tokens):
+        # Only exact, locale-independent character constants. This does not
+        # execute VBA or infer values of variables/functions from the workbook.
+        if index + 3 < len(raw_tokens) and raw_tokens[index].casefold().rstrip('$') in ('chr', 'chrw') and raw_tokens[index + 1] == '(' and raw_tokens[index + 3] == ')':
+            number = raw_tokens[index + 2]
+            value = int(number[2:],16) if re.fullmatch(r'&[Hh][0-9a-fA-F]+',number) else int(number) if number.isdecimal() else None
+            if value in (9,10,13):
+                tokens.append('"'+chr(value)+'"');index+=4;continue
+        tokens.append(raw_tokens[index]);index+=1
     value = []
     static = True
     expect_value = True
@@ -5602,8 +5753,10 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
     Supported: a multiline If/End If without Else, whose only executable body
     is MsgBox plus Exit Sub/Function, optionally its Boolean Function=False.
     A single inner `If MsgBox(...) = vbYes/vbNo Then Exit ...` is also recognized.
-    Unknown calls, object access, loops, other assignments, labels and directives
-    inside the selected guard are rejected. No live VBA branches are inferred.
+    The outer condition is kept verbatim and evaluated as before, including
+    unknown calls and object reads. Only its verified message/early-return body
+    is disabled by an inner False guard. Other work in that body is rejected.
+    No live VBA branches are inferred.
     """
     result = {"status": "unsupported", "candidates": [], "rejections": [], "complete": True,
               "notice": "Propozycja statyczna do przeglądu. Nie ustala wykonanej gałęzi, nie uruchamia makra i nie zmienia pliku. Zastosowanie wymaga osobnej zgody i kopii skoroszytu."}
@@ -5639,6 +5792,17 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
             match = re.match(r"^(?:(?:Public|Private|Friend|Static|Declare|PtrSafe)\s+)*(?:Sub|Function|Property\s+(?:Get|Let|Set))\s+(\w+)", line, re.I)
             if match:
                 shadowed.add(match[1].casefold())
+            # A default-member call through a variable/array can also shadow
+            # a built-in. Do not rely only on the set of typed scalar locals.
+            declaration = _VBA_PLAN_PROC.fullmatch(line)
+            variables = re.match(r'^(?:Dim|Static|Public|Private|Global|Const)\s+(.+)$',line,re.I) if not match else None
+            if variables or declaration:
+                try:
+                    for item in _vba_plan_split_args(declaration[3] if declaration else variables[1]):
+                        symbol=re.match(r'(?:(?:ByVal|ByRef|Optional|ParamArray|WithEvents)\s+)*([A-Za-z_]\w*)',item,re.I)
+                        if symbol:shadowed.add(symbol[1].casefold())
+                except ValueError:
+                    result['complete']=False
         prepared.append((module["name"], code, lines, cleaned))
     if len(modules) > 100:
         result["complete"] = False
@@ -5691,7 +5855,9 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                 # Reject only blocks containing a related literal, so unrelated
                 # business code does not produce a wall of refusal messages.
                 literal_values = [match[1].replace('""', '"') for text in body for match in re.finditer(r'"((?:[^"]|"")*)"', text)]
-                if not any(len(_vba_plan_normal(value)) >= 20 and (_vba_plan_normal(value) == _vba_plan_normal(prompt_text) or _vba_plan_normal(value) in _vba_plan_normal(prompt_text)) for value in literal_values):
+                visible_prompt=_vba_plan_normal(prompt_text)
+                literal_parts=[_vba_plan_normal(value) for value in literal_values]
+                if not any(len(value)>=20 and value in visible_prompt for value in literal_parts) and sum(len(value) for value in literal_parts if value and value in visible_prompt)<20:
                     continue
                 context = {"module": module_name, "procedure": declaration[2], "line": block_start + 1, "end_line": block_end + 1}
                 try:
@@ -5701,7 +5867,10 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                         raise ValueError("Moduł zawiera dyrektywy kompilacji; wybrana wersja kodu nie została potwierdzona.")
                     if any(":" in _vba_plan_masked(text) or re.search(r"\s_\s*$", text) for text in cleaned[block_start:block_end + 1]):
                         raise ValueError("Etykiety, wiele instrukcji w wierszu lub kontynuacje są poza obsługiwanym wzorcem.")
-                    _vba_plan_pure_expression(header[1], symbols, shadowed)
+                    _vba_plan_split_args(header[1])  # Balanced strings/parentheses; no execution.
+                    # Preserve the original condition and its evaluation. It may
+                    # read cells or prepare data; only the verified body below
+                    # is skipped, so no purity claim is made about the condition.
                     exit_text = "exit " + declaration[1].casefold()
                     boolean_return = False
                     response_conditional = False
@@ -5741,8 +5910,10 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                     old_block = "".join(lines[block_start:block_end + 1])
                     ending = "\r\n" if lines[block_start].endswith("\r\n") else "\n" if lines[block_start].endswith("\n") else "\r" if lines[block_start].endswith("\r") else ""
                     indent = re.match(r"\s*", lines[block_start])[0].rstrip("\r\n")
-                    new_header = indent + "If False Then ' Pivot Studio: selected validation bypass in reviewed copy" + ending
-                    new_block = new_header + "".join(lines[block_start + 1:block_end + 1])
+                    new_header = lines[block_start]
+                    inner_indent = indent + '    '
+                    new_block = (new_header + inner_indent + "If False Then ' Pivot Studio: selected validation body bypass in reviewed copy" + ending
+                                 + "".join(lines[block_start + 1:block_end]) + inner_indent + 'End If' + ending + lines[block_end])
                     relation = "entry" if requested in (declaration[2].casefold(), (module_name + "." + declaration[2]).casefold()) else "unproven"
                     warnings = ["Pominięcie tej kontroli może dopuścić niepoprawne dane do dalszej pracy.", "Nie jest to dowód wykonanej gałęzi ani gwarancja utworzenia dokumentu.", "Zmieniaj tylko odrębną kopię, po sprawdzeniu całego proponowanego bloku."]
                     if relation == "unproven":
@@ -5754,7 +5925,7 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                                      start_offset=sum(map(len, lines[:block_start])), end_offset=sum(map(len, lines[:block_end + 1])),
                                      old_block=old_block, new_block=new_block, old_header=lines[block_start], new_header=new_header,
                                      condition=header[1], match=match, entry_relation=relation, requires_confirmation=True,
-                                     reason="Blok ma rozpoznany wzorzec komunikatu i wyjścia, bez dodatkowej pracy. " + semantic_note,
+                                     reason="Zachowano oryginalny warunek i jego wywołania. Pomijane jest tylko rozpoznane wnętrze: komunikat i wyjście, bez dodatkowej pracy. " + semantic_note,
                                      warnings=warnings)
                     if len(old_block) > 12000 or len(result["candidates"]) >= 8:
                         result["complete"] = False
@@ -6479,7 +6650,13 @@ class ExcelSessionWorker:
         expected=source.get('file_sha256','')
         if not isinstance(expected,str) or not re.fullmatch('[0-9a-f]{64}',expected):raise UserError('Nie potwierdzono skrótu kopii przygotowanej do zmiany.')
         modules=source.get('modules',[]);plan=plan_vba_validation_patch(modules,macro_name=macro,prompt_text=prompt);preview['status']=str(plan.get('status','unsupported'))[:100]
-        preview['reason']=str(plan.get('reason',''))[:1800];preview['rejections']=[{'reason':str(item.get('reason',''))[:1800]} if isinstance(item,dict) else {'reason':str(item)[:1800]} for item in plan.get('rejections',[])[:24]]
+        preview['reason']=str(plan.get('reason',''))[:1800];preview['rejections']=[]
+        for item in plan.get('rejections',[])[:24]:
+            record={'reason':str(item.get('reason',''))[:1800]} if isinstance(item,dict) else {'reason':str(item)[:1800]}
+            if isinstance(item,dict):
+                for key in ('module','procedure','line'):
+                    if key in item:record[key]=str(item[key])[:128]
+            preview['rejections'].append(record)
         sources={item['name']:item['code'] for item in modules};candidates={}
         for candidate in plan.get('candidates',[])[:8]:
             module=candidate.get('module');old=sources.get(module);start=candidate.get('start_offset');end=candidate.get('end_offset');cid=candidate.get('id')
@@ -12873,9 +13050,9 @@ def native_ui_types():
             self.native_prompt_host=QW.QWidget();self.native_prompt_layout=QW.QVBoxLayout(self.native_prompt_host);self.native_prompt_layout.setContentsMargins(0,0,0,0);self.prompt_layout.addWidget(self.native_prompt_host)
             self.previous_failure_button=button('Szczegóły ostatniego błędu…',self.show_error_details);self.prompt_layout.addWidget(self.previous_failure_button);self.previous_failure_button.hide()
             self.patch_frame=QW.QGroupBox('Pominięcie walidacji w kopii');patch_layout=QW.QVBoxLayout(self.patch_frame)
-            self.patch_note=label('Po odpowiedzi na pytanie możesz przygotować zmianę wybranego warunku VBA.',True,True);self.patch_note.setTextFormat(Qt.TextFormat.PlainText);patch_layout.addWidget(self.patch_note)
+            self.patch_note=label('Po odpowiedzi na pytanie możesz przygotować zmianę wybranego bloku walidacji VBA.',True,True);self.patch_note.setTextFormat(Qt.TextFormat.PlainText);patch_layout.addWidget(self.patch_note)
             self.patch_status=label('',True,True);self.patch_status.setTextFormat(Qt.TextFormat.PlainText);patch_layout.addWidget(self.patch_status)
-            self.patch_button=button('Pierdol to',self.prepare_vba_patch);self.patch_button.setToolTip('Znajdź warunek związany z ostatnim pytaniem i pokaż zmianę kodu. Zastosowanie utworzy osobną kopię skoroszytu.');patch_layout.addWidget(self.patch_button)
+            self.patch_button=button('Pierdol to',self.prepare_vba_patch);self.patch_button.setToolTip('Znajdź blok walidacji związany z ostatnim pytaniem i pokaż zmianę kodu. Zastosowanie utworzy osobną kopię skoroszytu.');patch_layout.addWidget(self.patch_button)
             self.patch_open_button=button('Otwórz zmienioną kopię w Pivocie',self.open_vba_patch_copy);patch_layout.addWidget(self.patch_open_button);self.patch_open_button.hide()
             self.prompt_layout.addWidget(self.patch_frame);self.patch_frame.hide()
             self.generator_frame=QW.QGroupBox('Generator w zmienionej kopii');generator_layout=QW.QVBoxLayout(self.generator_frame)
@@ -12958,14 +13135,14 @@ def native_ui_types():
             if self._patch_preview is not None:
                 with contextlib.suppress(RuntimeError):self._patch_preview.reject()
             self._patch_preview=None;self._patch_question=self._patch_question if preserve_question else None;self._patch_plan={};self._patch_result={};self._patch_run_request=None;self.patch_frame.hide();self.patch_open_button.hide()
-            self.patch_note.setText('Zachowano pytanie z poprzedniej próby tego makra. Analiza będzie dotyczyć bieżącej kopii skoroszytu.' if self._patch_question else 'Po odczytaniu pytania makra możesz przygotować zmianę wybranego warunku VBA.')
+            self.patch_note.setText('Zachowano pytanie z poprzedniej próby tego makra. Analiza będzie dotyczyć bieżącej kopii skoroszytu.' if self._patch_question else 'Po odczytaniu pytania makra możesz przygotować zmianę wybranego bloku walidacji VBA.')
         def remember_vba_question(self,snapshot,answer=''):
             identity=self.session_identity();text=str(snapshot.get('text') or '').strip()
             if not identity or not text or not snapshot.get('complete',True) or not snapshot.get('buttons'):return
             control=self.native_controls.currentData() or {}
             self._patch_question={'identity':identity,'text':text[:8000],'answer':answer[:200],'macro_name':self._vba_macro or str(control.get('on_action') or control.get('macro_name') or ''),'sheet':self.native_sheets.currentText(),'control':clone(control)}
             self._patch_plan={};self._patch_result={};self.patch_open_button.hide()
-            self.patch_note.setText(('Wybrano „'+answer+'”. ' if answer else 'Zapamiętano pytanie Excela. Odpowiedź wybrana poza Pivotem nie jest rejestrowana. ')+'„Pierdol to” przygotuje propozycję pominięcia warunku związanego z tym pytaniem w osobnej kopii.')
+            self.patch_note.setText(('Wybrano „'+answer+'”. ' if answer else 'Zapamiętano pytanie Excela. Odpowiedź wybrana poza Pivotem nie jest rejestrowana. ')+'„Pierdol to” przygotuje propozycję pominięcia bloku komunikatu i wyjścia związanego z tym pytaniem w osobnej kopii.')
         def prepare_vba_patch(self):
             if not self._patch_question or self._last_prompts or self._action_pending:return False
             if self._snapshot.get('state') not in ('ready','disconnected') or self._command_pending or self._queued is not None or self._snapshot.get('handoff_incomplete'):return False
@@ -12977,7 +13154,7 @@ def native_ui_types():
             args={'prompt_text':question['text'],'answer_text':question['answer'],'macro_name':question.get('macro_name','')}
             saved=self._snapshot.get('state')=='disconnected'
             if saved:args['source_mode']='saved_file'
-            self.patch_note.setText('Analizuję ostatnią zapisaną kopię sesji. Niezapisane zmiany z Excela nie są uwzględnione.' if saved else 'Przygotowuję kopię bieżącego skoroszytu i szukam warunku związanego z pytaniem…')
+            self.patch_note.setText('Analizuję ostatnią zapisaną kopię sesji. Niezapisane zmiany z Excela nie są uwzględnione.' if saved else 'Przygotowuję kopię bieżącego skoroszytu i szukam bloku walidacji związanego z pytaniem…')
             return self.submit('prepare_vba_patch',args)
         def present_vba_patch(self,plan):
             if not isinstance(plan,dict) or not self._patch_question:return
@@ -12985,11 +13162,17 @@ def native_ui_types():
             candidates=plan.get('candidates') or []
             if not candidates:
                 reasons=plan.get('rejections') or [plan.get('reason') or 'Nie znaleziono jednoznacznego bloku walidacji, który można pominąć.']
-                self.patch_note.setText('Nie utworzono zmienionej kopii. '+'\n'.join(str(item.get('reason',item)) if isinstance(item,dict) else str(item) for item in reasons)[:2500]);return
+                descriptions=[]
+                for item in reasons:
+                    if not isinstance(item,dict):descriptions.append(str(item));continue
+                    location='.'.join(str(item.get(key) or '') for key in ('module','procedure')).strip('.')
+                    if item.get('line'):location+=' · wiersz '+str(item['line'])
+                    descriptions.append((location+': ' if location else '')+str(item.get('reason',item)))
+                self.patch_note.setText('Nie utworzono zmienionej kopii. '+'\n'.join(descriptions)[:2500]);return
             if self._patch_preview is not None:return
             dialog=QW.QDialog(self);dialog.setWindowTitle('Pierdol to — podgląd zmiany VBA');dialog.setWindowModality(Qt.WindowModality.WindowModal);layout=QW.QVBoxLayout(dialog)
             source_note=('Źródło: ostatnia zapisana kopia sesji. Niezapisane zmiany z Excela nie są uwzględnione. '+str(plan.get('source_note','')) if plan.get('source_mode')=='saved_file' else 'Źródło: bieżący skoroszyt z chwili przygotowania. Późniejsze edycje nie są uwzględnione.')
-            description=label('Zmiana pominie wskazany warunek w nowej kopii. Dokument może zawierać brakujące dane. '+source_note+' Przygotowano: '+str(plan.get('created_at',''))+'. Wybierz samo utworzenie kopii albo zastosowanie i jedną próbę generatora z wyborem miejsca zapisu PDF.',True,True);description.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(description)
+            description=label('Zmiana pominie wskazany blok komunikatu i wyjścia w nowej kopii. Oryginalny warunek zostanie nadal obliczony. Dokument może zawierać brakujące dane. '+source_note+' Przygotowano: '+str(plan.get('created_at',''))+'. Wybierz samo utworzenie kopii albo zastosowanie i jedną próbę generatora z wyborem miejsca zapisu PDF.',True,True);description.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(description)
             choice=QW.QComboBox();choice.setMinimumContentsLength(1);choice.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);choice.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed);layout.addWidget(choice)
             for item in candidates:choice.addItem(str(item.get('module',''))+'.'+str(item.get('procedure',''))+' · wiersz '+str(item.get('line','')),item)
             if len(candidates)>1:choice.setCurrentIndex(-1);choice.setPlaceholderText('Wybierz właściwy blok — pytanie pasuje do kilku miejsc')
@@ -13589,7 +13772,7 @@ def native_ui_types():
                 if operation=='prepare_vba_patch':self.present_vba_patch(snapshot.get('vba_patch') or result.get('vba_patch') or {})
                 elif operation=='apply_vba_patch':
                     self._patch_result=clone(result.get('vba_patch_applied') or result);path=str(self._patch_result.get('path') or self._patch_result.get('patched_path') or '')
-                    self.patch_note.setText('Utworzono kopię z pominiętym warunkiem: '+path+'\nOtwórz ją w Pivocie i uruchom generator. Utworzenie PDF wymaga osobnego sprawdzenia.');self.patch_open_button.setVisible(bool(path));self.body_tabs.setCurrentIndex(1)
+                    self.patch_note.setText('Utworzono kopię z pominiętym blokiem walidacji: '+path+'\nOtwórz ją w Pivocie i uruchom generator. Utworzenie PDF wymaga osobnego sprawdzenia.');self.patch_open_button.setVisible(bool(path));self.body_tabs.setCurrentIndex(1)
                     request=self._patch_run_request;self._patch_run_request=None
                     if request and request.get('token')==self._patch_result.get('token') and request.get('candidate_id')==self._patch_result.get('candidate_id'):
                         self.patch_note.setText('Utworzono zmienioną kopię. Otwieram ją do jednej próby generatora i zapisu PDF: '+path);self.open_vba_patch_copy(request)
@@ -16752,32 +16935,21 @@ def native_ui_types():
 
     class DatabaseEdge(QW.QGraphicsPathItem):
         def __init__(self,edge,pair,graph):
-            super().__init__();self._edge=edge;self._pair=pair;self._graph=graph
+            super().__init__();self._edge=edge;self._pair=pair;self._graph=graph;self._route=None
             self.setZValue(-1);self.setAcceptHoverEvents(True);self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
             self.arrow=QW.QGraphicsPolygonItem(self);self.arrow.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.setToolTip(edge['name']+'\n'+', '.join(edge['source_columns'])+' → '+edge.get('target_table','')+' ('+', '.join(str(x or '?') for x in edge['target_columns'])+')')
-            self._hover=False;self.refresh()
+            self._base_tooltip=self.toolTip();self._hover=False;self.refresh()
         def shape(self):
             stroke=QG.QPainterPathStroker();stroke.setWidth(12);return stroke.createStroke(self.path())
         def refresh(self):
             graph=self._graph;edge=self._edge;src=graph._nodes.get(edge['source']);dst=graph._nodes.get(edge['target'])
             if src is None or dst is None:return
-            col,target=self._pair;a=src.sceneBoundingRect();b=dst.sceneBoundingRect();path=QG.QPainterPath()
-            if src is dst:
-                start=src.anchor(col,'right');end=dst.anchor(target,'right');lane=a.right()+45
-                if abs(start.y()-end.y())<4:end=end+QC.QPointF(0,8)
-                points=[start,QC.QPointF(lane,start.y()),QC.QPointF(lane,end.y()),end]
-            elif b.left()>=a.right()+16:
-                start=src.anchor(col,'right');end=dst.anchor(target,'left');mid=(start.x()+end.x())/2
-                points=[start,QC.QPointF(mid,start.y()),QC.QPointF(mid,end.y()),end]
-            elif a.left()>=b.right()+16:
-                start=src.anchor(col,'left');end=dst.anchor(target,'right');mid=(start.x()+end.x())/2
-                points=[start,QC.QPointF(mid,start.y()),QC.QPointF(mid,end.y()),end]
-            else:
-                # Vertical/overlapping bands route outside both cards, never
-                # looping backwards through a header just to reach a fixed Y.
-                start=src.anchor(col,'right');end=dst.anchor(target,'right');lane=max(a.right(),b.right())+44
-                points=[start,QC.QPointF(lane,start.y()),QC.QPointF(lane,end.y()),end]
+            path=QG.QPainterPath()
+            if not self._route:
+                # Geometry is planned jointly after all cards have positions.
+                self.setPath(path);self.arrow.setPolygon(QG.QPolygonF());return
+            points=[QC.QPointF(*point) for point in self._route['points']]
             path.moveTo(points[0])
             # Round right-angle bends but keep the final few pixels straight.
             for i,p in enumerate(points[1:-1],1):
@@ -16787,7 +16959,10 @@ def native_ui_types():
                 path.lineTo(before);path.quadTo(p,after)
             path.lineTo(points[-1]);self.setPath(path)
             selected=src.isSelected() and dst.isSelected();color=ui_color('accent' if selected or self._hover else 'muted')
-            pen=QG.QPen(color,2.2 if selected or self._hover else 1.5);pen.setCosmetic(True);self.setPen(pen)
+            pen=QG.QPen(color,2.2 if selected or self._hover else 1.5);pen.setCosmetic(True)
+            if self._route.get('blocked'):pen.setStyle(Qt.PenStyle.DotLine)
+            self.setPen(pen)
+            self.setToolTip(self._base_tooltip+('\nKarty zasłaniają port połączenia. Uporządkuj mapę lub odsuń nakładające się tabele.' if self._route.get('blocked') else ''))
             end,before=points[-1],points[-2];angle=math.atan2(end.y()-before.y(),end.x()-before.x())
             tip=QG.QPolygonF([end,end-QC.QPointF(8*math.cos(angle-.48),8*math.sin(angle-.48)),end-QC.QPointF(8*math.cos(angle+.48),8*math.sin(angle+.48))])
             self.arrow.setPolygon(tip);self.arrow.setPen(QG.QPen(color));self.arrow.setBrush(QG.QBrush(color))
@@ -16804,7 +16979,8 @@ def native_ui_types():
             self._nodes={};self._edges=[];self._links=[];self._building=False;self._plan_key='';self._source_key='';self._view_key=''
             self._plan=None;self._key_fields={};self._foreign_fields={};self._highlight_fields={};self._selected_relation=''
             self._states={};self._manual_positions=set();self._space=False;self._pan_point=None;self._restoring=False;self._initial_view=False
-            self._edge_timer=QC.QTimer(self);self._edge_timer.setSingleShot(True);self._edge_timer.setInterval(0);self._edge_timer.timeout.connect(self.redraw_edges)
+            self._route_geometry=None
+            self._edge_timer=QC.QTimer(self);self._edge_timer.setSingleShot(True);self._edge_timer.setInterval(90);self._edge_timer.timeout.connect(self.redraw_edges)
             self._save_timer=QC.QTimer(self);self._save_timer.setSingleShot(True);self._save_timer.setInterval(180);self._save_timer.timeout.connect(self.save_state)
             self.setFrameShape(QW.QFrame.Shape.NoFrame)
             self.setRenderHints(QG.QPainter.RenderHint.Antialiasing|QG.QPainter.RenderHint.TextAntialiasing)
@@ -16839,7 +17015,28 @@ def native_ui_types():
             if not self._building:self._edge_timer.start()
         def redraw_edges(self):
             if self._building:return
-            for item in self._edges:item.refresh()
+            rectangles={oid:(node.pos().x(),node.pos().y(),node.rect().width(),node.rect().height()) for oid,node in self._nodes.items()}
+            ordered=sorted(self._edges,key=lambda item:(item._edge['source'],item._edge['target'],item._edge['id'],str(item._pair)))
+            geometry=(tuple(sorted(rectangles.items())),tuple(id(item) for item in ordered))
+            if geometry==self._route_geometry:
+                for item in ordered:item.refresh()
+                return
+            self._route_geometry=geometry
+            specs=[];side_counts=collections.Counter()
+            for item in ordered:
+                edge=item._edge;src=self._nodes[edge['source']];dst=self._nodes[edge['target']];a=src.sceneBoundingRect();b=dst.sceneBoundingRect()
+                if b.left()>=a.right()+16:left,right='right','left'
+                elif a.left()>=b.right()+16:left,right='left','right'
+                else:
+                    # Same-column links use both sides instead of piling onto
+                    # one shared vertical line on the right of the cards.
+                    left=right='left' if side_counts[edge['source'],'left']<side_counts[edge['source'],'right'] else 'right'
+                side_counts[edge['source'],left]+=1;side_counts[edge['target'],right]+=1
+                start=src.anchor(item._pair[0],left);end=dst.anchor(item._pair[1],right)
+                if src is dst and abs(start.y()-end.y())<4:end+=QC.QPointF(0,8)
+                specs.append({'source':edge['source'],'target':edge['target'],'source_side':left,'target_side':right,
+                    'start':(start.x(),start.y()),'end':(end.x(),end.y())})
+            for item,route in zip(ordered,database_graph_routes(rectangles,specs)):item._route=route;item.refresh()
             self._scene.setSceneRect(self._scene.itemsBoundingRect().adjusted(-12,-12,12,12))
         def schedule_save(self,*_):
             if self._source_key and not self._building and not self._restoring and not self._initial_view:self._save_timer.start()
@@ -16940,7 +17137,11 @@ def native_ui_types():
                         item=DatabaseEdge(edge,pair,self);self._scene.addItem(item);self._edges.append(item)
                 self._scene.setSceneRect(scene_rect.united(self._scene.itemsBoundingRect().adjusted(-42,-42,42,42)));self.centerOn(center)
             finally:self._building=False
-            self.setBackgroundBrush(ui_color('bg'));self._selection_changed();self._edge_timer.stop();self.save_state()
+            self.setBackgroundBrush(ui_color('bg'));self.redraw_edges()
+            # Routing changes the scene bounds too. Restore the viewport only
+            # after the new arrow paths exist, so hydration cannot move it.
+            self._scene.setSceneRect(scene_rect.united(self._scene.itemsBoundingRect().adjusted(-42,-42,42,42)));self.centerOn(center)
+            self._selection_changed();self._edge_timer.stop();self.save_state()
         def _initialize_view(self):
             if not self._initial_view or not self.isVisible() or self.viewport().width()<20:return
             self._initial_view=False;self._restoring=True
@@ -16975,7 +17176,7 @@ def native_ui_types():
                     for oid,old in list(self._nodes.items()):
                         node=DatabaseNode(old._object,self);self._scene.removeItem(old);self._nodes[oid]=node;self._scene.addItem(node);node.setSelected(oid in selected)
                 sizes={oid:(n.rect().width(),n.rect().height()) for oid,n in self._nodes.items()}
-                positions=database_graph_layout(self._plan['objects'],self._links,sizes,self.layout_width(),compact=True)
+                positions=database_graph_layout(self._plan['objects'],self._links,sizes,self.layout_width())
                 stored=self._state().get('positions',{}) if preserve else {}
                 raw_manual=self._state().get('manual',[]) if preserve else []
                 self._manual_positions={oid for oid in raw_manual if isinstance(oid,str) and oid in self._nodes} if isinstance(raw_manual,list) else set()
@@ -17406,6 +17607,7 @@ def native_ui_types():
             self.graph_note=label('Ctrl+klik lub prostokąt: zaznacz tabele.',True);self.graph_note.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Preferred);gt.addWidget(self.graph_note,1)
             self.graph_open=button('Otwórz dane ↵',lambda:window.guard(lambda:self.open_graph_selection(self.graph.selected_ids())),primary=True)
             self.graph_open.setEnabled(False);gt.addWidget(self.graph_open)
+            self.graph_arrange=button('Uporządkuj',lambda:self.graph.arrange_nodes(False));self.graph_arrange.setToolTip('Rozsuń tabele według relacji i poprowadź strzałki między kartami. Zastępuje ręczny układ.');gt.addWidget(self.graph_arrange)
             view_menu=QW.QToolButton();view_menu.setText('Widok');view_menu.setPopupMode(QW.QToolButton.ToolButtonPopupMode.InstantPopup);menu=QW.QMenu(view_menu)
             menu.addAction('Wszystkie dostępne tabele',self.all_relations)
             system_action=menu.addAction('Pokaż obiekty systemowe');system_action.setCheckable(True);system_action.toggled.connect(self.system.setChecked);self.system.toggled.connect(system_action.setChecked)
@@ -21969,7 +22171,18 @@ def excel_vba_patch_test_suite():
         def plan(self, code, prompt=None):
             return plan_vba_validation_patch([{"name": "ThisWorkbook", "code": code}], "ThisWorkbook.GenerateDocument", self.prompt if prompt is None else prompt)
 
-        def test_sub_guard_minimal_preview_preserves_other_work_and_line_count(self):
+        def assert_preserved_guard(self, item):
+            old = item['old_block'].splitlines(keepends=True)
+            new = item['new_block'].splitlines(keepends=True)
+            self.assertEqual(new[0], old[0])
+            self.assertEqual(new[2:-2], old[1:-1])
+            self.assertEqual(new[-1], old[-1])
+            self.assertEqual(len(new), len(old) + 2)
+            self.assertRegex(new[1], r'^\s*If False Then(?:\s|$)')
+            self.assertEqual(new[-2].strip().casefold(), 'end if')
+            self.assertEqual(item['new_header'], item['old_header'])
+
+        def test_sub_guard_preview_preserves_original_evaluation_body_and_other_work(self):
             code = self.code()
             result = self.plan(code)
             self.assertEqual(result["status"], "candidate")
@@ -21977,9 +22190,11 @@ def excel_vba_patch_test_suite():
             self.assertEqual(item["source_sha256"], _vba_plan_sha(code))
             self.assertEqual(code[item["start_offset"]:item["end_offset"]], item["old_block"])
             patched = code[:item["start_offset"]] + item["new_block"] + code[item["end_offset"]:]
-            self.assertEqual(len(code.splitlines()), len(patched.splitlines()))
+            self.assertEqual(len(code.splitlines()) + 2, len(patched.splitlines()))
             self.assertIn("    ExportDocument\n", patched)
-            self.assertEqual(item["old_block"].splitlines()[1:], item["new_block"].splitlines()[1:])
+            self.assert_preserved_guard(item)
+            self.assertEqual(patched[:item['start_offset']], code[:item['start_offset']])
+            self.assertEqual(patched[item['start_offset'] + len(item['new_block']):], code[item['end_offset']:])
             self.assertIn("If False Then", patched)
             self.assertTrue(item["requires_confirmation"])
 
@@ -21987,22 +22202,37 @@ def excel_vba_patch_test_suite():
             result = self.plan(self.code(['If MsgBox("' + self.prompt + '", vbYesNo) = vbYes Then Exit Sub']))
             self.assertEqual(result["status"], "candidate")
 
-        def test_multiline_response_only_neutralizes_outer_invalid_condition(self):
+        def test_multiline_response_only_neutralizes_message_and_exit(self):
             code = self.code(['If MsgBox("' + self.prompt + '", vbYesNo) = vbYes Then', 'Exit Sub', 'End If'])
             item = self.plan(code)["candidates"][0]
             self.assertEqual(item["condition"], "Len(Trim(projectCode)) < 5")
-            self.assertEqual(item["old_block"].splitlines()[1:], item["new_block"].splitlines()[1:])
+            self.assert_preserved_guard(item)
             self.assertFalse(self.plan(code.replace('        Exit Sub', '        SaveDocument\n        Exit Sub'))["candidates"])
             function = code.replace('Sub GenerateDocument(ByVal projectCode As String)', 'Function GenerateDocument(ByVal projectCode As String) As Boolean').replace('Exit Sub', 'GenerateDocument = False\n        Exit Function').replace('    ExportDocument', '    GenerateDocument = True').replace('End Sub', 'End Function')
             self.assertEqual(self.plan(function)["status"], "candidate")
             self.assertFalse(self.plan(function.replace('    GenerateDocument = True\n', ''))["candidates"])
 
-        def test_unknown_calls_object_access_and_implicit_calls_are_rejected(self):
+        def test_unknown_calls_object_access_and_implicit_calls_remain_evaluated_once(self):
             for condition in ("Not ValidateProject(projectCode)", "Not ValidateProject", "Sheet1.Range(\"A1\").Value = 0", "Application.Evaluate(projectCode)"):
                 with self.subTest(condition=condition):
                     result = self.plan(self.code(condition=condition))
-                    self.assertFalse(result["candidates"])
-                    self.assertTrue(result["rejections"])
+                    self.assertEqual(result['status'], 'candidate')
+                    item = result['candidates'][0]
+                    self.assert_preserved_guard(item)
+                    self.assertEqual(item['new_block'].count(condition), 1)
+
+        def test_original_header_whitespace_comment_and_side_effect_call_are_unchanged(self):
+            code = self.code(condition='LogAndValidate(projectCode)').replace('    If LogAndValidate(projectCode) Then', '\tIf LogAndValidate(projectCode) Then \' records the validation')
+            item = self.plan(code)['candidates'][0]
+            self.assert_preserved_guard(item)
+            self.assertEqual(item['new_block'].splitlines()[0], "\tIf LogAndValidate(projectCode) Then ' records the validation")
+
+        def test_unknown_calls_in_removed_message_are_still_rejected(self):
+            for expression in ('LoadProjectCaption(projectCode)', 'Sheet1.Range("A1").Value', 'Application.Evaluate(projectCode)'):
+                with self.subTest(expression=expression):
+                    result = self.plan(self.code(['MsgBox "' + self.prompt + '" & ' + expression, 'Exit Sub'], condition='ValidateProject(projectCode)'))
+                    self.assertFalse(result['candidates'])
+                    self.assertTrue(result['rejections'])
 
         def test_unrelated_work_in_block_is_never_disabled(self):
             for operation in ("SaveDocument", 'Kill "data.txt"', 'Shell "cmd"', "connection.Execute sql", 'projectCode = "fixed"'):
@@ -22039,19 +22269,56 @@ def excel_vba_patch_test_suite():
         def test_comment_only_message_and_shadowed_pure_builtin_are_rejected(self):
             self.assertFalse(self.plan(self.code().replace('MsgBox "', "' MsgBox \""))["candidates"])
             code = self.code() + '\nFunction Len(ByVal x As String) As Long\nLen = 1\nEnd Function\n'
+            self.assertEqual(self.plan(code)['status'], 'candidate')
+            code = code.replace('MsgBox "' + self.prompt + '", vbExclamation', 'MsgBox "' + self.prompt + '" & Len(projectCode), vbExclamation')
             self.assertFalse(self.plan(code)["candidates"])
+
+        def test_message_builtin_calls_shadowed_by_variables_are_rejected(self):
+            for declaration in ('Dim Chr As Object', 'Dim Chr As String', 'Dim ignored As Long, Chr As Object', 'Dim Chr(2) As String', 'Public Chr As Object', 'Private ignored As Long, Chr As Variant'):
+                with self.subTest(declaration=declaration):
+                    code = self.code(['MsgBox "' + self.prompt + '" & Chr(13)', 'Exit Sub'])
+                    if declaration.startswith('Dim'):
+                        code = code.replace('    If', '    ' + declaration + '\n    If', 1)
+                    else:
+                        code = code.replace('Option Explicit\n', 'Option Explicit\n' + declaration + '\n', 1)
+                    self.assertFalse(self.plan(code)['candidates'])
+
+        def test_constant_chr_whitespace_can_match_entire_prompt_with_short_fragments(self):
+            body = ['MsgBox "Nieprawidlowy kod." & Chr(13) & ChrW$(10) & "Czy przerwac sprawdzanie?", vbYesNo', 'Exit Sub']
+            result = self.plan(self.code(body, condition='ValidateProject(projectCode)'), 'Nieprawidlowy kod.\r\nCzy przerwac sprawdzanie?')
+            self.assertEqual(result['status'], 'candidate')
+            self.assert_preserved_guard(result['candidates'][0])
+            self.assertIn(result['candidates'][0]['match']['kind'], ('literal_exact', 'literal_normalized'))
+            tab = self.code(['MsgBox "Nieprawidlowy kod." & ChrW(9) & "Czy przerwac sprawdzanie?"', 'Exit Sub'])
+            self.assertEqual(self.plan(tab, 'Nieprawidlowy kod.\tCzy przerwac sprawdzanie?')['status'], 'candidate')
+            short=self.code(['MsgBox "Bledny numer." & Chr(13) & "Czy przerwac?"', 'Exit Sub'])
+            self.assertEqual(self.plan(short,'Bledny numer.\rCzy przerwac?')['status'],'candidate')
+            self.assertFalse(self.plan(short,'Czy przerwac? Bledny numer.')['candidates'])
+
+        def test_standard_scalar_message_conversions_and_checks_are_supported(self):
+            for expression in ('CStr(42)', 'CStr(CBool(True))', 'CStr(CInt(42))', 'CStr(CLng(42))', 'CStr(CDbl(42))', 'CStr(CSng(42))', 'CStr(CDate("2026-10-08"))', 'CStr(IsDate(projectCode))', 'CStr(IsError(projectCode))', 'Replace(projectCode, "KIT", "P")'):
+                with self.subTest(expression=expression):
+                    result = self.plan(self.code(['MsgBox "' + self.prompt + '" & ' + expression, 'Exit Sub']))
+                    self.assertEqual(result['status'], 'candidate')
+
+        def test_shadowed_chr_procedure_does_not_supply_fake_constant_message_text(self):
+            code = self.code(['MsgBox "Nieprawidlowy kod." & Chr(13) & "Czy przerwac sprawdzanie?"', 'Exit Sub']) + '\nFunction Chr(ByVal value As Long) As String\nSaveDocument\nChr = " "\nEnd Function\n'
+            self.assertFalse(self.plan(code, 'Nieprawidlowy kod. Czy przerwac sprawdzanie?')['candidates'])
 
         def test_crlf_and_quoted_apostrophe_are_preserved(self):
             prompt = 'Nieprawidlowy projekt "MES" oraz klient O\'Brien.'
             code = self.code(['MsgBox "' + prompt.replace('"', '""') + '"', 'Exit Sub']).replace('\n', '\r\n')
             item = self.plan(code, prompt)["candidates"][0]
             self.assertIn('\r\n', item["new_header"])
-            self.assertEqual(item["old_block"].count('\r\n'), item["new_block"].count('\r\n'))
+            self.assert_preserved_guard(item)
+            self.assertEqual(item["old_block"].count('\r\n') + 2, item["new_block"].count('\r\n'))
 
-        def test_undeclared_variant_array_and_object_conditions_are_not_pure_scalars(self):
+        def test_variant_array_and_object_conditions_remain_unchanged(self):
             for declaration, condition in (("Dim invalid", "invalid"), ("Dim invalid As Object", "invalid"), ("Dim invalid(2) As Boolean", "invalid(0)")):
                 code = self.code(condition=condition).replace('    If', '    ' + declaration + '\n    If', 1)
-                self.assertFalse(self.plan(code)["candidates"])
+                result = self.plan(code)
+                self.assertEqual(result['status'], 'candidate')
+                self.assert_preserved_guard(result['candidates'][0])
 
         def test_malformed_or_duplicate_modules_never_raise_or_offer_partial_patch(self):
             code = self.code().replace('    If', '    Dim broken( As Boolean\n    If', 1)
@@ -24457,6 +24724,50 @@ def database_join_test_suite():
             positions=database_graph_layout(objs,edges,sizes,1800,compact=True)
             for edge in edges:
                 a,b=positions[edge['source']],positions[edge['target']];self.assertEqual(a[1],b[1]);self.assertLess(abs(a[0]-b[0]),300)
+        def test_graph_layout_dense_connections_get_space_without_overlapping_cards(self):
+            objs=[{'id':str(i),'name':f'T{i}','schema':'main'} for i in range(8)];sizes={o['id']:(230,160) for o in objs}
+            edges=[{'source':str(i),'target':'0','source_columns':['A','B']} for i in range(1,8)]
+            positions=database_graph_layout(objs,edges,sizes,700);root=positions['0']
+            self.assertGreater(positions['1'][0]-root[0]-230,92)
+            self.assertGreater(root[1],min(y for x,y in positions.values()))
+            for i,a in enumerate(objs):
+                x,y=positions[a['id']]
+                for b in objs[i+1:]:
+                    xx,yy=positions[b['id']];self.assertTrue(x+230<=xx or xx+230<=x or y+160<=yy or yy+160<=y)
+        def assert_route_avoids_rect(self,route,rect):
+            l,t,w,h=rect;r=l+w;b=t+h;self.assertFalse(route['blocked'],route)
+            for a,z in zip(route['points'],route['points'][1:]):
+                self.assertTrue(a[0]==z[0] or a[1]==z[1],(a,z))
+                if a[0]==z[0]:self.assertFalse(l<a[0]<r and max(a[1],z[1])>t and min(a[1],z[1])<b,(route,rect))
+                else:self.assertFalse(t<a[1]<b and max(a[0],z[0])>l and min(a[0],z[0])<r,(route,rect))
+        def test_graph_routing_avoids_intervening_table_and_separates_parallel_keys(self):
+            rectangles={'a':(0,0,230,160),'b':(560,0,230,160),'middle':(290,-30,160,240)}
+            connections=[dict(source='a',target='b',source_side='right',target_side='left',start=(230,55+i*20),end=(560,55+i*20)) for i in range(4)]
+            routes=database_graph_routes(rectangles,connections)
+            for route in routes:self.assert_route_avoids_rect(route,rectangles['middle'])
+            self.assertEqual(routes,database_graph_routes(rectangles,connections))
+            vertical=[{a[0] for a,b in zip(route['points'],route['points'][1:]) if a[0]==b[0]} for route in routes]
+            self.assertEqual(len({tuple(sorted(x)) for x in vertical}),4)
+        def test_graph_routing_self_reference_and_moved_obstacle(self):
+            rectangles={'a':(0,0,230,160),'b':(560,0,230,160),'middle':(290,220,160,240)}
+            spec=dict(source='a',target='b',source_side='right',target_side='left',start=(230,55),end=(560,55))
+            before=database_graph_routes(rectangles,[spec])[0];rectangles['middle']=(290,-30,160,240)
+            after=database_graph_routes(rectangles,[spec])[0];self.assertNotEqual(before,after);self.assert_route_avoids_rect(after,rectangles['middle'])
+            loop=dict(source='a',target='a',source_side='right',target_side='right',start=(230,55),end=(230,100))
+            route=database_graph_routes({'a':rectangles['a']},[loop])[0]
+            self.assertGreaterEqual(len(route['points']),4);self.assert_route_avoids_rect(route,rectangles['a'])
+        def test_graph_routing_dense_catalogue_has_bounded_work_and_no_hidden_connections(self):
+            objs=[{'id':str(i),'name':f'T{i}','schema':'main'} for i in range(32)];sizes={o['id']:(230,230) for o in objs}
+            edges=[{'source':str(i),'target':str((i-1)//3)} for i in range(1,32)]+[{'source':str(1+(i*7)%31),'target':str((i*3)%32)} for i in range(98)]
+            positions=database_graph_layout(objs,edges,sizes,1200);rectangles={oid:(*point,*sizes[oid]) for oid,point in positions.items()};connections=[]
+            for index,edge in enumerate(edges):
+                a,b=rectangles[edge['source']],rectangles[edge['target']];left='right' if a[0]<=b[0] else 'left';right='right' if a[0]>=b[0] else 'left'
+                connections.append(dict(edge,source_side=left,target_side=right,start=(a[0]+(230 if left=='right' else 0),a[1]+50+(index%7)*23),end=(b[0]+(230 if right=='right' else 0),b[1]+50)))
+            started=time.monotonic();routes=database_graph_routes(rectangles,connections)
+            self.assertLess(time.monotonic()-started,8);self.assertEqual(len(routes),129);self.assertFalse(any(route['blocked'] for route in routes))
+            for spec,route in zip(connections,routes):
+                for oid,rect in rectangles.items():
+                    if oid not in (spec['source'],spec['target']):self.assert_route_avoids_rect(route,rect)
         def test_graph_ui_has_no_automatic_fit_in_show_plan(self):
             tree=ast.parse(Path(__file__).read_text('utf-8'));cls=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='DatabaseGraph')
             method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='show_plan')
@@ -26296,12 +26607,16 @@ def ui_test():
             source,ex,requests,events=self.persistent_oracle_fixture(progressive=True);obj=self.oracle_scope_table('APP');requests[-1]['done'](self.persistent_oracle_catalog(source,[obj]));ex.refresh_cached_structure();late=events[-1]
             ex._oracle_schema_override='OTHER';ex.reload(False);self.assertTrue(late['cancelled']);late['done'](self.progressive_graph_payload([self.progressive_structure(obj)]));self.assertFalse(ex._objects[obj['id']]['columns']);self.assertFalse(ex._structure_job)
             ex.reset();late['done'](self.progressive_graph_payload([self.progressive_structure(obj)]));self.assertIsNone(ex.catalog)
-        def test_progressive_compact_cards_fit_four_across_at_1100(self):
+        def test_progressive_connected_cards_expand_to_leave_arrow_gutters(self):
             source,ex,requests,events=self.persistent_oracle_fixture(progressive=True);objects=[self.oracle_scope_table('APP','LONG_TABLE_NAME_FOR_READABLE_CARD_'+str(i)) for i in range(8)]
             for obj in objects[1:]:obj['keys']=[{'name':'FK_PARENT','kind':'FOREIGN KEY','columns':['ID'],'target_schema':'APP','target_table':objects[0]['name'],'target_columns':['ID']}]
             self.window.resize(1100,760);requests[-1]['done'](self.persistent_oracle_catalog(source,objects));ex.tabs.setCurrentIndex(1);app.processEvents();self.wait(lambda:not ex.graph._initial_view)
             ex.merge_cached_structure(self.progressive_graph_payload([self.progressive_structure(o) for o in objects]));ex.graph.arrange_nodes(preserve=False);app.processEvents()
-            nodes=list(ex.graph._nodes.values());rows=collections.Counter(round(n.pos().y()) for n in nodes);self.assertGreaterEqual(max(rows.values()),4,[(n.pos().x(),n.pos().y(),n.rect().width()) for n in nodes]);self.assertTrue(all(220<=n.rect().width()<=250 for n in nodes))
+            nodes=list(ex.graph._nodes.values());self.assertTrue(all(220<=n.rect().width()<=250 for n in nodes))
+            columns=sorted({n.pos().x() for n in nodes});self.assertGreaterEqual(len(columns),2);self.assertGreater(columns[1]-columns[0],320)
+            for index,node in enumerate(nodes):
+                for other in nodes[index+1:]:self.assertFalse(node.sceneBoundingRect().intersects(other.sceneBoundingRect()))
+            self.assertTrue(ex.graph_arrange.isVisible());self.assertTrue(all(edge._route and not edge._route['blocked'] for edge in ex.graph._edges))
             self.assertAlmostEqual(ex.graph.transform().m11(),1.0,places=3)
         def test_graph_arrange_uses_resized_canvas_and_releases_manual_positions(self):
             source,ex,requests,events=self.persistent_oracle_fixture(progressive=True);objects=[self.oracle_scope_table('APP','LONG_TABLE_NAME_'+str(i).zfill(3)) for i in range(100)]
@@ -26869,6 +27184,18 @@ def ui_test():
             child=next(n for n in ex.graph._nodes.values() if n._object['name']=='child')
             self.assertGreater(child.anchor('p','right').y(),child.anchor('id','right').y())
             self.assertGreaterEqual(child._field_font.pixelSize(),12);self.assertGreaterEqual(child._title_font.pixelSize(),13)
+        def test_graph_reroutes_after_drag_and_selection_reuses_geometry(self):
+            from unittest import mock
+            path,ex=self.open_database_fixture();ex.tabs.setCurrentIndex(1);app.processEvents();self.wait(lambda:not ex.graph._initial_view)
+            graph=ex.graph;nodes={node._object['name']:node for node in graph._nodes.values()}
+            nodes['child'].setPos(0,0);nodes['parent'].setPos(700,0);nodes['names'].setPos(350,300);graph.redraw_edges()
+            before=clone(graph._edges[0]._route);nodes['names'].setPos(350,0)
+            self.wait(lambda:clone(graph._edges[0]._route)!=before);route=graph._edges[0]._route;obstacle=nodes['names'].sceneBoundingRect();self.assertFalse(route['blocked'])
+            for a,b in zip(route['points'],route['points'][1:]):
+                center=QC.QPointF((a[0]+b[0])/2,(a[1]+b[1])/2);self.assertFalse(obstacle.contains(center),(a,b))
+            with mock.patch(__name__+'.database_graph_routes',wraps=database_graph_routes) as router:
+                nodes['child'].setSelected(True);nodes['parent'].setSelected(True);graph.redraw_edges();self.assertEqual(router.call_count,0)
+            self.assertTrue(graph._edge_timer.interval()>=70)
         def test_sqlite_opens_whole_catalog_without_analysis_wizard(self):
             path,ex=self.open_database_fixture();self.assertEqual(self.service.document['analyses'],[])
             self.assertEqual(len(self.service.document['sources']),1);self.assertFalse(self.window._sheet_mode)
