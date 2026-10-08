@@ -107,7 +107,7 @@ REQUIREMENTS = {
     'firebird': ['firebird-driver==2.0.3'],
     'h2': ['JPype1==1.7.1'],
     'secrets': ['keyring==25.6.0'],
-    'excel': ["pywin32==312; sys_platform == 'win32'"],
+    'excel': ["pywin32==312; sys_platform == 'win32'", 'pypdf==6.19.0'],
 }
 
 
@@ -158,7 +158,7 @@ def dependency_status(profile, settings=None):
     """
     if profile not in DEPENDENCY_MODULES:
         return {'state':'ready','profile':profile,'title':'','message':'','details':''}
-    modules=('pythoncom','win32com') if profile=='excel' else (DEPENDENCY_MODULES[profile],)
+    modules=('pythoncom','win32com','pypdf') if profile=='excel' else (DEPENDENCY_MODULES[profile],)
     try:
         for module in modules:
             if importlib.util.find_spec(module) is None:
@@ -5973,6 +5973,206 @@ def _vba_plan_match_prompt(expression, literals, prompt):
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class _VbaStatement:
+    """Bounded, source-preserving statement IR, not a complete VBA compiler."""
+    index: int
+    kind: str
+    text: str
+    start: int
+    end: int
+    line: int
+    end_line: int
+    parent: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _VbaProcedure:
+    module: str
+    name: str
+    start: int
+    end: int
+    statements: tuple
+    shadowed: frozenset
+
+
+@dataclasses.dataclass(frozen=True)
+class _VbaPatchEvidence:
+    strategy: str
+    preserved_lines: tuple
+    neutralized_lines: tuple
+    return_effect: str
+    call_path: tuple
+    unresolved_calls: tuple
+
+
+def _vba_plan_message_expression(statement):
+    """Only syntactic standard-call shapes can anchor a validation candidate."""
+    response = _vba_plan_response(statement)
+    if response:
+        expression = response['expression']
+    else:
+        assignment = re.fullmatch(r'(?:Let\s+)?[A-Za-z_]\w*\s*=\s*(.+)', statement, re.I)
+        expression = assignment[1] if assignment else statement
+    return expression if re.match(r'^(?:Call\s+)?(?:VBA\.(?:Interaction\.)?)?MsgBox\b', expression, re.I) else None
+
+
+def _vba_plan_names(declaration):
+    """Declared names, including objects/arrays that can shadow VBA built-ins."""
+    names = set()
+    for part in _vba_plan_split_args(declaration):
+        match = re.match(r'(?:(?:ByVal|ByRef|Optional|ParamArray|WithEvents)\s+)*([A-Za-z_]\w*)', part, re.I)
+        if match:names.add(match[1].casefold())
+    return names
+
+
+def _vba_plan_program(prepared):
+    """A small immutable IR with lexical scopes and syntactic direct-call paths.
+
+    Opaque statements remain source spans. Their presence never authorizes
+    removing them; the transformation still validates its exact supported slice.
+    """
+    declarations = []
+    module_symbols = {}
+    exported = set()
+    module_names = {item[0].casefold() for item in prepared}
+    for module, code, lines, cleaned in prepared:
+        module_symbols[module] = set(module_names)
+        start = None
+        for index, text in enumerate(cleaned):
+            declaration = _VBA_PLAN_PROC.fullmatch(text)
+            named = re.match(r'^(?:(?:Public|Private|Friend|Static|Declare|PtrSafe)\s+)*(?:Sub|Function|Property\s+(?:Get|Let|Set))\s+(\w+)', text, re.I)
+            if named:
+                module_symbols[module].add(named[1].casefold())
+                if not re.match(r'^Private\b', text, re.I):exported.add(named[1].casefold())
+            if declaration:start = index
+            elif start is not None and re.fullmatch(r'End\s+(?:Sub|Function)', text, re.I):
+                declarations.append((module, lines, cleaned, start, index));start = None
+            elif start is None:
+                match = re.match(r'^(?:Dim|Static|Public|Private|Global|Const)\s+(.+)$', text, re.I)
+                if match and not named:
+                    names = _vba_plan_names(match[1]);module_symbols[module].update(names)
+                    if re.match(r'^(?:Public|Global)\b', text, re.I):exported.update(names)
+    procedures = {}
+    for module, lines, cleaned, start, end in declarations:
+        declaration = _VBA_PLAN_PROC.fullmatch(cleaned[start])
+        shadowed = set(module_symbols[module]) | exported | _vba_plan_names(declaration[3])
+        for text in cleaned[start + 1:end]:
+            match = re.match(r'^(?:Dim|Static|Const)\s+(.+)$', text, re.I)
+            if match:shadowed.update(_vba_plan_names(match[1]))
+        statements = []
+        offset = 0;physical = 1;parents = []
+        for index, (raw, text) in enumerate(zip(lines, cleaned)):
+            if start <= index <= end:
+                kind = 'opaque'
+                if not text:kind = 'empty'
+                elif re.fullmatch(r'If\s+.+?\s+Then', text, re.I):kind = 'if'
+                elif re.fullmatch(r'End\s+If', text, re.I):
+                    kind = 'end_if'
+                    if parents:parents.pop()
+                elif re.match(r'Else(?:If|\b)', text, re.I):kind = 'else'
+                elif _vba_plan_message_expression(text):kind = 'message'
+                elif re.match(r'^(?:Let\s+)?[A-Za-z_]\w*\s*=', text, re.I):kind = 'assignment'
+                elif re.match(r'^(?:Dim|Static|Const)\b', text, re.I):kind = 'declaration'
+                elif re.fullmatch(r'Exit\s+(Sub|Function)', text, re.I):kind = 'exit'
+                statements.append(_VbaStatement(index, kind, text, offset, offset + len(raw), physical,
+                                                physical + len(raw.splitlines()) - 1, parents[-1] if parents else -1))
+                if kind == 'if':parents.append(index)
+            offset += len(raw);physical += len(raw.splitlines())
+        procedure = _VbaProcedure(module, declaration[2], start, end, tuple(statements), frozenset(shadowed))
+        key = (module.casefold(), declaration[2].casefold())
+        if key in procedures:raise ValueError('Powtórzona deklaracja procedury w module; nie potwierdzono zakresu nazw.')
+        procedures[key] = procedure
+    return procedures
+
+
+def _vba_plan_call_paths(procedures, requested):
+    """Direct syntax is evidence of a possible call path, never execution proof."""
+    graph = {};unknown = {}
+    for key, procedure in procedures.items():
+        targets = set();unresolved = set()
+        local_names = set()
+        for node in procedure.statements:
+            declaration = _VBA_PLAN_PROC.fullmatch(node.text)
+            variable = re.match(r'^(?:Dim|Static|Const)\s+(.+)$', node.text, re.I)
+            if declaration:local_names.update(_vba_plan_names(declaration[3]))
+            if variable:local_names.update(_vba_plan_names(variable[1]))
+        for node in procedure.statements[1:-1]:
+            text = _vba_plan_masked(node.text)
+            if re.search(r'\b(?:Application\s*\.\s*(?:Run|OnTime)|CallByName|OnAction)\b', text, re.I):
+                unresolved.add('Wywołanie dynamiczne lub zdarzenie: wiersz ' + str(node.line))
+            if node.kind == 'declaration':continue
+            for token in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)(?:\.([A-Za-z_]\w*))?', text):
+                left, right = token[1].casefold(), (token[2] or '').casefold()
+                tail = text[token.end():]
+                if re.match(r'\s*=', tail) or (not right and left in local_names):continue
+                # Parenthesized expressions and bare Call/procedure statements.
+                prefix = text[:token.start()].strip()
+                callable_shape = bool(re.match(r'\s*\(', tail) or prefix.casefold() in ('', 'call'))
+                if not callable_shape:continue
+                if right:
+                    matches = [(left, right)] if (left, right) in procedures else []
+                elif (key[0], left) in procedures:
+                    matches = [(key[0], left)]
+                else:
+                    matches = [target for target in procedures if target[1] == left and not re.match(r'^Private\b', procedures[target].statements[0].text, re.I)]
+                if len(matches) == 1:targets.add(matches[0])
+                elif len(matches) > 1:unresolved.add('Niejednoznaczne wywołanie: ' + token[0])
+        graph[key] = tuple(sorted(targets));unknown[key] = tuple(sorted(unresolved))[:16]
+    entries = [key for key in procedures if requested in (key[1], '.'.join(key))]
+    paths = {}
+    if len(entries) == 1:
+        entry = entries[0];paths[entry] = ('.'.join(entry),);pending = [entry]
+        for key in pending:
+            for target in graph[key]:
+                if target not in paths:
+                    paths[target] = paths[key] + ('.'.join(target),);pending.append(target)
+    return paths, unknown
+
+
+def _vba_plan_anchor_guards(procedure, cleaned, locals_, symbols, prompt):
+    """Anchor to the actual question, not an ancestor with a coincidental literal."""
+    nodes = {item.index:item for item in procedure.statements}
+    bindings = {};binding_sources = {};selected = set();anchored = set()
+    for node in procedure.statements[1:-1]:
+        assignment = re.fullmatch(r'(?:Let\s+)?([A-Za-z_]\w*)\s*=\s*(.+)', node.text, re.I)
+        if assignment and locals_.get(assignment[1].casefold()) == 'string':
+            prior = binding_sources.get(assignment[1].casefold(), '')
+            binding_sources[assignment[1].casefold()] = (prior + '\n' + assignment[2])[-8192:]
+            try:
+                _vba_plan_pure_expression(assignment[2], symbols, procedure.shadowed)
+                expanded = ' '.join(bindings.get(token.casefold(), token) for token in _vba_plan_tokens(assignment[2]))
+                if len(expanded) <= 2048:bindings[assignment[1].casefold()] = expanded
+            except ValueError:bindings.pop(assignment[1].casefold(), None)
+        expression = _vba_plan_message_expression(node.text)
+        if not expression:continue
+        anchored.add(node.index)
+        try:
+            message, literals = _vba_plan_message(expression, symbols, procedure.shadowed, bindings)
+            matched = _vba_plan_match_prompt(message, literals, prompt)
+        except ValueError:
+            # Keep a precise rejection for a matching, but impure/shadowed call.
+            literals = [m[1].replace('""','"') for m in re.finditer(r'"((?:[^"]|"")*)"', node.text)]
+            matched = any(len(_vba_plan_normal(value)) >= 20 and _vba_plan_normal(value) in _vba_plan_normal(prompt) for value in literals)
+        if not matched:
+            # Preserve a diagnostic for impure local message construction. This
+            # hint can select a rejection location, never authorize a patch.
+            related = expression + '\n' + '\n'.join(binding_sources.get(name.casefold(), '') for name in re.findall(r'[A-Za-z_]\w*', _vba_plan_masked(expression)))
+            matched = any(len(_vba_plan_normal(m[1])) >= 20 and _vba_plan_normal(m[1]) in _vba_plan_normal(prompt)
+                          for m in re.finditer(r'"((?:[^"]|"")*)"', related))
+        if not matched:continue
+        parent = node.parent
+        while parent >= 0 and _vba_plan_message_expression(cleaned[parent]):parent = nodes[parent].parent
+        selected.add(parent if parent >= 0 else node.index)
+    return selected, anchored
+
+
+def _vba_plan_presentation(statement):
+    # Preserved, NOT pure: activation can fire events and changes ActiveSheet.
+    return bool(re.fullmatch(r'(?:Call\s+)?[A-Za-z_]\w*\.Activate(?:\s*\(\s*\))?', statement, re.I)
+                or re.fullmatch(r'(?:Application\.)?ActiveWindow\.(?:ScrollRow|ScrollColumn)\s*=\s*[1-9]\d{0,6}', statement, re.I))
+
+
 def _vba_plan_boolean_success(cleaned, declaration, proc_start, block_start, block_end, proc_end):
     name = re.escape(declaration[2])
     success = re.compile(name + r"\s*=\s*True\s*$", re.I)
@@ -5986,19 +6186,80 @@ def _vba_plan_boolean_success(cleaned, declaration, proc_start, block_start, blo
     raise ValueError("Nie potwierdzono zwrócenia True po pominięciu warunku; samo usunięcie False/Exit Function mogłoby nadal zwrócić False.")
 
 
+def _vba_plan_boolean_flow(cleaned, declaration, proc_start, proc_end, neutralized):
+    """Bounded If/assignment/return flow after a proposed single-check edit.
+
+    The implicit function result is a local accumulator. Removing one False
+    assignment retains its previous value, including False from another check;
+    no True assignment is synthesized. Unsupported transfers fail closed.
+    """
+    name = declaration[2].casefold()
+    visits = 0
+    def simple(text, values):
+        masked = _vba_plan_masked(text)
+        if not text or re.match(r'^(?:Dim|Const)\b', text, re.I):return values, set()
+        if re.fullmatch(r'Exit\s+Function', text, re.I):return set(), set(values)
+        assignment = re.fullmatch(re.escape(name) + r'\s*=\s*(True|False)', text, re.I)
+        if assignment:return {assignment[1].casefold()}, set()
+        if re.search(r'\b' + re.escape(name) + r'\b', masked, re.I):
+            raise ValueError('Wartość wyniku funkcji jest odczytywana lub przekazywana poza obsługiwanym przypisaniem Boolean; nie potwierdzono wpływu jednej kontroli.')
+        if re.match(r'^(?:GoTo|GoSub|Return|Resume|On\s+Error|For|Next|Do|Loop|While|Wend|Select|Case|With|End\s+With|Static)\b', masked, re.I) or ':' in masked or masked.startswith('#'):
+            raise ValueError('Przepływ wyniku funkcji zawiera nieobsługiwane sterowanie, obsługę błędów lub stan trwały.')
+        return values, set()
+    def walk(start, end, incoming, depth=0):
+        nonlocal visits
+        if depth > 32:raise ValueError('Zbyt głęboki przepływ warunków funkcji.')
+        values = set(incoming);returns = set();index = start
+        while index < end and values:
+            visits += 1
+            if visits > 20000:raise ValueError('Przepływ wyniku funkcji przekracza limit analizy.')
+            if index in neutralized:index += 1;continue
+            text = cleaned[index]
+            conditional = re.fullmatch(r'If\s+(.+?)\s+Then(?:\s+(.+))?', text, re.I)
+            if not conditional:
+                if re.match(r'^(?:Else(?:If|\b)|End\s+If)\b', text, re.I):raise ValueError('Niepełna struktura warunków funkcji.')
+                values, ended = simple(text, values);returns.update(ended);index += 1;continue
+            if re.search(r'\b' + re.escape(name) + r'\b', _vba_plan_masked(conditional[1]), re.I):
+                raise ValueError('Warunek korzysta z wyniku funkcji; nie potwierdzono niezależności pojedynczej kontroli.')
+            if conditional[2]:
+                if re.search(r'\bElse\b', _vba_plan_masked(conditional[2]), re.I):raise ValueError('Jednowierszowy If/Else wykracza poza analizę wyniku funkcji.')
+                branch, ended = simple(conditional[2], set(values));values.update(branch);returns.update(ended);index += 1;continue
+            level = 1;finish = None;alternative = None
+            for scan in range(index + 1, end):
+                current = cleaned[scan]
+                if re.fullmatch(r'If\s+.+?\s+Then', current, re.I):level += 1
+                elif re.fullmatch(r'End\s+If', current, re.I):
+                    level -= 1
+                    if level == 0:finish = scan;break
+                elif level == 1 and re.match(r'ElseIf\b', current, re.I):raise ValueError('ElseIf wykracza poza analizę wyniku funkcji.')
+                elif level == 1 and current.casefold() == 'else':alternative = scan
+            if finish is None:raise ValueError('Niepełny warunek w analizie wyniku funkcji.')
+            left, left_returns = walk(index + 1, alternative if alternative is not None else finish, values, depth + 1)
+            right, right_returns = walk(alternative + 1, finish, values, depth + 1) if alternative is not None else (values, set())
+            values = left | right;returns.update(left_returns | right_returns);index = finish + 1
+        return values, returns
+    continuing, returned = walk(proc_start + 1, proc_end, {'false'})
+    possible = continuing | returned
+    if 'true' not in possible:
+        raise ValueError('Po pominięciu tej kontroli funkcja nadal nie ma potwierdzonej drogi do True. Nie wymuszam sukcesu całego walidatora.')
+    return 'Usunięto wpływ wyłącznie wybranej kontroli na lokalny wynik. Poprzednia wartość, także False z innych kontroli, pozostaje; nie dodano przypisania True. Statyczny przepływ dopuszcza True, ale nie potwierdza wyniku konkretnego wykonania.'
+
+
 def _vba_plan_rejection_context(lines, cleaned, physical_starts, index, block_start, block_end, stage):
     """Small static source excerpt; never an executed-line trace or event-log text."""
     first = physical_starts[index]
     last = first + len(lines[index].splitlines()) - 1
-    physical = ''.join(lines[max(block_start, index - 2):min(block_end + 1, index + 3)]).splitlines()
-    offset = physical_starts[max(block_start, index - 2)]
+    entire = ''.join(lines[block_start:block_end + 1]).splitlines()
+    short = len(entire) <= 18 and sum(map(len, entire)) <= 3000
+    physical = entire if short else ''.join(lines[max(block_start, index - 2):min(block_end + 1, index + 3)]).splitlines()
+    offset = physical_starts[block_start if short else max(block_start, index - 2)]
     # Long continuations should not hide the rejected statement below context.
-    if first - offset > 3:
+    if not short and first - offset > 3:
         physical = physical[first - offset - 3:]
         offset = first - 3
-    selected = physical[:12]
+    selected = physical[:18 if short else 12]
     excerpt = '\n'.join(('> ' if first <= offset + n <= last else '  ') + str(offset + n) + ': ' + text for n, text in enumerate(selected))
-    if len(physical) > 12:excerpt += '\n… dalsze wiersze pominięte'
+    if len(physical) > len(selected):excerpt += '\n… dalsze wiersze pominięte'
     if len(excerpt) > 3500:excerpt = excerpt[:3450] + '\n… fragment skrócony'
     return {'line': first, 'end_line': last, 'block_line': physical_starts[block_start],
             'block_end_line': physical_starts[block_end] + len(lines[block_end].splitlines()) - 1,
@@ -6030,7 +6291,6 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
         return finish()
     total = 0
     prepared = []
-    shadowed = set()
     module_names = set()
     for module in modules[:100]:
         if not isinstance(module, dict) or not isinstance(module.get("name"), str) or not isinstance(module.get("code"), str):
@@ -6042,7 +6302,6 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
             result["complete"] = False
             continue
         module_names.add(module_key)
-        shadowed.add(module_key)
         code = module["code"]
         try:
             lines,cleaned = _vba_plan_logical_lines(code)
@@ -6050,26 +6309,18 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
             result["complete"] = False
             result["rejections"].append({"module": module["name"], "reason": str(error)})
             continue
-        for line in cleaned:
-            match = re.match(r"^(?:(?:Public|Private|Friend|Static|Declare|PtrSafe)\s+)*(?:Sub|Function|Property\s+(?:Get|Let|Set))\s+(\w+)", line, re.I)
-            if match:
-                shadowed.add(match[1].casefold())
-            # A default-member call through a variable/array can also shadow
-            # a built-in. Do not rely only on the set of typed scalar locals.
-            declaration = _VBA_PLAN_PROC.fullmatch(line)
-            variables = re.match(r'^(?:Dim|Static|Public|Private|Global|Const)\s+(.+)$',line,re.I) if not match else None
-            if variables or declaration:
-                try:
-                    for item in _vba_plan_split_args(declaration[3] if declaration else variables[1]):
-                        symbol=re.match(r'(?:(?:ByVal|ByRef|Optional|ParamArray|WithEvents)\s+)*([A-Za-z_]\w*)',item,re.I)
-                        if symbol:shadowed.add(symbol[1].casefold())
-                except ValueError:
-                    result['complete']=False
         prepared.append((module["name"], code, lines, cleaned))
         analysis['modules'] += 1
     if len(modules) > 100:
         result["complete"] = False
     requested = macro_name.rsplit("!", 1)[-1].strip().strip("'").casefold()
+    try:
+        program = _vba_plan_program(prepared)
+        call_paths, unresolved_calls = _vba_plan_call_paths(program, requested)
+    except ValueError as error:
+        result['complete'] = False
+        result['rejections'].append({'reason': str(error)})
+        return finish()
 
     for module_name, code, lines, cleaned in prepared:
         physical_starts = []
@@ -6095,6 +6346,9 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                     raise ValueError("Procedura przekracza limit analizy planera.")
                 symbols = _vba_plan_declared_symbols(declaration, cleaned, proc_start, proc_end)
                 locals_ = _vba_plan_local_scalars(cleaned, proc_start, proc_end)
+                procedure = program[(module_name.casefold(), declaration[2].casefold())]
+                shadowed = procedure.shadowed
+                selected_guards, message_anchors = _vba_plan_anchor_guards(procedure, cleaned, locals_, symbols, prompt_text)
             except ValueError as error:
                 result["complete"] = False
                 result["rejections"].append({"module": module_name, "procedure": declaration[2], "reason": str(error)})
@@ -6124,6 +6378,9 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                     elif depth == 1 and re.match(r"Else(?:If|\b)", body_line, re.I):
                         has_else = True
                 if block_end is None:
+                    continue
+                contained_anchors = [position for position in message_anchors if block_start <= position <= block_end]
+                if contained_anchors and block_start not in selected_guards:
                     continue
                 body_indices = [position for position in range(block_start + 1, block_end) if cleaned[position]]
                 body = [cleaned[position] for position in body_indices]
@@ -6158,6 +6415,9 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                     response_assignment = None
                     prefix_count = 0
                     bindings = {}
+                    preserved_indices = []
+                    false_indices = []
+                    presentation_indices = []
                     # Preserve local message construction; only its standard
                     # MsgBox and the proven early-return branch may be disabled.
                     if not direct_message:
@@ -6168,12 +6428,17 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                             _vba_plan_pure_expression(assignment[2],symbols,shadowed)
                             expression=' '.join(bindings.get(token.casefold(),token) for token in _vba_plan_tokens(assignment[2]))
                             if len(expression)>2048:raise ValueError('Treść komunikatu przekracza limit analizy.')
-                            bindings[assignment[1].casefold()]=expression;prefix_count+=1
+                            bindings[assignment[1].casefold()]=expression;prefix_count+=1;preserved_indices.append(position)
                         body=body[prefix_count:]
                         body_indices=body_indices[prefix_count:]
                         if not body:raise ValueError('Brak komunikatu po przygotowaniu jego treści.')
                         if declaration[1].casefold()=='function' and re.fullmatch(re.escape(declaration[2])+r'\s*=\s*False',body[0],re.I):
-                            boolean_return=True;body=body[1:];body_indices=body_indices[1:]
+                            boolean_return=True;false_indices.append(body_indices[0]);body=body[1:];body_indices=body_indices[1:]
+                        # These operations retain their order and exact source.
+                        # Activate is not classified as pure: it can fire events.
+                        while body and _vba_plan_presentation(body[0]):
+                            presentation_indices.append(body_indices[0]);preserved_indices.append(body_indices[0])
+                            body=body[1:];body_indices=body_indices[1:]
                     if not body:raise ValueError('Brak komunikatu walidacji.')
                     focus = block_start if direct_message else body_indices[0]
                     stage = 'Rozpoznanie wywołania komunikatu'
@@ -6239,18 +6504,38 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                     if not match:
                         raise ValueError("Treść MsgBox nie daje jednoznacznego, charakterystycznego dopasowania do pytania.")
                     semantic_note = "Po pominięciu bloku wykonanie może przejść do kolejnych instrukcji tej procedury."
+                    message_start = block_start if direct_message else body_indices[0]
+                    neutralized_indices = (set(range(block_start, block_end + 1)) if direct_message else
+                                           set(range(block_start + 1, block_end)) - set(preserved_indices))
+                    if len(preserved_indices) > 256 or len(neutralized_indices) > 256:
+                        raise ValueError('Zakres wpływu kontroli przekracza limit 256 instrukcji; nie przygotowano skróconej zmiany.')
                     if declaration[1].casefold() == "function":
                         stage = 'Wartość zwracana przez funkcję'
                         if (declaration[4] or "").casefold() != "boolean":
                             raise ValueError("Nie potwierdzono semantyki wartości zwracanej przez funkcję inną niż Boolean.")
-                        semantic_note = _vba_plan_boolean_success(cleaned, declaration, proc_start, block_start, block_end, proc_end)
+                        try:
+                            semantic_note = _vba_plan_boolean_success(cleaned, declaration, proc_start, block_start, block_end, proc_end)
+                        except ValueError:
+                            semantic_note = _vba_plan_boolean_flow(cleaned, declaration, proc_start, proc_end, neutralized_indices)
                     old_block = "".join(lines[block_start:block_end + 1])
                     ending = "\r\n" if lines[block_start].endswith("\r\n") else "\n" if lines[block_start].endswith("\n") else "\r" if lines[block_start].endswith("\r") else ""
                     indent = re.match(r"\s*", lines[block_start])[0].rstrip("\r\n")
                     new_header = lines[block_start]
                     inner_indent = indent + '    '
                     guard="If False Then ' Pivot Studio: selected validation body bypass in reviewed copy"
-                    if direct_message:
+                    if presentation_indices:
+                        # Separate edit spans preserve the intervening sheet
+                        # activation/scroll instructions, without moving them.
+                        ranges = [(position, position) for position in false_indices]
+                        ranges.append((message_start, block_end - 1))
+                        pieces = [lines[block_start]];cursor = block_start + 1
+                        for first, last in ranges:
+                            pieces.append(''.join(lines[cursor:first]))
+                            if first == message_start and response_assignment:pieces.append(inner_indent + response_assignment + ending)
+                            pieces.extend((inner_indent + guard + ending, ''.join(lines[first:last + 1]), inner_indent + 'End If' + ending))
+                            cursor = last + 1
+                        pieces.append(''.join(lines[cursor:block_end + 1]));new_block = ''.join(pieces)
+                    elif direct_message:
                         new_block=indent+guard+ending+old_block+indent+'End If'+ending
                     else:
                         prefix_end=block_start+1
@@ -6261,7 +6546,9 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                         response_line=inner_indent+response_assignment+ending if response_assignment else ''
                         new_block = (new_header + prefix + response_line + inner_indent + guard + ending
                                      + "".join(lines[prefix_end:block_end]) + inner_indent + 'End If' + ending + lines[block_end])
-                    relation = "entry" if requested in (declaration[2].casefold(), (module_name + "." + declaration[2]).casefold()) else "unproven"
+                    procedure_key = (module_name.casefold(), declaration[2].casefold())
+                    call_path = call_paths.get(procedure_key, ())
+                    relation = 'entry' if len(call_path) == 1 else 'direct' if len(call_path) == 2 else 'transitive' if call_path else 'unproven'
                     warnings = ["Pominięcie tej kontroli może dopuścić niepoprawne dane do dalszej pracy.", "Nie jest to dowód wykonanej gałęzi ani gwarancja utworzenia dokumentu.", "Zmieniaj tylko odrębną kopię, po sprawdzeniu całego proponowanego bloku."]
                     if relation == "unproven":
                         warnings.append("Nie potwierdzono ścieżki wywołań między wskazanym makrem a tą procedurą.")
@@ -6275,7 +6562,13 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                                      reason="Zachowano oryginalny warunek i jego wywołania. Pomijane jest tylko rozpoznane wnętrze: komunikat i wyjście, bez dodatkowej pracy. " + semantic_note,
                                      warnings=warnings)
                     if direct_message:candidate['reason']='Pominięto rozpoznane pytanie MsgBox i jego gałąź wyjścia. '+semantic_note
+                    if presentation_indices:candidate['reason']='Zachowano oryginalny warunek, aktywację arkusza i przewijanie w tej samej kolejności. Pominięto tylko wskazany wpływ walidacji na wynik, pytanie i gałąź wyjścia. '+semantic_note
                     if response_assignment:candidate['reason']+=' Lokalna odpowiedź otrzyma wartość kontynuacji: '+response_assignment+'. Nie jest to odpowiedź odczytana z okna.'
+                    evidence = _VbaPatchEvidence('selected_validation_effect' if presentation_indices else 'guard_body',
+                        tuple(physical_starts[position] for position in preserved_indices),
+                        tuple(physical_starts[position] for position in sorted(neutralized_indices) if cleaned[position]),
+                        semantic_note, tuple(call_path[:64]), tuple(unresolved_calls.get(procedure_key, ())))
+                    candidate['semantic_evidence'] = dataclasses.asdict(evidence)
                     if len(old_block) > 12000 or len(result["candidates"]) >= 8:
                         result["complete"] = False
                     else:
@@ -6432,8 +6725,122 @@ def excel_vba_source_view(modules,macro_name='',prompt_text=''):
     return result
 
 
+@dataclasses.dataclass(frozen=True)
+class ExcelArtifactResult:
+    """A parsed, stable PDF; this does not certify the report's business contents."""
+    path:str
+    size:int
+    sha256:str
+    page_count:int
+    verification_backend:str='pypdf'
+
+
+def _excel_pdf_reader():
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise UserError('Nie można potwierdzić dokumentu PDF: brak biblioteki pypdf. Przygotuj biblioteki sesji Excel w ustawieniach.') from exc
+    return PdfReader
+
+
+EXCEL_PDF_MAX_STREAM=32*1024*1024
+
+
+def _excel_pdf_limits():
+    from pypdf import apply_configuration
+    # Context-local limits are restored after verification, including exceptions.
+    # Structural verification never launches optional external image decoders.
+    return apply_configuration(maximum_declared_stream_length=EXCEL_PDF_MAX_STREAM,
+        array_based_stream_maximum_output_length=EXCEL_PDF_MAX_STREAM,jbig2_maximum_output_length=EXCEL_PDF_MAX_STREAM,
+        lzw_maximum_output_length=EXCEL_PDF_MAX_STREAM,run_length_maximum_output_length=EXCEL_PDF_MAX_STREAM,
+        zlib_maximum_output_length=EXCEL_PDF_MAX_STREAM,zlib_maximum_recovery_input_length=1024*1024,
+        image_maximum_buffer_size=EXCEL_PDF_MAX_STREAM,page_tree_maximum_entries=20000,page_tree_maximum_depth=64,jbig2dec_binary=None)
+
+
+def excel_verify_pdf_artifact(path,expected=None,cancelled=None):
+    """Parse pages and content streams from one stable file, without running Office."""
+    import stat
+    maximum=256*1024*1024;path=Path(path);deadline=time.monotonic()+30
+    def check():
+        if cancelled is not None and cancelled.is_set():raise Cancelled('Anulowano sprawdzanie dokumentu PDF.')
+        if time.monotonic()>deadline:raise UserError('Przekroczono czas sprawdzania PDF. Dokument nie został potwierdzony.')
+    def identity(info):return (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)
+    def regular(info):
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or _ExcelPdfObserver._linked(info):raise UserError('Sprawdzany PDF musi być zwykłym plikiem bez dowiązań.')
+    check();_ExcelPdfObserver._directory(path.parent);details=path.lstat();regular(details)
+    observed=identity(details)
+    if expected is not None and observed!=tuple(expected):raise UserError('Dokument PDF zmienił się przed sprawdzeniem.')
+    if not 64<=details.st_size<=maximum:raise UserError('PDF jest pusty, niepełny lub przekracza limit 256 MiB.')
+    reader_class=_excel_pdf_reader();fingerprint=hashlib.sha256()
+    flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)
+    with _excel_pdf_limits(),os.fdopen(os.open(path,flags),'rb') as stream:
+        opened=os.fstat(stream.fileno());regular(opened)
+        if identity(opened)!=observed:raise UserError('Dokument PDF został zastąpiony przed sprawdzeniem.')
+        header=stream.read(16);stream.seek(max(0,opened.st_size-4096));tail=stream.read(4096)
+        if not re.match(rb'%PDF-[12]\.\d[\r\n]',header) or not re.search(rb'%%EOF[\x00\t\n\f\r ]*\Z',tail):raise UserError('Dokument nie ma prawidłowego początku lub zakończenia PDF.')
+        stream.seek(0)
+        while block:=stream.read(1024*1024):check();fingerprint.update(block)
+        class BoundedReader:
+            # pypdf is lazy: keep the descriptor open while every page is inspected.
+            def __init__(self):self.remaining=max(4*1024*1024,opened.st_size*32)
+            def read(self,size=-1):
+                check();value=stream.read(size);self.remaining-=len(value)
+                if self.remaining<0:raise UserError('Przekroczono limit odczytu PDF. Dokument nie został potwierdzony.')
+                return value
+            def seek(self,*args):check();return stream.seek(*args)
+            def tell(self):check();return stream.tell()
+            def __getattr__(self,name):return getattr(stream,name)
+        try:
+            from pypdf.generic import IndirectObject,NullObject,StreamObject
+            stream.seek(0);reader=reader_class(BoundedReader(),strict=True)
+            if reader.is_encrypted:raise UserError('Nie potwierdzono PDF zabezpieczonego hasłem. Wybierz dokument możliwy do odczytania bez hasła.')
+            if reader.root_object.get('/Type')!='/Catalog':raise ValueError('missing catalog')
+            count=len(reader.pages)
+            if not 1<=count<=10000:raise UserError('PDF nie zawiera stron lub przekracza limit 10 000 stron.')
+            declared=reader.root_object['/Pages'].get('/Count')
+            if isinstance(declared,bool) or not isinstance(declared,int) or declared!=count:raise ValueError('page count mismatch')
+            decoded=0;references=set();objects=set()
+            for page in reader.pages:
+                check()
+                if page.get('/Type')!='/Page':raise ValueError('invalid page')
+                box=page.mediabox;dimensions=[float(value) for value in box]
+                if len(dimensions)!=4 or not all(math.isfinite(value) for value in dimensions) or float(box.width)<=0 or float(box.height)<=0:raise ValueError('invalid page dimensions')
+                contents=page.get_contents()
+                if contents is not None:
+                    decoded+=len(contents.get_data())
+                    if decoded>maximum:raise UserError('Treść PDF przekracza limit sprawdzania. Dokument nie został potwierdzony.')
+                    # Header and page count alone do not prove content is parseable.
+                    for _operands,_operator in contents.operations:check()
+                # Also resolve the resources used by pages: a missing font/image
+                # object must not pass simply because text operators parse.
+                pending=[(page.get('/Resources',{}),0)]
+                while pending:
+                    check();value,depth=pending.pop()
+                    if depth>64 or len(objects)+len(references)>100000:raise UserError('Struktura zasobów PDF przekracza limit sprawdzania.')
+                    if isinstance(value,IndirectObject):
+                        key=(value.idnum,value.generation)
+                        if key in references:continue
+                        references.add(key);value=value.get_object()
+                        if value is None or isinstance(value,NullObject):raise ValueError('missing page resource')
+                    if isinstance(value,(dict,list,tuple)):
+                        key=id(value)
+                        if key in objects:continue
+                        objects.add(key)
+                        if isinstance(value,StreamObject):
+                            decoded+=len(value.get_data())
+                            if decoded>maximum:raise UserError('Zasoby PDF przekraczają limit sprawdzania.')
+                        children=value.values() if isinstance(value,dict) else value
+                        pending.extend((child,depth+1) for child in children)
+            check()
+        except (Cancelled,UserError):raise
+        except Exception as exc:raise UserError('Nie można odczytać struktury lub stron PDF. Dokument nie został potwierdzony.') from exc
+        current=path.lstat();regular(current);_ExcelPdfObserver._directory(path.parent)
+        if identity(os.fstat(stream.fileno()))!=observed or identity(current)!=observed:raise UserError('PDF zmienił się podczas sprawdzania. Dokument nie został potwierdzony.')
+    return ExcelArtifactResult(str(path),opened.st_size,fingerprint.hexdigest(),count)
+
+
 class _ExcelPdfObserver:
-    """Bounded observations in the session directory, never proof of VBA success."""
+    """Cheap new/changed-file observations; publishing separately parses the PDF."""
     MAX_ENTRIES=2048;MAX_PDFS=128;MAX_RESULTS=64;MAX_RESULT_BYTES=512*1024;MAX_SIZE=128*1024*1024;TIME_LIMIT=.25
     def __init__(self,working_copy):
         path=Path(working_copy) if working_copy else None
@@ -6468,7 +6875,7 @@ class _ExcelPdfObserver:
             current=path.lstat();cls._directory(path.parent)
             if cls._linked(current) or cls._signature(os.fstat(stream.fileno()))!=expected or cls._signature(current)!=expected:raise OSError('PDF changed during inspection.')
         if not re.search(br'%PDF-[12]\.\d(?:\r\n|\r|\n)',head) or not re.search(br'%%EOF[\x00\t\n\f\r ]*\Z',tail):raise OSError('PDF header or final marker is missing.')
-        return {'path':str(path),'name':path.name,'size':opened.st_size,'mtime_ns':opened.st_mtime_ns,'device':opened.st_dev,'inode':opened.st_ino}
+        return {'path':str(path),'name':path.name,'size':opened.st_size,'mtime_ns':opened.st_mtime_ns,'device':opened.st_dev,'inode':opened.st_ino,'verified':False}
     def _scan(self,before=None):
         import stat
         result={'entries':{},'files':[],'complete':True,'directory':None};deadline=time.monotonic()+self.TIME_LIMIT;result_bytes=0
@@ -6517,6 +6924,85 @@ class _ExcelPdfObserver:
         return {'files':files,'scope':self.scope,'complete':complete,'status':'found' if files else ('not_observed' if complete else 'unknown')}
 
 
+@dataclasses.dataclass(frozen=True)
+class ExcelVbaSourceSnapshot:
+    path: str
+    sha256: str
+    source_mode: str
+    captured_at: str
+    saved_source_mtime: str = ''
+
+    @property
+    def note(self):
+        return ('Ostatnia zapisana kopia sesji; niezapisane zmiany nie są uwzględnione.'
+                if self.source_mode=='saved_file' else 'Kopia bieżącego skoroszytu utworzona przez Excel.')
+
+
+def excel_vba_semantic_evidence(value):
+    """Bounded, source-free explanation transported separately from event history."""
+    if not isinstance(value,dict):raise UserError('Nieprawidłowe uzasadnienie zmiany VBA.')
+    result={}
+    for key,maximum in (('strategy',80),('return_effect',1800)):
+        item=value.get(key,'')
+        if not isinstance(item,str) or len(item)>maximum:raise UserError('Nieprawidłowe uzasadnienie zmiany VBA.')
+        result[key]=item
+    if result['strategy'] not in ('guard_body','selected_validation_effect'):raise UserError('Nieznana metoda zmiany VBA.')
+    for key in ('preserved_lines','neutralized_lines'):
+        items=value.get(key,[])
+        if not isinstance(items,(list,tuple)) or len(items)>256 or any(type(n) is not int or not 1<=n<=2147483647 for n in items):raise UserError('Nieprawidłowe wiersze zmiany VBA.')
+        result[key]=list(items)
+    for key,count,maximum in (('call_path',64,260),('unresolved_calls',16,300)):
+        items=value.get(key,[])
+        if not isinstance(items,(list,tuple)) or len(items)>count or any(not isinstance(s,str) or len(s)>maximum for s in items):raise UserError('Nieprawidłowe zależności zmiany VBA.')
+        result[key]=list(items)
+    return result
+
+
+class ExcelVbaSnapshotProvider:
+    """Capture provenance once; only the injected live-copy callback may use COM."""
+    @staticmethod
+    def capture(working,mode,regular_file,capture_live=None):
+        if mode not in ('live','saved_file'):raise UserError('Nieprawidłowe źródło analizy VBA.')
+        working=Path(working);regular_file(working,256*1024*1024)
+        folder=Path(tempfile.mkdtemp(prefix='vba-edit-',dir=working.parent));base=folder/'base';base.mkdir(mode=0o700);snapshot=base/working.name
+        saved_mtime=''
+        if mode=='saved_file':
+            info=regular_file(working,256*1024*1024);signature=_ExcelPdfObserver._signature(info);expected=file_digest(working)
+            saved_mtime=dt.datetime.fromtimestamp(info.st_mtime,dt.timezone.utc).isoformat()
+            excel_copy_workbook(working,snapshot,threading.Event())
+            if _ExcelPdfObserver._signature(regular_file(working,256*1024*1024))!=signature or file_digest(working)!=expected or file_digest(snapshot)!=expected:
+                raise UserError('Zapisana kopia zmieniła się podczas odczytu. Przygotuj propozycję ponownie.')
+        else:
+            if capture_live is None:raise UserError('Brak połączenia do odczytu bieżącego skoroszytu.')
+            capture_live(snapshot)
+        regular_file(snapshot,256*1024*1024);_vba_copy_zone(working,snapshot)
+        return ExcelVbaSourceSnapshot(str(snapshot),file_digest(snapshot),mode,utcnow(),saved_mtime)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExcelVbaModulePatch:
+    id: str
+    module: str
+    old_source: str
+    new_source: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExcelVbaCompanion:
+    path: str
+    name: str
+    signature: tuple
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExcelVbaPreparedPatch:
+    token: str
+    source: ExcelVbaSourceSnapshot
+    candidates: tuple[_ExcelVbaModulePatch, ...]
+    revision: int
+    companions: tuple[_ExcelVbaCompanion, ...]
+
+
 class ExcelSessionWorker:
     """One bound workbook in an owned Excel process; all COM stays on its STA."""
     VBA_MAX_MODULES=100;VBA_MAX_CHARACTERS=500000;VBA_MAX_LINES=20000;VBA_MAX_SECONDS=3.;VBA_MAX_JSON=3*1024*1024
@@ -6526,6 +7012,8 @@ class ExcelSessionWorker:
         self.owned_process=None
         self.revision=0;self.applied=0;self.layout_applied=0;self.layout_touched=0;self.owned_excel=False;self.working_copy='';self.original_path='';self.resumed=False;self.open_events_enabled=False;self.handoff_incomplete=False;self.pdf_observer=None;self.last_macro='';self.vba_patch_plan=None
     def send(self,event,**fields):
+        attempt_id=getattr(self,'_command_attempt_id','')
+        if attempt_id and fields.get('id')==getattr(self,'_command_id',None):fields.setdefault('attempt_id',attempt_id)
         data=dumps(dict(fields,event=event,session_id=self.session_id))
         if len(data.encode('utf-8'))>EXCEL_SESSION_MAX_MESSAGE:raise UserError('Snapshot exceeds 4 MiB. Read a smaller range.')
         self.output.write(data+'\n');self.output.flush()
@@ -7011,23 +7499,18 @@ class ExcelSessionWorker:
         macro=(self.vba_saved_macro(requested,working) if saved else self.qualified_macro(self.macro_name(requested)) if self.macro_name(requested) else '') if requested else ''
         if requested and not macro:raise UserError('Makro do analizy musi należeć do tej kopii skoroszytu.')
         workspace=working.parent;companions=self.vba_patch_companions(workspace)
-        folder=Path(tempfile.mkdtemp(prefix='vba-edit-',dir=workspace));base=folder/'base';base.mkdir(mode=0o700);snapshot=base/working.name
-        saved_mtime='';saved_hash=''
-        if saved:
-            info=self.vba_regular_file(working,256*1024*1024);signature=_ExcelPdfObserver._signature(info);saved_hash=file_digest(working);saved_mtime=dt.datetime.fromtimestamp(info.st_mtime,dt.timezone.utc).isoformat()
-            excel_copy_workbook(working,snapshot,threading.Event())
-            if _ExcelPdfObserver._signature(self.vba_regular_file(working,256*1024*1024))!=signature or file_digest(working)!=saved_hash or file_digest(snapshot)!=saved_hash:raise UserError('Zapisana kopia zmieniła się podczas odczytu. Przygotuj propozycję ponownie.')
-        else:
+        def capture_live(snapshot):
             previous_events=self.excel.EnableEvents
             try:self.excel.EnableEvents=False;self.book.call('SaveCopyAs',str(snapshot))
             finally:self.excel.EnableEvents=previous_events
             self.session_save_path()
-        self.vba_regular_file(snapshot,256*1024*1024);_vba_copy_zone(working,snapshot);source=excel_vba_package_read(snapshot)
-        token=uid();created=utcnow();preview={'token':token,'status':'unsupported','candidates':[],'rejections':[],'created_at':created,'workbook_id':self.workbook_id,'macro_name':macro,'answer_text':answer,'source_mode':mode,'saved_source_mtime':saved_mtime,'file_sha256':saved_hash,'source_note':'Ostatnia zapisana kopia sesji; niezapisane zmiany nie są uwzględnione.' if saved else 'Kopia bieżącego skoroszytu utworzona przez Excel.'}
+        snapshot_record=ExcelVbaSnapshotProvider.capture(working,mode,self.vba_regular_file,None if saved else capture_live)
+        snapshot=Path(snapshot_record.path);source=excel_vba_package_read(snapshot)
+        token=uid();preview={'token':token,'status':'unsupported','candidates':[],'rejections':[],'created_at':snapshot_record.captured_at,'workbook_id':self.workbook_id,'macro_name':macro,'answer_text':answer,'source_mode':mode,'saved_source_mtime':snapshot_record.saved_source_mtime,'file_sha256':snapshot_record.sha256,'source_note':snapshot_record.note}
         if source.get('status')!='available':
             preview['reason']=str(source.get('reason') or 'Nie odczytano pełnego, obsługiwanego źródła VBA.')[:1800];return preview
         expected=source.get('file_sha256','')
-        if not isinstance(expected,str) or not re.fullmatch('[0-9a-f]{64}',expected):raise UserError('Nie potwierdzono skrótu kopii przygotowanej do zmiany.')
+        if expected!=snapshot_record.sha256 or file_digest(snapshot)!=snapshot_record.sha256:raise UserError('Nie potwierdzono skrótu kopii przygotowanej do zmiany.')
         modules=source.get('modules',[]);plan=plan_vba_validation_patch(modules,macro_name=macro,prompt_text=prompt);preview['status']=str(plan.get('status','unsupported'))[:100]
         preview['reason']=str(plan.get('reason',''))[:1800];preview['rejections']=[];preview['analysis']=dict(plan.get('analysis',{}))
         preview['file_sha256']=expected
@@ -7050,38 +7533,39 @@ class ExcelSessionWorker:
             new=old[:start]+new_block+old[end:]
             if new==old or len(new)>self.VBA_MAX_CHARACTERS:raise UserError('Nieprawidłowa długość zmienionego źródła VBA.')
             item={key:candidate[key] for key in ('id','module','procedure','line','end_line','old_block','new_block','reason','warnings') if key in candidate}
+            if 'semantic_evidence' in candidate:item['semantic_evidence']=excel_vba_semantic_evidence(candidate['semantic_evidence'])
             item['unified_diff']=''.join(difflib.unified_diff(candidate['old_block'].splitlines(True),new_block.splitlines(True),fromfile=str(module)+' — przed',tofile=str(module)+' — po'))
             proposed=dict(preview,candidates=preview['candidates']+[item])
             if len(dumps(proposed).encode('utf-8'))>256*1024:
                 preview.update(status='unsupported',candidates=[],reason='Podgląd zmiany przekracza limit. Nie przygotowano niepełnej propozycji.');candidates={};break
-            preview['candidates'].append(item);candidates[cid]={'module':module,'old_source':old,'new_source':new}
+            preview['candidates'].append(item);candidates[cid]=_ExcelVbaModulePatch(cid,module,old,new)
         if saved:self.vba_saved_patch_path()
         else:self.session_save_path()
-        if candidates:self.vba_patch_plan={'token':token,'snapshot':str(snapshot),'sha256':expected,'candidates':candidates,'revision':self.revision,'companions':companions,'created_at':created,'source_mode':mode,'saved_source_mtime':saved_mtime,'source_note':preview['source_note']}
+        if candidates:self.vba_patch_plan=_ExcelVbaPreparedPatch(token,snapshot_record,tuple(candidates.values()),self.revision,tuple(_ExcelVbaCompanion(item['path'],item['name'],tuple(item['signature'])) for item in companions))
         return preview
     def apply_vba_patch(self,command):
         mode=self.vba_patch_source_mode(command);saved=mode=='saved_file';working=self.vba_saved_patch_path() if saved else self.session_save_path();plan=self.vba_patch_plan;token=command.get('token');cid=command.get('candidate_id')
-        if not plan or token!=plan['token'] or cid not in plan['candidates']:raise UserError('Propozycja zmiany jest nieaktualna albo została już zastosowana. Przygotuj ją ponownie.')
-        if plan.get('source_mode','live')!=mode:raise UserError('Propozycja dotyczy innego źródła. Przygotuj ją ponownie.')
-        if plan['revision']!=self.revision:raise UserError('Skoroszyt zmienił się od przygotowania propozycji. Przygotuj ją ponownie.')
-        snapshot=_excel_retained_path(plan['snapshot']);self.vba_regular_file(snapshot,256*1024*1024)
-        if not snapshot.is_relative_to(working.parent) or file_digest(snapshot)!=plan['sha256']:raise UserError('Kopia przygotowana do zmiany została zmodyfikowana. Przygotuj propozycję ponownie.')
-        for item in plan['companions']:
-            if _ExcelPdfObserver._signature(self.vba_regular_file(item['path'],500*1024*1024))!=item['signature']:raise UserError('Plik towarzyszący zmienił się od przygotowania propozycji: '+item['name'])
+        if not plan or token!=plan.token or cid not in {item.id for item in plan.candidates}:raise UserError('Propozycja zmiany jest nieaktualna albo została już zastosowana. Przygotuj ją ponownie.')
+        if plan.source.source_mode!=mode:raise UserError('Propozycja dotyczy innego źródła. Przygotuj ją ponownie.')
+        if plan.revision!=self.revision:raise UserError('Skoroszyt zmienił się od przygotowania propozycji. Przygotuj ją ponownie.')
+        snapshot=_excel_retained_path(plan.source.path);self.vba_regular_file(snapshot,256*1024*1024)
+        if not snapshot.is_relative_to(working.parent) or file_digest(snapshot)!=plan.source.sha256:raise UserError('Kopia przygotowana do zmiany została zmodyfikowana. Przygotuj propozycję ponownie.')
+        for item in plan.companions:
+            if _ExcelPdfObserver._signature(self.vba_regular_file(item.path,500*1024*1024))!=item.signature:raise UserError('Plik towarzyszący zmienił się od przygotowania propozycji: '+item.name)
         self.vba_patch_plan=None  # Applying a frozen proposal is one-shot, including failures.
-        folder=Path(tempfile.mkdtemp(prefix='vba-patched-',dir=working.parent));destination=folder/working.name;candidate=plan['candidates'][cid]
-        patched=excel_vba_package_patch(snapshot,destination,plan['sha256'],candidate['module'],candidate['old_source'],candidate['new_source'])
+        folder=Path(tempfile.mkdtemp(prefix='vba-patched-',dir=working.parent));destination=folder/working.name;candidate=next(item for item in plan.candidates if item.id==cid)
+        patched=excel_vba_package_patch(snapshot,destination,plan.source.sha256,candidate.module,candidate.old_source,candidate.new_source)
         if _excel_retained_path(patched.get('path',''))!=destination:raise UserError('Zapis zmiany zwrócił inną kopię niż oczekiwana.')
         self.vba_regular_file(destination,256*1024*1024);sha256=file_digest(destination)
         if patched.get('sha256')!=sha256:raise UserError('Nie potwierdzono skrótu zmienionej kopii.')
         paths=[];cancelled=threading.Event()
-        for item in plan['companions']:
-            source=Path(item['path']);target=folder/item['name'];excel_copy_workbook(source,target,cancelled)
-            if _ExcelPdfObserver._signature(self.vba_regular_file(source,500*1024*1024))!=item['signature'] or self.vba_regular_file(target,500*1024*1024).st_size!=item['signature'][2]:raise UserError('Plik towarzyszący zmienił się podczas kopiowania: '+item['name'])
+        for item in plan.companions:
+            source=Path(item.path);target=folder/item.name;excel_copy_workbook(source,target,cancelled)
+            if _ExcelPdfObserver._signature(self.vba_regular_file(source,500*1024*1024))!=item.signature or self.vba_regular_file(target,500*1024*1024).st_size!=item.signature[2]:raise UserError('Plik towarzyszący zmienił się podczas kopiowania: '+item.name)
             paths.append(str(target))
         if saved:self.vba_saved_patch_path()
         else:self.session_save_path()
-        return {'path':str(destination),'sha256':sha256,'token':token,'candidate_id':cid,'label':'Zmieniona kopia — niezweryfikowana','verified':False,'snapshot_created_at':plan['created_at'],'companions':[item['name'] for item in plan['companions']],'companion_paths':paths,'source_mode':mode,'source_note':plan.get('source_note',''),'saved_source_mtime':plan.get('saved_source_mtime','')}
+        return {'path':str(destination),'sha256':sha256,'token':token,'candidate_id':cid,'label':'Zmieniona kopia — niezweryfikowana','verified':False,'snapshot_created_at':plan.source.captured_at,'companions':[item.name for item in plan.companions],'companion_paths':paths,'source_mode':mode,'source_note':plan.source.note,'saved_source_mtime':plan.source.saved_source_mtime}
     def invoke_macro(self,macro,extra,diagnostics=False,identity=None,action='run_macro'):
         self.last_macro=macro;self.vba_patch_plan=None
         if diagnostics:self.send('vba_source',id=identity,operation=action,report=self.inspect_vba(macro))
@@ -7089,7 +7573,12 @@ class ExcelSessionWorker:
         with contextlib.suppress(Exception):
             if self.pdf_observer is None:self.pdf_observer=_ExcelPdfObserver(self.working_copy)
             extra['pdf_outputs']['scope']=self.pdf_observer.scope;before=self.pdf_observer.capture()
-        try:self.excel.call('Run',macro)
+        extra['macro_outcome']='running'
+        try:
+            self.excel.call('Run',macro);extra['macro_outcome']='returned'
+        except Exception as exc:
+            extra['macro_outcome']='unknown' if excel_connection_lost(exc) else 'failed'
+            raise
         finally:
             if before is not None:
                 with contextlib.suppress(Exception):extra['pdf_outputs']=self.pdf_observer.outputs(before)
@@ -7097,8 +7586,10 @@ class ExcelSessionWorker:
         if command.get('session_id')!=self.session_id:raise UserError('Wrong session identity.')
         if command.get('action')=='close':return False
         action=command.get('action');identity=command.get('id');self.applied=0;macro='';invocation={};extra={};file_only=action in ('prepare_vba_patch','apply_vba_patch') and command.get('source_mode')=='saved_file'
+        self._command_id=identity;self._command_attempt_id=command.get('attempt_id','')
         self.send('busy',id=identity,operation=action)
         try:
+            if not isinstance(self._command_attempt_id,str) or (self._command_attempt_id and not re.fullmatch('[0-9a-f]{32}',self._command_attempt_id)):raise UserError('Nieprawidłowy identyfikator próby Excel.')
             if type(command.get('diagnostics',False)) is not bool:raise UserError('Nieprawidłowa opcja diagnostyki VBA.')
             isolated=action in ('inspect_vba','prepare_vba_patch','apply_vba_patch','reconnect_workbook')
             if command.get('workbook_id')!=self.workbook_id:raise UserError('Wrong workbook identity.')
@@ -7150,7 +7641,7 @@ class ExcelSessionWorker:
         except Exception as exc:
             if action not in ('inspect_vba','prepare_vba_patch','apply_vba_patch','reconnect_workbook') and not excel_connection_lost(exc) and not isinstance(exc,_ExcelWorkbookRebound):
                 with contextlib.suppress(Exception):self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
-            outcome={'result':{'pdf_outputs':extra['pdf_outputs']}} if 'pdf_outputs' in extra else {}
+            outcome={'result':{key:extra[key] for key in ('pdf_outputs','macro_outcome') if key in extra}} if extra else {}
             if isinstance(exc,_ExcelWorkbookRebound):outcome['result']=exc.result
             fields=excel_worker_error_fields(exc,action,macro,{'working_copy':self.working_copy,'source_mode':'saved_file'}) if file_only else self.error_fields(exc,action,macro,invocation)
             self.send('error',id=identity,operation=action,applied=self.applied,retry_safe=False,**outcome,**fields)
@@ -7293,8 +7784,15 @@ def excel_publish_macro_pdf(source_descriptor,session_dir,destination,cancelled=
             if target_state(target)!=previous_target:raise UserError('Plik docelowy zmienił się podczas kopiowania. Wybierz miejsce zapisu ponownie.')
             temp_current=temporary.lstat();regular(temp_current)
             if (temp_current.st_dev,temp_current.st_ino)!=temporary_identity or temp_current.st_size!=total:raise UserError('Tymczasowy dokument PDF zmienił się przed zapisem.')
+            artifact=excel_verify_pdf_artifact(temporary,identity(temp_current),cancelled)
+            if artifact.size!=total or artifact.sha256!=fingerprint.hexdigest():raise UserError('Tymczasowy PDF różni się od dokumentu skopiowanego z sesji.')
+            # Parsing can take time. Recheck both names after it, before replacement.
+            plain_path(source);plain_path(target);plain_path(temporary)
+            if identity(source.lstat())!=expected or identity(temporary.lstat())!=identity(temp_current):raise UserError('Dokument PDF zmienił się przed zakończeniem zapisu.')
+            if target_state(target)!=previous_target:raise UserError('Plik docelowy zmienił się podczas sprawdzania PDF. Wybierz miejsce zapisu ponownie.')
             check_cancelled();os.replace(temporary,target)
-        return {'destination':str(target),'path':str(target),'source_path':str(source),'size':total,'bytes':total,'sha256':fingerprint.hexdigest()}
+        return {'destination':str(target),'path':str(target),'source_path':str(source),'size':total,'bytes':total,'sha256':artifact.sha256,
+            'verified':True,'page_count':artifact.page_count,'verification_backend':artifact.verification_backend}
     finally:
         if temporary is not None:
             with contextlib.suppress(OSError):
@@ -7392,7 +7890,7 @@ class ExcelSessionController:
         self.process=None;self.owned_process=None;self.thread=None;self.reaper=None;self.dispatcher=None;self.previous=set();self.pending=None;self.temp_root=None;self.staged=None;self._copy_cancel=None
         self.resume_path=resume_path;self.session_file_lock=None;self.manifest={};self.resume_info=None;self._vba_requested_job='';self._file_patch_job_state=None
         self.state={'session_id':self.session_id,'workbook_id':self.session_id+'-book','state':'new','job_id':'','operation':'','original_path':str(self.original),'source_path':str(self.original),'staged_path':'','working_copy':'','temp_root':'','workspace_path':'','last_saved_path':'','pid':0,'hwnd':0,'owned':False,'alive':False,'active_sheet':'','last_result':{},'last_operation':'','error':'','error_operation':'','events':[],'cancelled':False,'finished':False,'handoff_incomplete':False}
-        self.state.update(error_details='',error_code='',macro_name='',resumed=resume_path is not None,externally_changed=False,vba_source={},vba_source_job='',vba_patch={},vba_patch_job='')
+        self.state.update(error_details='',error_code='',macro_name='',resumed=resume_path is not None,externally_changed=False,vba_source={},vba_source_job='',vba_patch={},vba_patch_job='',attempt_id='',last_attempt_id='',last_job_id='')
     def _event(self,event,**fields):
         with self.lock:
             if isinstance(fields.get('result'),dict) and 'snapshot' in fields['result']:
@@ -7569,6 +8067,9 @@ class ExcelSessionController:
         if event=='closed':return
         with self.lock:
             if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
+            attempt_id=self.state.get('attempt_id','')
+            if value.get('attempt_id',attempt_id)!=attempt_id:return
+            if value.get('operation',self.state.get('operation'))!=self.state.get('operation'):return
             pending=self.pending if event=='done' else None
             owned=self.owned_process;operation=self.state.get('operation');file_patch_state=self._file_patch_job_state if self._file_patch_job_state and self._file_patch_job_state['id']==value.get('id') else None
         if event=='vba_source':
@@ -7605,6 +8106,7 @@ class ExcelSessionController:
             if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
             if event=='busy':self.state['state']='busy'
             elif event in ('ready','done','error'):
+                self.state.update(last_attempt_id=attempt_id,last_job_id=value.get('id',''))
                 self._remove_pending();self.state['last_operation']=str(value.get('operation') or operation or 'open')
                 if operation=='apply_vba_patch':self.state.update(vba_patch={},vba_patch_job='')
                 if (isinstance(value.get('result'),dict) and value['result'].get('handoff_incomplete') is True) or self.manifest.get('handoff_incomplete'):self.state['handoff_incomplete']=True
@@ -7616,9 +8118,9 @@ class ExcelSessionController:
                     if result.get('saved_path'):self.state['last_saved_path']=result['saved_path']
                 disconnected=(file_patch_state is not None and file_patch_state['state']=='disconnected') or (event=='error' and (value.get('code')=='excel_disconnected' or operation=='reconnect_workbook'))
                 if (disconnected and not file_patch_state) or (value.get('result') or {}).get('workbook_rebound'):self.state.update(vba_patch={},vba_patch_job='',vba_source={},vba_source_job='')
-                self.state.update(state='disconnected' if disconnected else 'ready',job_id='',operation='')
+                self.state.update(state='disconnected' if disconnected else 'ready',job_id='',operation='',attempt_id='')
                 self._file_patch_job_state=None
-        self._event(event,operation=value.get('operation','open'),message=value.get('message',''),details=str(value.get('details',''))[:16384],code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],result=value.get('result',{}),applied=value.get('applied',0),retry_safe=False)
+        self._event(event,id=value.get('id',''),attempt_id=attempt_id,operation=value.get('operation','open'),message=value.get('message',''),details=str(value.get('details',''))[:16384],code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],result=value.get('result',{}),applied=value.get('applied',0),retry_safe=False)
     def _accept_vba_source(self,report,jid):
         # Source belongs only to the current in-memory view, never the event log.
         if not isinstance(report,dict) or report.get('status') not in ('available','partial','denied','locked','unavailable'):return
@@ -7657,6 +8159,9 @@ class ExcelSessionController:
             warnings=item.get('warnings',[])
             if not isinstance(warnings,list) or len(warnings)>10 or any(not isinstance(w,str) or len(w)>1800 for w in warnings):return
             entry['warnings']=list(warnings);clean['candidates'].append(entry)
+            if 'semantic_evidence' in item:
+                try:entry['semantic_evidence']=excel_vba_semantic_evidence(item['semantic_evidence'])
+                except UserError:return
         clean['rejections']=[]
         for item in rejections:
             if not isinstance(item,dict):return
@@ -7691,6 +8196,8 @@ class ExcelSessionController:
     def submit(self,action,args=None):
         args=args or {}
         if not isinstance(args,dict):raise UserError('Nieprawidłowe parametry sesji Excel.')
+        attempt_id=args.get('attempt_id','')
+        if not isinstance(attempt_id,str) or (attempt_id and not re.fullmatch('[0-9a-f]{32}',attempt_id)):raise UserError('Nieprawidłowy identyfikator próby Excel.')
         with self.lock:
             reconnect=action=='reconnect_workbook' and self.state['state']=='disconnected'
             file_only=action in ('prepare_vba_patch','apply_vba_patch') and args.get('source_mode')=='saved_file'
@@ -7702,6 +8209,7 @@ class ExcelSessionController:
             workbook_id=self.state['workbook_id']
             if args.get('workbook_id',workbook_id)!=workbook_id:raise UserError('Polecenie dotyczy innego skoroszytu.')
             jid=uid();command={'action':action,'id':jid,'workbook_id':workbook_id}
+            if attempt_id:command['attempt_id']=attempt_id
             if action in ('prepare_vba_patch','apply_vba_patch') and 'source_mode' in args:
                 if args['source_mode'] not in ('live','saved_file'):raise UserError('Nieprawidłowy wybór źródła zmiany VBA.')
                 command['source_mode']=args['source_mode']
@@ -7743,9 +8251,9 @@ class ExcelSessionController:
             if action in ('run_macro','run_control_macro','prepare_vba_patch','reconnect_workbook'):self.state.update(vba_patch={},vba_patch_job='')
             self._vba_requested_job=jid if command.get('diagnostics') is True else ''
             self._file_patch_job_state={'id':jid,'state':self.state['state']} if file_only else None
-            self.state.update(state='busy',job_id=jid,operation=action,error='',error_operation='',error_details='',error_code='',macro_name='')
+            self.state.update(state='busy',job_id=jid,operation=action,attempt_id=attempt_id,error='',error_operation='',error_details='',error_code='',macro_name='')
             self.dispatcher=threading.Thread(target=self._dispatch,args=(command,),name='pivot-excel-request',daemon=False);self.dispatcher.start()
-        self._event('submitted',operation=action,id=jid);return jid
+        self._event('submitted',operation=action,id=jid,attempt_id=attempt_id);return jid
     def _dispatch(self,command):
         temp=None
         try:
@@ -7769,16 +8277,14 @@ class ExcelSessionController:
                 if self.pending and self.pending['id']==command['id']:self.pending=None
                 if not self.cancelled.is_set() and command['id']==self.state['job_id']:
                     previous=self._file_patch_job_state;disconnected=command['action']=='reconnect_workbook' or bool(previous and previous['id']==command['id'] and previous['state']=='disconnected')
-                    self.state.update(state='disconnected' if disconnected else 'ready',job_id='',operation='',error=safe_error(exc),error_operation=command['action']);self._file_patch_job_state=None
-            self._event('error',message=safe_error(exc),operation=command['action'])
+                    self.state.update(state='disconnected' if disconnected else 'ready',job_id='',operation='',attempt_id='',last_attempt_id=command.get('attempt_id',''),last_job_id=command['id'],error=safe_error(exc),error_operation=command['action']);self._file_patch_job_state=None
+            self._event('error',id=command['id'],attempt_id=command.get('attempt_id',''),message=safe_error(exc),operation=command['action'])
     def _publish(self,pending):
         if self.cancelled.is_set():raise Cancelled('Anulowano zapis.')
-        temp=Path(pending['temp_path'])
+        temp=Path(pending['temp_path']);artifact=None
         if not temp.is_file():raise UserError('Excel nie utworzył pliku wynikowego.')
         if pending['action']=='export_pdf':
-            with temp.open('rb') as stream:
-                header=stream.read(16);size=temp.stat().st_size;stream.seek(max(0,size-4096));tail=stream.read(4096).rstrip(b'\r\n\t \x00')
-                if size<64 or not re.match(rb'%PDF-[12]\.\d[\r\n]',header) or not tail.endswith(b'%%EOF'):raise UserError('Excel nie utworzył kompletnego pliku PDF.')
+            pdf_identity=_ExcelPdfObserver._signature(temp.lstat());artifact=excel_verify_pdf_artifact(temp,pdf_identity,self.cancelled)
         else:
             with zipfile.ZipFile(temp) as archive:
                 documents={}
@@ -7803,8 +8309,10 @@ class ExcelSessionController:
             revision=fingerprint.hexdigest()
         with self.lock:
             if self.cancelled.is_set() or pending is not self.pending or pending['id']!=self.state['job_id']:raise Cancelled('Anulowano zapis.')
+            if artifact is not None and _ExcelPdfObserver._signature(temp.lstat())!=pdf_identity:raise UserError('PDF zmienił się po sprawdzeniu. Nie zapisano dokumentu.')
             os.replace(temp,pending['destination'])
         result={'destination':pending['destination'],'bytes':size,'action':pending['action']}
+        if artifact is not None:result.update(verified=True,page_count=artifact.page_count,sha256=artifact.sha256,verification_backend=artifact.verification_backend)
         if revision:result.update(saved_path=pending['destination'],saved_revision=revision)
         return result
     def _remove_pending(self):
@@ -8725,7 +9233,7 @@ def install_environment(profile,root=None,wheelhouse=None,progress=print,*,sourc
             # Drivers run in isolated workers. Qt's import hook must not participate
             # in their probes (notably dateutil/six imported by Firebird on Windows).
             for key,code in [('oracle','import oracledb'),('firebird','import firebird.driver'),('h2','import jpype'),
-                             ('excel','import pythoncom; import win32com.client.dynamic')]:
+                             ('excel','import pythoncom; import win32com.client.dynamic; import pypdf')]:
                 if key in profiles:run([py,'-I','-c',code+f"; print('Import {key}: OK')"],timeout=90)
             check();marker={'python':str(py),'profiles':sorted(profiles),'version':APP_VERSION,'installed':utcnow(),
                 'platform':platform.platform(),'python_version':list(sys.version_info[:2]),
@@ -11583,6 +12091,7 @@ _LICENSE_LGPL_TERMS = (
     'zgodną zmodyfikowaną wersją i debugowanie tych modyfikacji. Dynamiczne ładowanie samo '
     'nie załatwia wszystkich obowiązków. Oddzielne składniki Qt zachowują własne licencje.')
 _LICENSE_RULES = {
+    'BSD-3-Clause': ('Tak · warunki BSD', 'Zachowaj notę copyright, warunki i wyłączenie gwarancji; nie używaj nazw autorów do promowania produktu bez zgody.', 'https://github.com/py-pdf/pypdf/blob/6.19.0/LICENSE'),
     'MIT': ('Tak · warunki MIT', 'Zachowaj informację copyright oraz tekst licencji przy przekazywaniu kopii lub istotnych części. Licencja nie zapewnia gwarancji.', 'https://opensource.org/license/mit'),
     'Apache-2.0': ('Tak · warunki Apache', 'Zachowaj licencję, atrybucje i wymagane NOTICE; oznacz zmiany. Uwzględnij warunki patentowe. Licencja nie udziela praw do znaków towarowych.', 'https://www.apache.org/licenses/LICENSE-2.0'),
     'UPL-1.0 OR Apache-2.0': ('Tak · wybierz wariant', 'Wybierz UPL-1.0 albo Apache-2.0 i spełnij jego warunki, w tym zachowanie odpowiednich not. Sterownik nie udziela licencji na serwer Oracle ani Oracle Client. Składniki zewnętrzne mają osobne noty.', 'https://github.com/oracle/python-oracledb/blob/main/LICENSE.txt'),
@@ -11599,6 +12108,7 @@ _LICENSE_PACKAGES = {
     'jpype1': ('JPype1','1.7.1','Apache-2.0','Opcjonalny most do Javy/JDBC dla H2; Java i H2 mają własne warunki.'),
     'keyring': ('keyring','25.6.0','MIT','Opcjonalny dostęp do systemowego magazynu haseł. Wykaz nie inicjalizuje magazynu.'),
     'pywin32': ('pywin32','312','PSF + licencje składników','Opcjonalna obsługa COM w osobnym procesie sesji Microsoft Excel na Windows. Microsoft Excel wymaga osobnej instalacji i licencji.'),
+    'pypdf': ('pypdf','6.19.0','BSD-3-Clause','Sprawdzenie struktury i liczby stron PDF przed zapisaniem wyniku sesji Excel. Nie ocenia poprawności treści raportu.'),
 }
 _LICENSE_NOTICE_NAME = re.compile(r'^(?:licen[cs]e|copying\d*|notice|notices|copyright)(?:$|[._-])|^runtime\.library\.exception$',re.I)
 _LICENSE_DENIED_EXT = {'.py','.pyc','.pyd','.exe','.dll','.so','.dylib','.sh','.bat','.cmd','.ps1','.lnk','.url','.msi','.com','.html','.htm','.js'}
@@ -12143,6 +12653,138 @@ def author_system_reduced_motion():
         fn.restype=ctypes.c_int
         return bool(fn(0x1042,0,ctypes.byref(enabled),0)) and not bool(enabled.value)
     except (OSError,AttributeError):return False
+
+
+@dataclasses.dataclass(frozen=True)
+class ExcelRunRequest:
+    macro: str
+    control_name: str = ''
+    sheet: str = ''
+    destination: str = ''
+    source_sha256: str = ''
+    candidate_id: str = ''
+
+
+@dataclasses.dataclass(frozen=True)
+class ExcelRunAttempt:
+    attempt_id: str
+    request: ExcelRunRequest
+    phase: str = 'opening'
+    connection_status: str = 'opening'
+    macro_status: str = 'not_started'
+    artifact_status: str = 'not_checked'
+    pending_operation: str = ''
+    job_id: str = ''
+    previous_attempt_id: str = ''
+    message: str = ''
+
+
+@dataclasses.dataclass(frozen=True)
+class ExcelRunControl:
+    control_id: str
+    name: str
+    qualified_macro: str
+    supported: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class ExcelRunReadiness:
+    connection_status: str
+    workbook_id: str = ''
+    sheet: str = ''
+    sheet_id: str = ''
+    requested_sheet_id: str = ''
+    qualified_macro: str = ''
+    controls: tuple[ExcelRunControl, ...] = ()
+    error: str = ''
+    handoff_incomplete: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class ExcelRunIntent:
+    attempt_id: str
+    action: str
+    arguments: tuple[tuple[str, str | int | bool], ...] = ()
+
+    def parameters(self):
+        return dict(self.arguments,attempt_id=self.attempt_id)
+
+
+class ExcelRunCoordinator:
+    """Pure run orchestration. It emits commands; it never calls Office or files."""
+    def __init__(self,id_factory=None):
+        self._id_factory=id_factory or uid;self.attempt: ExcelRunAttempt | None=None
+
+    def _new(self,request,**changes):
+        if not isinstance(request,ExcelRunRequest):raise TypeError('Expected immutable ExcelRunRequest.')
+        identifier=self._id_factory()
+        if not isinstance(identifier,str) or not re.fullmatch('[0-9a-f]{32}',identifier):raise ValueError('Invalid run attempt identity.')
+        self.attempt=ExcelRunAttempt(identifier,request,**changes);return self.attempt
+
+    def begin_patched(self,request):
+        return self._new(request,message='Otwieram zmienioną kopię. Następnie wykonam jedną próbę generatora.')
+
+    def begin_manual(self,request,action):
+        if action not in ('run_macro','run_control_macro'):raise ValueError('Unsupported macro command.')
+        return self._new(request,phase='running',connection_status='ready',macro_status='queued',pending_operation=action,message='Zlecam jedną próbę makra. Utworzenie PDF wymaga osobnego potwierdzenia.')
+
+    def _matches(self,attempt_id,action='',job_id=''):
+        current=self.attempt
+        return bool(current and attempt_id==current.attempt_id and (not action or action==current.pending_operation) and (not job_id or not current.job_id or job_id==current.job_id))
+
+    def accepted(self,attempt_id,action,job_id):
+        if not action or not self._matches(attempt_id,action,str(job_id)):return False
+        self.attempt=dataclasses.replace(self.attempt,job_id=str(job_id),macro_status='running' if action in ('run_macro','run_control_macro') else self.attempt.macro_status);return True
+
+    def retry_after_content(self,attempt_id):
+        current=self.attempt
+        if not self._matches(attempt_id) or current.phase!='needs_content':return None
+        self._new(current.request,phase='reconnecting',connection_status='reconnecting',pending_operation='reconnect_workbook',previous_attempt_id=current.attempt_id,message='Odnawiam połączenie z tą samą kopią po włączeniu zawartości…')
+        return ExcelRunIntent(self.attempt.attempt_id,'reconnect_workbook')
+
+    def advance(self,attempt_id,view):
+        if not self._matches(attempt_id) or not isinstance(view,ExcelRunReadiness):return None
+        current=self.attempt
+        if current.phase not in ('opening','reconnecting','reading_sheet') or current.pending_operation or view.connection_status in ('starting','busy','closing'):return None
+        if view.connection_status!='ready' or view.error or view.handoff_incomplete:
+            self.attempt=dataclasses.replace(current,phase='needs_content' if current.phase=='reconnecting' else 'failed',connection_status=view.connection_status,message='Nie uruchomiono generatora. '+(view.error or 'Kopia nie jest gotowa. Sprawdź komunikaty sesji.'));return None
+        if not view.workbook_id:return None
+        if view.sheet!=current.request.sheet and current.phase!='reading_sheet' and view.requested_sheet_id:
+            self.attempt=dataclasses.replace(current,phase='reading_sheet',connection_status='ready',pending_operation='read_range',job_id='',message='Odczytuję arkusz generatora w tej samej kopii…')
+            return ExcelRunIntent(current.attempt_id,'read_range',tuple({'workbook_id':view.workbook_id,'sheet_id':view.requested_sheet_id,'top':1,'left':1,'rows':30,'cols':12}.items()))
+        matches=[control for control in view.controls if control.name==current.request.control_name and control.supported and control.qualified_macro.casefold()==view.qualified_macro.casefold()]
+        if view.sheet!=current.request.sheet or not view.qualified_macro or len(matches)!=1:
+            self.attempt=dataclasses.replace(current,phase='failed',connection_status='ready',message='Nie uruchomiono generatora: nie potwierdzono tego samego przycisku i makra w zmienionej kopii. Wybierz przycisk w arkuszu.');return None
+        self.attempt=dataclasses.replace(current,phase='running',connection_status='ready',macro_status='queued',pending_operation='run_control_macro',job_id='',message='Uruchamiam generator w zmienionej kopii. Zapis PDF zostanie potwierdzony dopiero po sprawdzeniu pliku.')
+        return ExcelRunIntent(current.attempt_id,'run_control_macro',tuple({'workbook_id':view.workbook_id,'sheet_id':view.sheet_id,'control_id':matches[0].control_id}.items()))
+
+    def completed(self,attempt_id,action,job_id='',artifact_status='unknown'):
+        if not action or not self._matches(attempt_id,action,job_id):return False
+        current=self.attempt;changes={'connection_status':'ready','pending_operation':'','job_id':''}
+        if action in ('run_macro','run_control_macro'):
+            if artifact_status not in ('observed','not_observed','unknown'):artifact_status='unknown'
+            changes.update(phase='done',macro_status='returned',artifact_status=artifact_status,message='Generator zakończył próbę. '+('Znaleziono PDF; trwa osobna weryfikacja i zapis.' if artifact_status=='observed' else 'Nie potwierdzono utworzenia PDF. Sprawdź pytania i komunikaty makra; nie ponawiam go automatycznie.'))
+        self.attempt=dataclasses.replace(current,**changes);return True
+
+    def failed(self,attempt_id,action,message,code='',job_id='',macro_outcome='',artifact_status='unknown'):
+        if not action or not self._matches(attempt_id,action,job_id):return False
+        current=self.attempt;macro=action in ('run_macro','run_control_macro');unavailable=macro and code=='macro_unavailable'
+        content=unavailable or action=='reconnect_workbook'
+        note=('Excel nie udostępnił generatora. Pokaż tę kopię i sprawdź pasek zabezpieczeń. Jeśli jest „Włącz zawartość”, kliknij go w Excelu, a następnie „Włączono zawartość — uruchom generator” tutaj. Ta decyzja rozpocznie nową próbę.' if unavailable else ('Nie uruchomiono generatora. ' if not macro else 'Próba generatora nie powiodła się. ')+str(message))
+        outcome=macro_outcome if macro_outcome in ('returned','failed','unknown') else 'failed'
+        if macro and outcome=='returned':note='Wywołanie makra wróciło do Pivota, ale dalsza obsługa sesji nie powiodła się. '+str(message)+' Nie ponawiam makra.'
+        self.attempt=dataclasses.replace(current,phase='needs_content' if content else 'failed',connection_status='disconnected' if code=='excel_disconnected' or action=='reconnect_workbook' else current.connection_status,macro_status='unavailable' if unavailable else outcome if macro else current.macro_status,artifact_status=artifact_status if macro and artifact_status in ('observed','not_observed','unknown') else current.artifact_status,pending_operation='',job_id='',message=note);return True
+
+    def artifact_updated(self,attempt_id,status):
+        if not self._matches(attempt_id) or status not in ('observed','not_observed','unknown','publishing','published','publish_failed'):return False
+        current=self.attempt
+        if current.macro_status not in ('running','returned','failed'):return False
+        note='Potwierdzono poprawny PDF i zapis we wskazanym miejscu.' if status=='published' else 'PDF nie został zapisany. Sprawdź wynik weryfikacji pliku.' if status=='publish_failed' else current.message
+        self.attempt=dataclasses.replace(current,artifact_status=status,message=note);return True
+
+    def connection_changed(self,attempt_id,status):
+        if not self._matches(attempt_id):return False
+        self.attempt=dataclasses.replace(self.attempt,connection_status=str(status));return True
 
 
 def native_ui_types():
@@ -13385,6 +14027,7 @@ def native_ui_types():
             self._vba_report={};self._vba_job='';self._vba_ignored_job='';self._vba_prompt='';self._vba_macro='';self._diag_active=False;self._diag_terminal_key=None;self._diag_macro_job=''
             self._patch_question=None;self._patch_plan={};self._patch_result={};self._patch_preview=None;self._patch_open_dialog=None;self._patch_open_path=''
             self._patch_run_request=None;self._generator_request=None;self._generator_stage=''
+            self._run_coordinator=ExcelRunCoordinator();self._run_jobs={}
             self._macro_pdf_outputs=None;self._pdf_destination='';self._pdf_destination_confirmed=False;self._pdf_publish_pending=False;self._pdf_publish_cancel=threading.Event();self._pdf_attempt_destination=''
             self._session_preferences=excel_session_preferences(window.service.root);self._resume_path='';self._resume_source_path='';self._resume_info={};self._resume_check_pending=False
             self._office_context=None;self._native_book_id='';self._native_controls=[];self._native_loading=False;self._last_view_refresh=0.;self._initial_control_pending=False;self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._companion_paths=[]
@@ -13530,7 +14173,8 @@ def native_ui_types():
                 fingerprint=digest(key)
                 if fingerprint in self._activity_keys:return
                 self._activity_keys=(self._activity_keys+[fingerprint])[-320:]
-            entry=time.strftime('%H:%M:%S')+'  '+str(text).replace('\0','')[:4000]
+            attempt=self._run_coordinator.attempt
+            entry=time.strftime('%H:%M:%S')+'  '+('[próba '+attempt.attempt_id+'] ' if attempt else '')+str(text).replace('\0','')[:4000]
             bar=self.activity_log.verticalScrollBar();at_end=bar.value()>=bar.maximum()-2;position=bar.value();cursor=self.activity_log.textCursor();anchor,point=cursor.anchor(),cursor.position()
             self._activity_records.append(entry);removed=0
             while len(self._activity_records)>160 or sum(len(item)+1 for item in self._activity_records)>64000:removed+=len(self._activity_records.pop(0))+1
@@ -13663,7 +14307,7 @@ def native_ui_types():
             if self._patch_preview is not None:return
             dialog=QW.QDialog(self);dialog.setWindowTitle('Pierdol to — podgląd zmiany VBA');dialog.setWindowModality(Qt.WindowModality.WindowModal);layout=QW.QVBoxLayout(dialog)
             source_note=('Źródło: ostatnia zapisana kopia sesji. Niezapisane zmiany z Excela nie są uwzględnione. '+str(plan.get('source_note','')) if plan.get('source_mode')=='saved_file' else 'Źródło: bieżący skoroszyt z chwili przygotowania. Późniejsze edycje nie są uwzględnione.')
-            description=label('Zmiana pominie wskazany blok komunikatu i wyjścia w nowej kopii. Oryginalny warunek zostanie nadal obliczony. Dokument może zawierać brakujące dane. '+source_note+' Przygotowano: '+str(plan.get('created_at',''))+'. Wybierz samo utworzenie kopii albo zastosowanie i jedną próbę generatora z wyborem miejsca zapisu PDF.',True,True);description.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(description)
+            description=label('Zmiana pominie wskazaną kontrolę w nowej kopii. Oryginalny warunek zostanie nadal obliczony; poniżej zobaczysz dokładny zakres zmiany i zachowane instrukcje. Dokument może zawierać brakujące dane. '+source_note+' Przygotowano: '+str(plan.get('created_at',''))+'. Wybierz samo utworzenie kopii albo zastosowanie i jedną próbę generatora z wyborem miejsca zapisu PDF.',True,True);description.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(description)
             choice=QW.QComboBox();choice.setMinimumContentsLength(1);choice.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);choice.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed);layout.addWidget(choice)
             for item in candidates:choice.addItem(str(item.get('module',''))+'.'+str(item.get('procedure',''))+' · wiersz '+str(item.get('line','')),item)
             if len(candidates)>1:choice.setCurrentIndex(-1);choice.setPlaceholderText('Wybierz właściwy blok — pytanie pasuje do kilku miejsc')
@@ -13680,7 +14324,13 @@ def native_ui_types():
             can_run=bool(macro and sheet_name and control.get('name') and control.get('macro_supported') and control_macro.casefold()==qualified.casefold())
             run.setToolTip('Uruchamia raz ten sam generator w zmienionej kopii. Excel może wymagać „Włącz zawartość”.' if can_run else 'Nie rozpoznano jednoznacznie przycisku i makra ostatniej próby. Możesz utworzyć kopię i wybrać generator w niej.')
             def selected(*_):
-                item=choice.currentData() or {};reason.setText(str(item.get('reason',''))+'\n'+'\n'.join(map(str,item.get('warnings',[]))));diff.setPlainText(str(item.get('diff') or item.get('unified_diff') or ('Przed:\n'+str(item.get('old_block',''))+'\n\nPo:\n'+str(item.get('new_block','')))));apply.setEnabled(bool(item.get('id')));run.setEnabled(bool(item.get('id')) and can_run)
+                item=choice.currentData() or {};evidence=item.get('semantic_evidence') or {};explanation=[str(item.get('reason','')),*map(str,item.get('warnings',[]))]
+                if evidence.get('return_effect'):explanation.append('Wpływ na wynik: '+evidence['return_effect'])
+                if evidence.get('preserved_lines'):explanation.append('Zachowane wiersze: '+', '.join(map(str,evidence['preserved_lines'])))
+                if evidence.get('neutralized_lines'):explanation.append('Pomijane instrukcje w wierszach: '+', '.join(map(str,evidence['neutralized_lines'])))
+                if evidence.get('call_path'):explanation.append('Możliwa ścieżka wywołań (analiza źródła): '+' → '.join(evidence['call_path']))
+                if evidence.get('unresolved_calls'):explanation.append('Nierozpoznane zależności: '+'; '.join(evidence['unresolved_calls']))
+                reason.setText('\n'.join(explanation));diff.setPlainText(str(item.get('diff') or item.get('unified_diff') or ('Przed:\n'+str(item.get('old_block',''))+'\n\nPo:\n'+str(item.get('new_block','')))));apply.setEnabled(bool(item.get('id')));run.setEnabled(bool(item.get('id')) and can_run)
             epoch=self._epoch;identity=self.session_identity();token=plan.get('token');self._patch_preview=dialog
             def accepted(run_generator=False):
                 item=choice.currentData() or {}
@@ -13710,38 +14360,45 @@ def native_ui_types():
             dialog._office_context={'source_revision':revision}
             if run_request:
                 dialog._office_context.update(sheet=run_request['sheet'],control={'name':run_request['control_name']});dialog._initial_control_pending=True
-                dialog._generator_request=clone(run_request);dialog._generator_stage='opening'
-                dialog.generator_note.setText('Otwieram zmienioną kopię. Następnie wykonam jedną próbę generatora.');dialog.generator_frame.show()
+                dialog._generator_request=clone(run_request);dialog._run_coordinator.begin_patched(ExcelRunRequest(run_request['macro'],run_request['control_name'],run_request['sheet'],run_request['destination']));dialog.render_run_attempt();dialog.generator_frame.show()
             dialog.setWindowTitle('Excel: kopia z pominiętą walidacją');dialog._companion_paths=list(result.get('companion_paths') or [str(Path(path).parent/name) for name in result.get('companions',[])]);dialog.diagnostics_enabled.setChecked(self.diagnostics_enabled.isChecked())
             dialog.show();dialog.start_session()
         def continue_patched_generator(self):
             if not self._generator_request or self._generator_stage!='needs_content' or self._snapshot.get('state') not in ('ready','disconnected') or self._command_pending or self._last_prompts or self._action_pending or self._closing:return False
-            self._generator_stage='reconnecting';self.generator_note.setText('Odnawiam połączenie z tą samą kopią po włączeniu zawartości…')
-            if self.submit('reconnect_workbook',{}):return True
-            self._generator_stage='needs_content';self.update_controls();return False
+            intent=self._run_coordinator.retry_after_content(self._run_coordinator.attempt.attempt_id);self.render_run_attempt()
+            return self.submit_run_intent(intent) if intent else False
+        def render_run_attempt(self):
+            attempt=self._run_coordinator.attempt
+            self._generator_stage=attempt.phase if attempt and self._generator_request else ''
+            if attempt and self._generator_request:self.generator_note.setText(attempt.message)
+        def submit_run_intent(self,intent):
+            if not intent:return False
+            if intent.action=='run_control_macro':
+                attempt=self._run_coordinator.attempt;index=next((i for i,control in enumerate(self._native_controls) if control.get('id')==dict(intent.arguments).get('control_id')),-1)
+                if index>=0:self.native_controls.setCurrentIndex(index)
+                self._pdf_destination=attempt.request.destination;self._pdf_destination_confirmed=bool(attempt.request.destination);self.pdf_target_path.setText(attempt.request.destination);self.body_tabs.setCurrentIndex(1)
+            if self.submit(intent.action,intent.parameters()):return True
+            self._run_coordinator.failed(intent.attempt_id,intent.action,'Nie zlecono polecenia. Sprawdź stan sesji przed kolejną próbą.');self.render_run_attempt();self.update_controls();return False
+        def run_event_identity(self,snapshot):
+            attempt=self._run_coordinator.attempt
+            if not attempt:return '',''
+            job=str(snapshot.get('last_job_id') or '')
+            return str(snapshot.get('last_attempt_id') or self._run_jobs.get(job) or (attempt.attempt_id if not job or job==attempt.job_id else '')),job
+        def complete_run_attempt(self,snapshot,result):
+            attempt_id,job_id=self.run_event_identity(snapshot);action=result.get('action') or snapshot.get('last_operation') or ''
+            outputs=result.get('pdf_outputs') or {};artifact='observed' if outputs.get('files') else 'not_observed' if outputs.get('status')=='not_observed' else 'unknown'
+            self._run_coordinator.completed(attempt_id,action,job_id,artifact);self.render_run_attempt()
+        def fail_run_attempt(self,snapshot):
+            attempt_id,job_id=self.run_event_identity(snapshot)
+            self._run_coordinator.failed(attempt_id,str(snapshot.get('error_operation') or ''),str(snapshot.get('error') or ''),str(snapshot.get('error_code') or ''),job_id);self.render_run_attempt()
         def advance_patched_generator(self):
-            request=self._generator_request;stage=self._generator_stage;state=self._snapshot.get('state')
-            if not request or self._disposed or self._closing or self._command_pending or self._action_pending or self._last_prompts or state in ('starting','busy','closing'):return
-            if stage not in ('opening','reconnecting','reading_sheet'):return
-            if state!='ready' or self._snapshot.get('error') or self._snapshot.get('handoff_incomplete'):
-                self._generator_stage='needs_content' if stage=='reconnecting' else 'failed'
-                self.generator_note.setText('Nie uruchomiono generatora. '+str(self._snapshot.get('error') or 'Kopia nie jest gotowa. Sprawdź komunikaty sesji.'));return
-            if not self._native_book_id:return
-            if self.native_sheets.currentText()!=request['sheet'] and stage!='reading_sheet':
-                index=self.native_sheets.findText(request['sheet'])
-                if index>=0:
-                    self._generator_stage='reading_sheet';self.generator_note.setText('Odczytuję arkusz generatora w tej samej kopii…')
-                    if self.submit('read_range',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.itemData(index),'top':1,'left':1,'rows':30,'cols':12}):return
-                    self._generator_stage='failed';self.generator_note.setText('Nie udało się odczytać arkusza generatora. Nie uruchomiono makra.');return
+            attempt=self._run_coordinator.attempt
+            if not self._generator_request or not attempt or self._disposed or self._closing or self._command_pending or self._action_pending or self._last_prompts:return
             working=Path(self._snapshot.get('working_copy') or self.file.text())
-            matches=[(i,c) for i,c in enumerate(self._native_controls) if c.get('name')==request['control_name'] and c.get('macro_supported') and ExcelSessionWorker.vba_saved_macro(str(c.get('on_action') or c.get('macro_name') or ''),working).casefold()==ExcelSessionWorker.vba_saved_macro(request['macro'],working).casefold()]
-            if self.native_sheets.currentText()!=request['sheet'] or len(matches)!=1:
-                self._generator_stage='failed';self.generator_note.setText('Nie uruchomiono generatora: nie potwierdzono tego samego przycisku i makra w zmienionej kopii. Wybierz przycisk w arkuszu.');return
-            index,control=matches[0];self.native_controls.setCurrentIndex(index)
-            self._pdf_destination=request['destination'];self._pdf_destination_confirmed=True;self.pdf_target_path.setText(request['destination'])
-            self._generator_stage='running';self.generator_note.setText('Uruchamiam generator w zmienionej kopii. Zapis PDF zostanie potwierdzony dopiero po znalezieniu pliku.');self.body_tabs.setCurrentIndex(1)
-            if not self.submit('run_control_macro',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'control_id':control['id']}):
-                self._generator_stage='failed';self.generator_note.setText('Nie zlecono generatora. Sprawdź stan sesji przed kolejną próbą.')
+            index=self.native_sheets.findText(attempt.request.sheet);controls=tuple(ExcelRunControl(str(control.get('id') or ''),str(control.get('name') or ''),ExcelSessionWorker.vba_saved_macro(str(control.get('on_action') or control.get('macro_name') or ''),working),bool(control.get('macro_supported'))) for control in self._native_controls)
+            view=ExcelRunReadiness(str(self._snapshot.get('state') or ''),self._native_book_id,self.native_sheets.currentText(),str(self.native_sheets.currentData() or ''),str(self.native_sheets.itemData(index) or '') if index>=0 else '',ExcelSessionWorker.vba_saved_macro(attempt.request.macro,working),controls,str(self._snapshot.get('error') or ''),bool(self._snapshot.get('handoff_incomplete')))
+            intent=self._run_coordinator.advance(attempt.attempt_id,view);self.render_run_attempt()
+            if intent:self.submit_run_intent(intent)
         def available_work_area(self):
             handle=self.windowHandle();parent=self.parentWidget()
             screen=handle.screen() if self.isVisible() and handle else parent.screen() if parent else self.screen()
@@ -22757,6 +23414,124 @@ def excel_vba_patch_test_suite():
             self.assertEqual(new[-2].strip().casefold(), 'end if')
             self.assertEqual(item['new_header'], item['old_header'])
 
+        def validator_fixture(self):
+            return ('Sub GenerateDocument()\n If Not CheckDocument(False, False, False) Then Exit Sub\n ExportDocument\nEnd Sub\n'
+                    'Function CheckDocument(ByVal firstInvalid As Boolean, ByVal selectedInvalid As Boolean, ByVal lastInvalid As Boolean) As Boolean\n'
+                    ' CheckDocument = True\n If firstInvalid Then\n  CheckDocument = False\n End If\n'
+                    ' If selectedInvalid Then\n  CheckDocument = False\n  ReportSheet.Activate\n'
+                    '  ActiveWindow.ScrollRow = 1\n  ActiveWindow.ScrollRow = 1\n'
+                    '  If MsgBox("'+self.prompt+'", vbYesNo) = vbYes Then Exit Function\n End If\n'
+                    ' If lastInvalid Then\n  CheckDocument = False\n End If\nEnd Function\n')
+
+        def execute_validator_fixture(self, code, first, selected, last):
+            # Independent executable oracle for this fixture's tiny VBA subset.
+            # No COM, external calls, package mutation or application launch.
+            environment = {'firstinvalid':first, 'selectedinvalid':selected, 'lastinvalid':last, 'true':True, 'false':False}
+            lines = code[code.index('Function CheckDocument('):].splitlines()[1:-1]
+            active = [True];result = False;events = []
+            for raw in lines:
+                text = raw.split("'",1)[0].strip()
+                if not text:continue
+                if text.casefold() == 'end if':active.pop();continue
+                conditional = re.fullmatch(r'If (.+) Then(?: (Exit Function))?', text, re.I)
+                if conditional:
+                    value = False
+                    if all(active):
+                        if conditional[1].startswith('MsgBox('):events.append('question');value = False  # user answered No
+                        else:value = environment[conditional[1].casefold()]
+                    if conditional[2]:
+                        if all(active) and value:return result, events
+                    else:active.append(value)
+                    continue
+                if not all(active):continue
+                if text == 'CheckDocument = True':result = True
+                elif text == 'CheckDocument = False':result = False
+                elif text in ('ReportSheet.Activate','ActiveWindow.ScrollRow = 1'):events.append(text)
+                else:self.fail('Unknown instruction in fixture oracle: '+text)
+            self.assertEqual(active,[True])
+            return result,events
+
+        def test_selected_check_preserves_prior_and_later_failures_and_ui_operations(self):
+            code = self.validator_fixture();result = self.plan(code)
+            self.assertEqual(result['status'],'candidate');self.assertEqual(len(result['candidates']),1)
+            item = result['candidates'][0];patched = code[:item['start_offset']]+item['new_block']+code[item['end_offset']:]
+            evidence = item['semantic_evidence']
+            self.assertEqual(evidence['strategy'],'selected_validation_effect')
+            self.assertEqual(item['entry_relation'],'direct')
+            self.assertEqual(evidence['call_path'],('thisworkbook.generatedocument','thisworkbook.checkdocument'))
+            self.assertEqual(patched.count('CheckDocument = True'),code.count('CheckDocument = True'))
+            self.assertEqual(patched.count('ReportSheet.Activate'),1);self.assertEqual(patched.count('ActiveWindow.ScrollRow = 1'),2)
+            for first,selected,last in itertools.product((False,True),repeat=3):
+                with self.subTest(first=first,selected=selected,last=last):
+                    before,old_events = self.execute_validator_fixture(code,first,selected,last)
+                    after,new_events = self.execute_validator_fixture(patched,first,selected,last)
+                    self.assertEqual(before,not (first or selected or last))
+                    self.assertEqual(after,not (first or last))
+                    self.assertEqual(new_events,[event for event in old_events if event!='question'])
+            self.assertIn('False z innych kontroli',evidence['return_effect'])
+
+        def test_selected_check_does_not_invent_success_or_ignore_opaque_return_flow(self):
+            code = self.validator_fixture()
+            for changed in (code.replace(' CheckDocument = True\n',''),
+                            code.replace(' CheckDocument = True',' CheckDocument = ReadResult()'),
+                            code.replace(' CheckDocument = True',' CheckDocument = True\n On Error Resume Next'),
+                            code.replace(' CheckDocument = True',' CheckDocument = True\n UpdateResult CheckDocument'),
+                            code.replace(' If firstInvalid Then',' For index = 1 To 2\n If firstInvalid Then').replace(' If selectedInvalid Then',' Next index\n If selectedInvalid Then')):
+                with self.subTest(code=changed):self.assertFalse(self.plan(changed)['candidates'])
+
+        def test_presentation_support_never_removes_database_or_arbitrary_prefix_work(self):
+            for instruction in ('.AddNew','.Fields(0) = 4','SaveDocument','ReportSheet.Delete','ActiveWindow.ScrollRow = FetchRow()'):
+                code = self.validator_fixture().replace('  ReportSheet.Activate','  '+instruction)
+                with self.subTest(instruction=instruction):
+                    result = self.plan(code);self.assertFalse(result['candidates'])
+                    self.assertTrue(any(item.get('statement')==instruction for item in result['rejections']))
+
+        def test_msgbox_anchor_ignores_unrelated_database_literal_and_outer_ancestor(self):
+            database = ('Sub SaveRecord()\n If pending Then\n  .AddNew\n  .Fields(0) = "'+self.prompt+'"\n  MsgBox "Saved"\n End If\nEnd Sub\n')
+            result = self.plan(self.validator_fixture()+database)
+            self.assertEqual(len(result['candidates']),1)
+            self.assertFalse(any(item.get('procedure')=='SaveRecord' for item in result['rejections']))
+            code = self.code().replace('    If Len','    If pending Then\n        connection.AddNew\n    If Len').replace('    ExportDocument','    End If\n    ExportDocument')
+            result = self.plan(code);self.assertEqual(len(result['candidates']),1)
+            self.assertNotIn('connection.AddNew',result['candidates'][0]['old_block'])
+
+        def test_procedure_local_shadow_does_not_poison_unrelated_message(self):
+            code = self.code(['MsgBox "'+self.prompt+'" & Chr(13)','Exit Sub'])
+            unrelated = '\nSub OtherTask()\n Dim Chr As Object\n Dim MsgBox As Object\nEnd Sub\n'
+            self.assertEqual(self.plan(code+unrelated)['status'],'candidate')
+            self.assertFalse(self.plan(code.replace('    If','    Dim MsgBox As Object\n    If',1)+unrelated)['candidates'])
+            private = {'name':'Helpers','code':'Private Function MsgBox(ByVal text As String) As Long\nMsgBox = 6\nEnd Function\n'}
+            self.assertEqual(plan_vba_validation_patch([{'name':'ThisWorkbook','code':code},private],prompt_text=self.prompt)['status'],'candidate')
+
+        def test_statement_ir_is_immutable_and_retains_continuation_source_spans(self):
+            code = self.validator_fixture().replace('  ActiveWindow.ScrollRow = 1','  ActiveWindow.ScrollRow = _\n    1',1).replace('\n','\r\n')
+            lines,cleaned = _vba_plan_logical_lines(code)
+            program = _vba_plan_program([('ThisWorkbook',code,lines,cleaned)])
+            procedure = program[('thisworkbook','checkdocument')]
+            node = next(node for node in procedure.statements if node.text=='ActiveWindow.ScrollRow = 1')
+            self.assertEqual(code[node.start:node.end],'  ActiveWindow.ScrollRow = _\r\n    1\r\n')
+            self.assertEqual(node.end_line,node.line+1)
+            with self.assertRaises(dataclasses.FrozenInstanceError):node.text='changed'
+            item = self.plan(code)['candidates'][0]
+            self.assertIn('  ActiveWindow.ScrollRow = _\r\n    1\r\n',item['new_block'])
+
+        def test_direct_call_path_and_dynamic_dispatch_are_distinguished(self):
+            code = self.validator_fixture().replace(' If Not CheckDocument(False, False, False) Then Exit Sub',' Call ValidateAndExport')
+            code += '\nSub ValidateAndExport()\n If Not CheckDocument(False, False, False) Then Exit Sub\n Application.Run commandName\nEnd Sub\n'
+            item = self.plan(code)['candidates'][0]
+            self.assertEqual(item['entry_relation'],'transitive');self.assertEqual(len(item['semantic_evidence']['call_path']),3)
+            dynamic = self.validator_fixture().replace(' If Not CheckDocument(False, False, False) Then Exit Sub',' Application.Run "CheckDocument"')
+            item = self.plan(dynamic)['candidates'][0]
+            self.assertEqual(item['entry_relation'],'unproven');self.assertFalse(item['semantic_evidence']['call_path'])
+            shadowed = self.validator_fixture().replace('Sub GenerateDocument()','Sub GenerateDocument()\n Dim CheckDocument As Object')
+            self.assertEqual(self.plan(shadowed)['candidates'][0]['entry_relation'],'unproven')
+
+        def test_short_rejection_shows_whole_block_including_question_and_end(self):
+            code = self.validator_fixture().replace('  ReportSheet.Activate','  StoreRecord')
+            rejected = self.plan(code)['rejections'][0]
+            self.assertIn('StoreRecord',rejected['excerpt']);self.assertIn(self.prompt,rejected['excerpt'])
+            self.assertIn('End If',rejected['excerpt']);self.assertEqual(rejected['statement'],'StoreRecord')
+
         def test_sub_guard_preview_preserves_original_evaluation_body_and_other_work(self):
             code = self.code()
             result = self.plan(code)
@@ -23139,6 +23914,24 @@ End Sub'''
     return unittest.defaultTestLoader.loadTestsFromTestCase(VbaSourceTests)
 
 
+def _excel_pdf_fixture_bytes(content=b'fixture document',pages=1):
+    """Build an inert, real PDF with offsets and pages for local regression tests."""
+    if type(pages) is not int or not 0<=pages<=100:raise ValueError('fixture pages')
+    text=bytes(content).replace(b'\\',b'\\\\').replace(b'(',b'\\(').replace(b')',b'\\)').replace(b'\r',b' ').replace(b'\n',b' ')
+    page_refs=b' '.join(f'{4+index*2} 0 R'.encode() for index in range(pages))
+    objects=[b'<< /Type /Catalog /Pages 2 0 R >>',b'<< /Type /Pages /Count '+str(pages).encode()+b' /Kids ['+page_refs+b'] >>',b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>']
+    for index in range(pages):
+        objects.append(b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents '+str(5+index*2).encode()+b' 0 R >>')
+        stream=b'BT /F1 12 Tf 40 750 Td ('+text+b') Tj ET\n'
+        objects.append(b'<< /Length '+str(len(stream)).encode()+b' >>\nstream\n'+stream+b'endstream')
+    result=bytearray(b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n');offsets=[0]
+    for number,value in enumerate(objects,1):offsets.append(len(result));result.extend(str(number).encode()+b' 0 obj\n'+value+b'\nendobj\n')
+    xref=len(result);result.extend(b'xref\n0 '+str(len(offsets)).encode()+b'\n0000000000 65535 f \n')
+    for offset in offsets[1:]:result.extend(f'{offset:010d} 00000 n \n'.encode())
+    result.extend(b'trailer\n<< /Size '+str(len(offsets)).encode()+b' /Root 1 0 R >>\nstartxref\n'+str(xref).encode()+b'\n%%EOF\n')
+    return bytes(result)
+
+
 def excel_macro_pdf_test_suite():
     import unittest
     from unittest.mock import patch
@@ -23146,7 +23939,7 @@ def excel_macro_pdf_test_suite():
         def setUp(self):
             self.temporary=tempfile.TemporaryDirectory();self.addCleanup(self.temporary.cleanup);self.root=Path(self.temporary.name);self.session=self.root/'sesja żółć';self.session.mkdir()
             self.source=self.session/'Raport miesiąca.pdf';self.target=self.root/'wynik końcowy.pdf';self.target.write_bytes(b'previous destination')
-            self.pdf=b'%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n';self.source.write_bytes(self.pdf)
+            self.pdf=_excel_pdf_fixture_bytes();self.source.write_bytes(self.pdf)
             self.descriptor=self.observe()
         def observe(self,path=None):
             path=path or self.source;info=path.stat()
@@ -23158,6 +23951,89 @@ def excel_macro_pdf_test_suite():
             source_info=self.source.stat();result=self.publish()
             self.assertEqual(self.source.read_bytes(),self.pdf);self.assertEqual(self.target.read_bytes(),self.pdf);self.assertEqual(self.source.stat().st_ino,source_info.st_ino)
             self.assertEqual(result['destination'],str(self.target));self.assertEqual(result['source_path'],str(self.source));self.assertEqual(result['size'],len(self.pdf));self.assertEqual(result['sha256'],hashlib.sha256(self.pdf).hexdigest());self.assertFalse(list(self.root.glob('.*.pdf')))
+            self.assertIs(result['verified'],True);self.assertEqual(result['page_count'],1);self.assertEqual(result['verification_backend'],'pypdf')
+        def test_artifact_verification_returns_immutable_page_count_and_content_hash(self):
+            self.source.write_bytes(_excel_pdf_fixture_bytes(b'two page document',2));artifact=excel_verify_pdf_artifact(self.source)
+            self.assertIsInstance(artifact,ExcelArtifactResult);self.assertEqual(artifact.page_count,2);self.assertEqual(artifact.size,self.source.stat().st_size)
+            self.assertEqual(artifact.sha256,file_digest(self.source));self.assertEqual(artifact.path,str(self.source));self.assertEqual(artifact.verification_backend,'pypdf')
+            with self.assertRaises(dataclasses.FrozenInstanceError):artifact.page_count=9
+        def test_header_and_eof_are_only_observation_and_do_not_confirm_a_document(self):
+            observer=_ExcelPdfObserver(str(self.session/'working.xlsm'));before=observer.capture();candidate=self.session/'markers-only.pdf'
+            candidate.write_bytes(b'%PDF-1.7\n'+b'not a PDF structure '*8+b'\n%%EOF\n');observed=observer.outputs(before)
+            self.assertEqual(observed['status'],'found');self.assertEqual(len(observed['files']),1);self.assertIs(observed['files'][0]['verified'],False)
+            with self.assertRaises(UserError):self.publish(observed['files'][0])
+            self.assert_unpublished()
+        def test_observation_distinguishes_old_changed_and_new_without_claiming_verification(self):
+            observer=_ExcelPdfObserver(str(self.session/'working.xlsm'));old_bytes=self.source.read_bytes();before=observer.capture()
+            self.assertEqual(observer.outputs(before)['files'],[])
+            old_stat=self.source.stat();self.source.write_bytes(_excel_pdf_fixture_bytes(b'changed output'))
+            os.utime(self.source,ns=(old_stat.st_atime_ns,old_stat.st_mtime_ns+1000000000));created=self.session/'second.pdf';created.write_bytes(_excel_pdf_fixture_bytes(b'new output'))
+            observed=observer.outputs(before);self.assertTrue(observed['complete']);self.assertEqual({item['name'] for item in observed['files']},{self.source.name,created.name})
+            self.assertTrue(all(item['verified'] is False for item in observed['files']));self.assertNotEqual(self.source.read_bytes(),old_bytes)
+        def test_parser_refuses_zero_pages_broken_page_reference_and_false_count(self):
+            malformed=(
+                _excel_pdf_fixture_bytes(pages=0),
+                self.pdf.replace(b'/Contents 5 0 R',b'/Contents 9 0 R'),
+                self.pdf.replace(b'/F1 3 0 R',b'/F1 9 0 R'),
+                self.pdf.replace(b'/Count 1',b'/Count 2'),
+                self.pdf.replace(b'[0 0 612 792]',b'[0 0 -12 792]'))
+            for content in malformed:
+                self.source.write_bytes(content)
+                with self.subTest(content=content[:32]),self.assertRaises(UserError):self.publish(self.observe())
+                self.assert_unpublished()
+        def test_parser_checks_last_page_and_rejects_truncated_stream_even_with_eof(self):
+            two_pages=_excel_pdf_fixture_bytes(pages=2)
+            for content in (two_pages.replace(b'/Contents 7 0 R',b'/Contents 9 0 R'),self.pdf.replace(b'endstream',b'notstream')):
+                self.source.write_bytes(content)
+                with self.assertRaises(UserError):self.publish(self.observe())
+                self.assert_unpublished()
+        def test_password_protected_pdf_is_not_reported_as_readable(self):
+            from pypdf import PdfWriter
+            writer=PdfWriter();writer.add_blank_page(width=612,height=792);writer.encrypt('fixture-password')
+            with self.source.open('wb') as stream:writer.write(stream)
+            with self.assertRaises(UserError):self.publish(self.observe())
+            self.assert_unpublished()
+        def test_pdf_limits_are_context_local_and_disable_external_decoders(self):
+            from pypdf import PdfReader,get_configuration
+            original=get_configuration();seen=[]
+            def reader(*args,**kwargs):seen.append(get_configuration());return PdfReader(*args,**kwargs)
+            with patch(__name__+'._excel_pdf_reader',return_value=reader):self.publish()
+            self.assertEqual(len(seen),1);self.assertIsNone(seen[0].jbig2dec_binary);self.assertEqual(seen[0].zlib_maximum_output_length,EXCEL_PDF_MAX_STREAM)
+            self.assertEqual(seen[0].page_tree_maximum_depth,64);self.assertIs(get_configuration(),original)
+        def test_compressed_stream_exceeding_limit_is_not_expanded_without_bound_or_published(self):
+            from pypdf import PdfWriter,get_configuration
+            from pypdf.generic import DecodedStreamObject,NameObject
+            original=get_configuration();writer=PdfWriter();page=writer.add_blank_page(width=612,height=792)
+            contents=DecodedStreamObject();contents.set_data(b' '*4096);page[NameObject('/Contents')]=writer._add_object(contents.flate_encode())
+            with self.source.open('wb') as stream:writer.write(stream)
+            self.assertLess(self.source.stat().st_size,4096)
+            with patch(__name__+'.EXCEL_PDF_MAX_STREAM',1024),self.assertRaises(UserError):self.publish(self.observe())
+            self.assert_unpublished();self.assertIs(get_configuration(),original)
+        def test_unavailable_parser_never_publishes_or_uses_marker_fallback(self):
+            import builtins
+            original_import=builtins.__import__
+            def missing(name,*args,**kwargs):
+                if name=='pypdf':raise ImportError('fixture parser unavailable')
+                return original_import(name,*args,**kwargs)
+            with patch.object(builtins,'__import__',side_effect=missing),self.assertRaisesRegex(UserError,'brak biblioteki pypdf'):self.publish()
+            self.assert_unpublished()
+        def test_parse_failure_is_not_success_and_does_not_replace_previous_destination(self):
+            with patch(__name__+'.excel_verify_pdf_artifact',side_effect=UserError('fixture unreadable pages')) as verify,self.assertRaisesRegex(UserError,'unreadable pages'):self.publish()
+            self.assertEqual(verify.call_count,1);self.assertNotEqual(Path(verify.call_args.args[0]),self.source);self.assert_unpublished()
+        def test_file_changes_during_parser_are_checked_again_before_publication(self):
+            original_verify=excel_verify_pdf_artifact
+            for changed in (self.source,self.target):
+                self.source.write_bytes(self.pdf);self.descriptor=self.observe();self.target.write_bytes(b'previous destination')
+                def verify(*args,**kwargs):
+                    artifact=original_verify(*args,**kwargs);changed.write_bytes(b'concurrently changed file');return artifact
+                with patch(__name__+'.excel_verify_pdf_artifact',side_effect=verify),self.assertRaises(UserError):self.publish()
+                self.assertEqual(self.target.read_bytes(),b'concurrently changed file' if changed==self.target else b'previous destination');self.assertFalse(list(self.root.glob('.*.pdf')))
+        def test_cancellation_after_parsing_never_replaces_destination(self):
+            original_verify=excel_verify_pdf_artifact;cancelled=threading.Event()
+            def verify(*args,**kwargs):
+                artifact=original_verify(*args,**kwargs);cancelled.set();return artifact
+            with patch(__name__+'.excel_verify_pdf_artifact',side_effect=verify),self.assertRaises(Cancelled):self.publish(cancelled=cancelled)
+            self.assert_unpublished()
         def test_creates_new_destination_with_uppercase_pdf_extension(self):
             target=self.root/'nowy dokument.PDF';result=self.publish(target=target)
             self.assertEqual(target.read_bytes(),self.pdf);self.assertEqual(result['path'],str(target));self.assertEqual(self.source.read_bytes(),self.pdf)
@@ -23282,11 +24158,12 @@ for line in sys.stdin:
  if action=='run_macro' and command['name']=='Fail':send('error',id=command['id'],operation=action,message='synthetic macro failure');continue
  if action=='run_macro' and command['name']=='WriteOutput':pathlib.Path('macro-output.txt').write_text('durable result',encoding='utf-8')
  if action=='export_pdf':
-  with open(command['temp_path'],'wb') as f:f.write(b'%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n')
+  with open(command['temp_path'],'wb') as f:f.write(__PDF_FIXTURE__)
  if action in ('save_copy','save_working'):shutil.copyfile(original,command['temp_path'])
  send('done',id=command['id'],operation=action,result=result(command))
 send('closed')
 '''
+    fake_processor=fake_processor.replace('__PDF_FIXTURE__',repr(_excel_pdf_fixture_bytes()))
     class ExcelSessionTests(unittest.TestCase):
         def setUp(self):
             self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name);self.original=self.root/"Dane 'żółć'.xlsm";self.private=self.root/'private'
@@ -23670,6 +24547,37 @@ send('closed')
                 'line':42,'end_line':44,'block_line':40,'block_end_line':50}
             analysis={'modules':3,'procedures':5,'blocks':17,'matched_blocks':1,'candidates':0,'rejections':1,'complete':True}
             return self.patch_report(controller,**dict({'status':'unsupported','candidates':[],'rejections':[rejection],'analysis':analysis},**values))
+        def test_attempt_identity_rejects_stale_or_wrong_operation_without_replaying(self):
+            controller=self.start();attempt='a'*32
+            with patch.object(controller,'_send') as send:
+                jid=controller.submit('run_macro',{'name':'GenerateDocument','attempt_id':attempt});controller.dispatcher.join(2)
+                self.assertEqual(send.call_args.args[0]['attempt_id'],attempt)
+                event={'session_id':controller.session_id,'event':'done','id':jid,'operation':'run_macro','attempt_id':attempt,'result':{'macro_outcome':'returned'}}
+                controller._consume(dict(event,attempt_id='b'*32));self.assertEqual(controller.poll()['state'],'busy')
+                controller._consume(dict(event,operation='read_range'));self.assertEqual(controller.poll()['state'],'busy')
+                controller._consume(event);state=controller.poll()
+                self.assertEqual((state['last_attempt_id'],state['last_job_id']),(attempt,jid));self.assertEqual(state['attempt_id'],'')
+                self.assertEqual(state['events'][-1]['attempt_id'],attempt);self.assertEqual(send.call_count,1)
+                newer=controller.submit('run_macro',{'name':'GenerateDocument','attempt_id':'c'*32});controller.dispatcher.join(2)
+                controller._consume(event);self.assertEqual(controller.poll()['job_id'],newer)
+                self.finish_vba_command(controller,newer,'run_macro');self.assertEqual(controller.poll()['last_attempt_id'],'c'*32)
+        def test_attempt_identity_validation_precedes_dispatch(self):
+            controller=self.start()
+            with patch.object(controller,'_send') as send:
+                for value in (None,True,'bad','A'*32,'a'*33):
+                    with self.subTest(value=value),self.assertRaises(UserError):controller.submit('run_macro',{'name':'GenerateDocument','attempt_id':value})
+                self.assertEqual(controller.poll()['state'],'ready');send.assert_not_called()
+        def test_semantic_evidence_is_private_bounded_and_preserved(self):
+            controller=self.start()
+            with patch.object(controller,'_send'):
+                jid=controller.submit('prepare_vba_patch',{'prompt_text':'Question'});controller.dispatcher.join(2);report=self.patch_report(controller)
+                evidence={'strategy':'selected_validation_effect','preserved_lines':[5,6],'neutralized_lines':[4,7],'return_effect':'Preserves previous result','call_path':['ThisWorkbook.GenerateDocument','ThisWorkbook.Validate'],'unresolved_calls':[]}
+                report['candidates'][0]['semantic_evidence']=evidence
+                invalid=clone(report);invalid['candidates'][0]['semantic_evidence']['neutralized_lines']=[True]
+                controller._accept_vba_patch(invalid,jid);self.assertFalse(controller.poll()['vba_patch'])
+                self.finish_vba_command(controller,jid,'prepare_vba_patch',{'vba_patch':report});state=controller.poll()
+                self.assertEqual(state['vba_patch']['candidates'][0]['semantic_evidence'],evidence)
+                self.assertNotIn('semantic_evidence',dumps(state['events']));self.assertNotIn('semantic_evidence',dumps(state['last_result']))
         def test_vba_patch_commands_validate_and_forward_only_data_for_one_operation(self):
             controller=self.start()
             with patch.object(controller,'_send') as send:
@@ -24395,7 +25303,7 @@ send('closed')
             self.assertEqual(event['event'],'done',event);self.assertEqual(event['result']['source_mode'],'saved_file');self.assertEqual(event['result']['action'],'prepare_vba_patch');return event['result']['vba_patch']
         def test_vba_saved_patch_prepare_and_apply_never_dereference_office(self):
             companion=self.path.parent/'known.csv';companion.write_bytes(b'reference data');original=self.offline_patch_fixture([companion.name]);before=self.path.read_bytes();original_before=original.read_bytes()
-            plan=self.prepared_saved_patch();snapshot=Path(self.worker.vba_patch_plan['snapshot']);self.assertEqual(snapshot.read_bytes(),before);self.assertFalse(self.copy_events)
+            plan=self.prepared_saved_patch();snapshot=Path(self.worker.vba_patch_plan.source.path);self.assertEqual(snapshot.read_bytes(),before);self.assertFalse(self.copy_events)
             self.assertEqual(plan['source_mode'],'saved_file');self.assertEqual(plan['file_sha256'],file_digest(self.path));self.assertTrue(plan['saved_source_mtime']);self.assertIn('niezapisane',plan['source_note']);self.assertEqual(len(plan['candidates']),1)
             event=self.session_command('apply_vba_patch',source_mode='saved_file',token=plan['token'],candidate_id=plan['candidates'][0]['id']);self.assertEqual(event['event'],'done',event)
             output=event['result']['vba_patch_applied'];self.assertEqual(output['source_mode'],'saved_file');self.assertEqual(Path(output['path']).parent.joinpath(companion.name).read_bytes(),companion.read_bytes());self.assertEqual(original.read_bytes(),original_before);self.assertEqual(self.path.read_bytes(),before);self.assertFalse(output['verified'])
@@ -24404,7 +25312,7 @@ send('closed')
             event=self.session_command('prepare_vba_patch',prompt_text='Question',source_mode='saved_file');self.assertEqual(event['event'],'error');self.assertIsNone(self.worker.vba_patch_plan);self.assertFalse(self.copy_events);self.assertNotIn('File-only patch touched Office',event['details'])
         def test_vba_saved_patch_rejects_other_workbook_and_source_mode_mismatch(self):
             self.offline_patch_fixture();event=self.session_command('prepare_vba_patch',prompt_text='Question',macro_name="'foreign.xlsm'!Generate",source_mode='saved_file');self.assertEqual(event['event'],'error');self.assertFalse(self.copy_events)
-            plan=self.prepared_saved_patch();self.worker.vba_patch_plan['source_mode']='live'
+            plan=self.prepared_saved_patch();self.worker.vba_patch_plan=dataclasses.replace(self.worker.vba_patch_plan,source=dataclasses.replace(self.worker.vba_patch_plan.source,source_mode='live'))
             event=self.session_command('apply_vba_patch',source_mode='saved_file',token=plan['token'],candidate_id=plan['candidates'][0]['id']);self.assertEqual(event['event'],'error');self.assertFalse(self.patch_calls)
         def test_vba_saved_patch_refuses_original_alias_and_changed_saved_bytes(self):
             original=self.offline_patch_fixture();working=self.worker.working_copy;self.worker.working_copy=str(original)
@@ -24415,11 +25323,11 @@ send('closed')
             with patch(__name__+'.excel_copy_workbook',side_effect=race):event=self.session_command('prepare_vba_patch',prompt_text='Question',source_mode='saved_file')
             self.assertEqual(event['event'],'error');self.assertIn('zmieniła',event['message']);self.assertIsNone(self.worker.vba_patch_plan)
         def test_vba_saved_patch_keeps_frozen_snapshot_after_later_saved_file_changes(self):
-            self.offline_patch_fixture();plan=self.prepared_saved_patch();snapshot=Path(self.worker.vba_patch_plan['snapshot']);frozen=snapshot.read_bytes();self.path.write_bytes(b'new saved version after review')
+            self.offline_patch_fixture();plan=self.prepared_saved_patch();snapshot=Path(self.worker.vba_patch_plan.source.path);frozen=snapshot.read_bytes();self.path.write_bytes(b'new saved version after review')
             event=self.session_command('apply_vba_patch',source_mode='saved_file',token=plan['token'],candidate_id=plan['candidates'][0]['id']);self.assertEqual(event['event'],'done',event);self.assertEqual(snapshot.read_bytes(),frozen);self.assertEqual(self.path.read_bytes(),b'new saved version after review');self.assertEqual(event['result']['vba_patch_applied']['saved_source_mtime'],plan['saved_source_mtime'])
         def test_prepare_vba_patch_captures_copy_without_saving_or_changing_live_workbook(self):
             original=self.patch_fixture();original_bytes=original.read_bytes();working_bytes=self.path.read_bytes();self.excel.EnableEvents=False;self.excel.DisplayAlerts=False;self.excel.AutomationSecurity=3
-            plan=self.prepared_patch();snapshot=Path(self.worker.vba_patch_plan['snapshot'])
+            plan=self.prepared_patch();snapshot=Path(self.worker.vba_patch_plan.source.path)
             self.assertEqual(snapshot.name,self.path.name);self.assertEqual(snapshot.parent.name,'base');self.assertTrue(snapshot.is_relative_to(self.path.parent));self.assertNotEqual(snapshot,self.path)
             self.assertEqual(self.copy_events,[False]);self.assertFalse(self.excel.EnableEvents);self.assertFalse(self.excel.DisplayAlerts);self.assertEqual(self.excel.AutomationSecurity,3)
             self.assertEqual(original.read_bytes(),original_bytes);self.assertEqual(self.path.read_bytes(),working_bytes);self.assertFalse(self.book.Saved)
@@ -24433,11 +25341,30 @@ send('closed')
             self.assertEqual((output.parent/selected.name).read_bytes(),selected.read_bytes());self.assertFalse((output.parent/unknown.name).exists());self.assertEqual(result['companion_paths'],[str(output.parent/selected.name)])
             self.assertEqual(original.read_bytes(),before);self.assertEqual(self.path.read_bytes(),working_before);self.assertEqual(len(self.patch_calls),1);self.assertFalse(any(name in ('Run','Quit','Close') for name,_ in self.excel.calls+self.book.calls))
             repeated=self.session_command('apply_vba_patch',token=plan['token'],candidate_id=candidate['id']);self.assertEqual(repeated['event'],'error');self.assertEqual(len(self.patch_calls),1)
+        def test_prepared_vba_plan_and_source_are_immutable(self):
+            self.patch_fixture();self.prepared_patch();plan=self.worker.vba_patch_plan
+            with self.assertRaises(dataclasses.FrozenInstanceError):plan.revision=999
+            with self.assertRaises(dataclasses.FrozenInstanceError):plan.source.sha256='a'*64
+            with self.assertRaises(dataclasses.FrozenInstanceError):plan.candidates[0].new_source='Sub Modified()\nEnd Sub'
+            self.assertIsInstance(plan.candidates,tuple);self.assertIsInstance(plan.companions,tuple)
+        def test_source_snapshot_rejects_changed_read_hash_without_applicable_plan(self):
+            self.patch_fixture()
+            with patch(__name__+'.excel_vba_package_read',return_value={'status':'available','modules':[],'file_sha256':'a'*64}):
+                event=self.session_command('prepare_vba_patch',prompt_text='Question')
+            self.assertEqual(event['event'],'error');self.assertIsNone(self.worker.vba_patch_plan);self.assertFalse(self.patch_calls)
+        def test_worker_attempt_echo_and_macro_outcome_are_independent_from_pdf(self):
+            self.worker.open_workbook(self.open_request());self.excel.handlers['Run']=lambda *_:None;attempt='a'*32
+            event=self.session_command('run_macro',name='Generate',attempt_id=attempt)
+            self.assertEqual(event['attempt_id'],attempt);self.assertEqual(event['result']['macro_outcome'],'returned')
+            self.assertEqual(event['result']['pdf_outputs']['files'],[])
+            calls=len([name for name,_ in self.excel.calls if name=='Run'])
+            event=self.session_command('run_macro',name='Generate',attempt_id='invalid')
+            self.assertEqual(event['event'],'error');self.assertEqual(len([name for name,_ in self.excel.calls if name=='Run']),calls)
         def test_vba_patch_rejects_stale_tokens_tampered_snapshot_and_changed_revision(self):
             self.patch_fixture();first=self.prepared_patch();second=self.prepared_patch()
             event=self.session_command('apply_vba_patch',token=first['token'],candidate_id=first['candidates'][0]['id']);self.assertEqual(event['event'],'error');self.assertFalse(self.patch_calls)
             self.worker.revision+=1;event=self.session_command('apply_vba_patch',token=second['token'],candidate_id=second['candidates'][0]['id']);self.assertEqual(event['event'],'error');self.assertFalse(self.patch_calls)
-            latest=self.prepared_patch();Path(self.worker.vba_patch_plan['snapshot']).write_bytes(b'tampered snapshot')
+            latest=self.prepared_patch();Path(self.worker.vba_patch_plan.source.path).write_bytes(b'tampered snapshot')
             event=self.session_command('apply_vba_patch',token=latest['token'],candidate_id=latest['candidates'][0]['id']);self.assertEqual(event['event'],'error');self.assertFalse(self.patch_calls)
         def test_vba_patch_savecopy_or_zone_failure_restores_events_and_cannot_apply(self):
             self.patch_fixture();self.excel.EnableEvents=True
@@ -26196,7 +27123,7 @@ def dependency_restart_test_suite():
             with patch('importlib.util.find_spec',side_effect=ModuleNotFoundError('missing',name='firebird')):
                 self.assertEqual(dependency_status('firebird')['state'],'missing')
         def test_excel_discovery_checks_both_com_packages_without_importing_office(self):
-            for missing in ('pythoncom','win32com'):
+            for missing in ('pythoncom','win32com','pypdf'):
                 with self.subTest(module=missing),patch('importlib.util.find_spec',side_effect=lambda name:None if name==missing else object()),patch.object(subprocess,'Popen') as launch:
                     problem=dependency_status('excel');launch.assert_not_called()
                 self.assertEqual(problem['state'],'missing');self.assertEqual(problem['profile'],'excel')
