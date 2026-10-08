@@ -4820,11 +4820,12 @@ class _ExcelWorkbookRebound(UserError):
 def excel_connection_lost(exc):
     """Recognize disconnect HRESULTs independently of Office's display language."""
     if isinstance(exc,_ExcelDisconnected):return True
-    codes={0x800401FD,0x80010108,0x80010007,0x80010012,0x800706BA,0x800706BE}
+    codes={0x800401FD,0x80010108,0x80010007,0x80010012,0x800706BA,0x800706BE,0x800706E6}
     info=getattr(exc,'excepinfo',None);args=getattr(exc,'args',())
-    values=(getattr(exc,'hresult',None),info[-1] if isinstance(info,(tuple,list)) and info else None,args[0] if args else None)
+    nested=args[2] if len(args)>2 and isinstance(args[2],(tuple,list)) else ()
+    values=(getattr(exc,'hresult',None),info[-1] if isinstance(info,(tuple,list)) and info else None,args[0] if args else None,nested[-1] if nested else None)
     if any(type(value) is int and value&0xffffffff in codes for value in values):return True
-    return bool(re.search(r'0x(?:800401FD|80010108|80010007|80010012|800706BA|800706BE)\b|\b(?:CO_E_OBJNOTCONNECTED|RPC_E_DISCONNECTED|RPC_E_SERVER_DIED(?:_DNE)?)\b',str(exc),re.IGNORECASE))
+    return bool(re.search(r'0x(?:800401FD|80010108|80010007|80010012|800706BA|800706BE|800706E6)\b|\b(?:CO_E_OBJNOTCONNECTED|RPC_E_DISCONNECTED|RPC_E_SERVER_DIED(?:_DNE)?|RPC_S_INTERNAL_ERROR)\b',str(exc),re.IGNORECASE))
 
 
 def excel_worker_error_fields(exc,operation='',macro_name='',diagnostics=None):
@@ -6232,20 +6233,38 @@ class ExcelSessionWorker:
             # Force a server roundtrip before replacing any cached identities.
             str(matches[0].Name);int(matches[0].Worksheets.Count)
             return matches[0]
+        def snapshot(application,book):
+            # Rebuilding the sheet/control snapshot is part of reconnecting:
+            # a proxy can fail later than Workbooks or FullName. Publish fresh
+            # identities only after that read succeeds; never restore a token
+            # for a VBA proposal prepared against an older connection.
+            previous=(self.excel,self.book,self.sheet_refs,self.control_refs,self.revision)
+            self.excel=application;self.book=book;self.sheet_refs={};self.control_refs={};self.vba_patch_plan=None;self.revision+=1
+            try:return self.connection_snapshot()
+            except Exception:
+                self.excel,self.book,self.sheet_refs,self.control_refs,self.revision=previous
+                raise
+        stage='cached_workbook';initial_error='';native_attempted=False
         try:
-            try:book=find_book(application)
+            try:
+                book=find_book(application);stage='cached_snapshot'
+                result=snapshot(application,book)
             except Exception as exc:
                 if isinstance(exc,_ExcelDisconnected) or not excel_connection_lost(exc):raise
-                # The application proxy can die too (for example when Office
-                # reloads a document after Enable Content). Reusing Workbooks
-                # on that proxy cannot reconnect; obtain a fresh native proxy.
+                # Reacquire once from the retained process's native window.
+                # Only these reads are repeated, never the interrupted command.
+                initial_error=excel_worker_error_text(exc)[:1200];native_attempted=True;stage='native_application'
                 application=excel_native_application(self.pythoncom,self.owned_process)
-                book=find_book(application)
-        except _ExcelDisconnected:raise
-        except Exception as exc:raise _ExcelDisconnected('Nie udało się odczytać istniejącej sesji. '+excel_worker_error_text(exc)) from exc
-        self.excel=application;self.book=book;self.sheet_refs.clear();self.control_refs.clear();self.vba_patch_plan=None;self.revision+=1
-        try:return self.connection_snapshot()
-        except Exception as exc:raise _ExcelDisconnected('Połączenie nie zostało potwierdzone po odświeżeniu obiektu skoroszytu. '+excel_worker_error_text(exc)) from exc
+                stage='native_workbook';book=find_book(application)
+                stage='native_snapshot';result=snapshot(application,book)
+            result['recovery_method']='native_window' if native_attempted else 'cached_application'
+            return result
+        except Exception as exc:
+            message=str(exc) if isinstance(exc,_ExcelDisconnected) else 'Nie udało się odczytać istniejącej sesji. '+excel_worker_error_text(exc)
+            error=_ExcelDisconnected(message)
+            error.recovery={'stage':stage,'native_refresh_attempted':native_attempted}
+            if initial_error:error.recovery['initial_error']=initial_error
+            raise error from exc
     def connection_snapshot(self):
         result=self.session_info();result.update(workbook_rebound=True,controls_invalidated=True)
         try:result['snapshot']=self.read_range({})
@@ -6401,6 +6420,7 @@ class ExcelSessionWorker:
     def error_fields(self,exc,operation='',macro_name='',context=None):
         diagnostics=dict(context or {})
         if self.working_copy:diagnostics.update(working_copy=self.working_copy,open_events_enabled=self.open_events_enabled)
+        if isinstance(getattr(exc,'recovery',None),dict):diagnostics['recovery']=exc.recovery
         # A rejected call must not trigger more Office calls (or another wait).
         if not excel_connection_lost(exc) and not isinstance(exc,_ExcelWorkbookRebound) and not re.search(r'0x800AC472|0x8001010A|0x80010001',excel_worker_error_text(exc),re.IGNORECASE):
             with contextlib.suppress(Exception):diagnostics['protected_view']=bool(self.excel.ProtectedViewWindows.Count)
@@ -6759,7 +6779,11 @@ class ExcelSessionWorker:
                 extra.update(self.save_session())
             else:raise UserError('Unsupported session action.')
             if not isolated:self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
-            result={'workbook_id':self.workbook_id,'file_only':True,'source_mode':'saved_file','action':action} if file_only else self.session_info();result.update(extra);self.send('done',id=identity,operation=action,result=result)
+            # Reconnect already read and validated the complete session. A
+            # second COM read could fail after success and discard that result.
+            result=({'workbook_id':self.workbook_id,'file_only':True,'source_mode':'saved_file','action':action} if file_only
+                    else {} if action=='reconnect_workbook' else self.session_info())
+            result.update(extra);self.send('done',id=identity,operation=action,result=result)
         except Exception as exc:
             if action not in ('inspect_vba','prepare_vba_patch','apply_vba_patch','reconnect_workbook') and not excel_connection_lost(exc) and not isinstance(exc,_ExcelWorkbookRebound):
                 with contextlib.suppress(Exception):self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
@@ -23196,12 +23220,24 @@ send('closed')
             self.excel.handlers['Run']=lambda *_:None
             return {'session_id':'fixture','workbook_id':'fixture-book','id':'connection-test'}
         def test_disconnect_hresult_is_not_a_macro_validation_or_busy_error(self):
-            for code in (0x800401FD,0x80010108,0x80010007,0x80010012,0x800706BA,0x800706BE):
+            for code in (0x800401FD,0x80010108,0x80010007,0x80010012,0x800706BA,0x800706BE,0x800706E6):
                 with self.subTest(code=hex(code)):
                     error=excel_worker_error_fields(self.lost_com(code),'run_control_macro','ThisWorkbook.GenerateDocument',{'protected_view':True})
                     self.assertEqual(error['code'],'excel_disconnected');self.assertIn('Połącz ponownie',error['message']);self.assertNotIn('Application.Caller',error['message'])
             self.assertFalse(excel_connection_lost(self.lost_com(0x800A03EC)));self.assertFalse(excel_connection_lost(self.lost_com(0x8001010A)))
             self.assertTrue(excel_connection_lost(RuntimeError(-2147220995,'localized',None,None)))
+        def test_rpc_internal_error_is_recognized_from_all_com_exception_shapes(self):
+            code=0x800706E6;signed=code-2**32
+            info=(0,'Microsoft Excel','Zdalna procedura nie powiodła się',None,0,signed)
+            wrapped=RuntimeError('Localized outer COM exception');wrapped.hresult=0x80020009-2**32;wrapped.excepinfo=info
+            errors=[self.lost_com(code),RuntimeError(code,'localized'),RuntimeError(signed,'localized'),wrapped,
+                RuntimeError(0x80020009-2**32,'localized',info,None),RuntimeError('Exception from HRESULT: 0x800706E6'),RuntimeError('RPC_S_INTERNAL_ERROR')]
+            for error in errors:
+                with self.subTest(error=str(error)):
+                    self.assertTrue(excel_connection_lost(error))
+                    fields=excel_worker_error_fields(error,'reconnect_workbook')
+                    self.assertEqual(fields['code'],'excel_disconnected')
+                    self.assertNotIn('Application.Caller',fields['message'])
         def test_stale_workbook_preflight_rebinds_exact_copy_but_never_replays_requested_macro(self):
             command=self.connection_ready();old_sid=self.worker.sheet_id(self.sheet);self.worker.control_refs['old-control']={'shape':object()};self.worker.vba_patch_plan={'token':'old'}
             self.worker.book=self.disconnected_book();self.excel.EnableEvents=False;self.excel.DisplayAlerts=False
@@ -23253,6 +23289,80 @@ send('closed')
             native.assert_called_once_with(self.worker.pythoncom,owned)
             result=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(result['code'],'workbook_reloaded');self.assertIs(self.worker.excel,self.excel);self.assertIs(self.worker.book,self.book)
             self.assertFalse(self.worker.control_refs);self.assertFalse(self.excel.EnableEvents);self.assertFalse(self.excel.DisplayAlerts);self.assertFalse(any(name in ('Run','Quit') for name,_ in self.excel.calls));self.assertEqual(len(self.open_calls),1)
+        def test_rpc_internal_error_refreshes_native_application_without_replaying_macro(self):
+            command=self.connection_ready();self.worker.excel=self.dead_application(self.lost_com(0x800706E6));self.worker.book=self.disconnected_book()
+            owned=object();self.worker.owned_process=owned
+            with patch(__name__+'.excel_native_application',return_value=self.excel) as native,patch.object(self.worker,'read_range',return_value={'controls':[]}):
+                self.worker.handle_command(dict(command,action='run_macro',name='GenerateDocument'))
+            native.assert_called_once_with(self.worker.pythoncom,owned)
+            event=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(event['code'],'workbook_reloaded')
+            self.assertIs(self.worker.excel,self.excel);self.assertIs(self.worker.book,self.book)
+            self.assertFalse(any(name in ('Run','Quit') for name,_ in self.excel.calls));self.assertEqual(len(self.open_calls),1)
+        def test_rpc_internal_error_during_cached_book_lookup_uses_one_native_refresh(self):
+            command=self.connection_ready();rpc=self.lost_com(0x800706E6);real_book=self.book
+            class BrokenCollection(FakeCollection):
+                def __iter__(inner):raise rpc
+            class BrokenSheets(FakeCollection):
+                @property
+                def Count(inner):raise rpc
+            class StaleBook:
+                def __init__(inner,stage):inner.stage=stage
+                def __getattr__(inner,name):
+                    if name==inner.stage:raise rpc
+                    if name=='Worksheets' and inner.stage=='Worksheets.Count':return BrokenSheets([self.sheet])
+                    return getattr(real_book,name)
+            for stage in ('Workbooks','enumerator','FullName','Name','Worksheets.Count'):
+                with self.subTest(stage=stage):
+                    stale_book=StaleBook(stage)
+                    cached=self.dead_application(rpc) if stage=='Workbooks' else FakeCom(Workbooks=BrokenCollection() if stage=='enumerator' else FakeCollection([stale_book]))
+                    self.worker.excel=cached;self.worker.book=stale_book;self.worker.owned_process=object()
+                    with patch(__name__+'.excel_native_application',return_value=self.excel) as native,patch.object(self.worker,'read_range',return_value={'controls':[]}):
+                        self.worker.handle_command(dict(command,id='reconnect-'+stage,action='reconnect_workbook'))
+                    native.assert_called_once_with(self.worker.pythoncom,self.worker.owned_process)
+                    event=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(event['event'],'done')
+                    self.assertTrue(event['result']['workbook_rebound']);self.assertIs(self.worker.excel,self.excel);self.assertIs(self.worker.book,self.book)
+            self.assertEqual(len(self.open_calls),1);self.assertFalse(any(name in ('Run','Quit') for name,_ in self.excel.calls))
+        def test_rpc_during_cached_metadata_or_viewport_restarts_snapshot_from_fresh_native_proxy(self):
+            command=self.connection_ready();rpc=self.lost_com(0x800706E6);real_info=self.worker.session_info
+            for stage in ('session_info','read_range'):
+                with self.subTest(stage=stage):
+                    cached=FakeCom(**{key:value for key,value in self.excel.__dict__.items() if key not in ('calls','handlers')})
+                    self.worker.excel=cached;self.worker.book=self.book;self.worker.owned_process=object();visits=[]
+                    def information():
+                        visits.append(('info',self.worker.excel))
+                        if stage=='session_info' and self.worker.excel is cached:raise rpc
+                        return real_info()
+                    def viewport(_):
+                        visits.append(('range',self.worker.excel))
+                        if stage=='read_range' and self.worker.excel is cached:raise rpc
+                        return {'controls':[],'sheet_id':'fresh-native-sheet'}
+                    with patch(__name__+'.excel_native_application',return_value=self.excel) as native,patch.object(self.worker,'session_info',side_effect=information),patch.object(self.worker,'read_range',side_effect=viewport):
+                        self.worker.handle_command(dict(command,id='snapshot-'+stage,action='reconnect_workbook'))
+                    native.assert_called_once_with(self.worker.pythoncom,self.worker.owned_process)
+                    event=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(event['event'],'done')
+                    self.assertEqual(event['result']['snapshot']['sheet_id'],'fresh-native-sheet')
+                    self.assertEqual(len([kind for kind,application in visits if kind=='info' and application is self.excel]),1)
+                    self.assertIs(self.worker.excel,self.excel);self.assertIs(self.worker.book,self.book)
+            self.assertFalse(any(name in ('Run','Quit') for name,_ in self.excel.calls));self.assertEqual(len(self.open_calls),1)
+        def test_successful_reconnect_reuses_confirmed_snapshot_without_second_metadata_roundtrip(self):
+            command=self.connection_ready();real_info=self.worker.session_info;reads=[]
+            def information():
+                reads.append('session_info')
+                if len(reads)>1:raise self.lost_com(0x800706E6)
+                return real_info()
+            with patch.object(self.worker,'session_info',side_effect=information),patch.object(self.worker,'read_range',return_value={'controls':[]}) as viewport,patch(__name__+'.excel_native_application') as native:
+                self.worker.handle_command(dict(command,action='reconnect_workbook'))
+            event=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(event['event'],'done')
+            self.assertEqual(reads,['session_info']);viewport.assert_called_once();native.assert_not_called()
+            self.assertEqual(event['result']['action'],'reconnect_workbook');self.assertTrue(event['result']['workbook_rebound'])
+        def test_fresh_native_rpc_failure_stops_after_one_attempt_and_preserves_old_references(self):
+            command=self.connection_ready();cached=self.dead_application(self.lost_com(0x800706E6));old_book=self.disconnected_book()
+            self.worker.excel=cached;self.worker.book=old_book;self.worker.owned_process=object();fresh=self.dead_application(self.lost_com(0x800706E6))
+            with patch(__name__+'.excel_native_application',return_value=fresh) as native:
+                self.worker.handle_command(dict(command,action='reconnect_workbook'))
+            native.assert_called_once();event=json.loads(self.output.getvalue().splitlines()[-1]);self.assertEqual(event['code'],'excel_disconnected')
+            self.assertIs(self.worker.excel,cached);self.assertIs(self.worker.book,old_book)
+            self.assertFalse(any(name in ('Run','Quit') for name,_ in self.excel.calls));self.assertEqual(len(self.open_calls),1)
         def test_reconnect_does_not_refresh_application_for_busy_or_mismatched_workbook(self):
             self.connection_ready()
             for replacement in (self.dead_application(self.lost_com(0x8001010A)),self.excel):
