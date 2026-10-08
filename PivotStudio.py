@@ -4645,12 +4645,97 @@ def excel_worker_error_fields(exc,operation='',macro_name='',diagnostics=None):
     return result
 
 
+class _ExcelPdfObserver:
+    """Bounded observations in the session directory, never proof of VBA success."""
+    MAX_ENTRIES=2048;MAX_PDFS=128;MAX_RESULTS=64;MAX_RESULT_BYTES=512*1024;MAX_SIZE=128*1024*1024;TIME_LIMIT=.25
+    def __init__(self,working_copy):
+        path=Path(working_copy) if working_copy else None
+        self.scope=str(path.parent) if path is not None and path.is_absolute() else ''
+        self.pending=None
+    @staticmethod
+    def _linked(details):
+        import stat
+        return stat.S_ISLNK(details.st_mode) or bool(getattr(details,'st_file_attributes',0)&0x400)
+    @classmethod
+    def _directory(cls,path):
+        import stat
+        for part in (path,*path.parents):
+            details=part.lstat()
+            if cls._linked(details) or not stat.S_ISDIR(details.st_mode):raise OSError('Session directory is not a plain directory.')
+        return path.lstat()
+    @staticmethod
+    def _signature(details):
+        return (details.st_dev,details.st_ino,details.st_size,details.st_mtime_ns)
+    @classmethod
+    def _verify_pdf(cls,path,expected):
+        import stat
+        cls._directory(path.parent)
+        details=path.lstat()
+        if cls._linked(details) or not stat.S_ISREG(details.st_mode) or cls._signature(details)!=expected:raise OSError('PDF changed before inspection.')
+        if not 20<=details.st_size<=cls.MAX_SIZE:raise OSError('PDF size outside inspection limit.')
+        flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)
+        with os.fdopen(os.open(path,flags),'rb') as stream:
+            opened=os.fstat(stream.fileno());current=path.lstat()
+            if not stat.S_ISREG(opened.st_mode) or cls._linked(current) or cls._signature(opened)!=expected or cls._signature(current)!=expected:raise OSError('PDF identity changed before inspection.')
+            head=stream.read(1024);stream.seek(max(0,opened.st_size-2048));tail=stream.read(2048)
+            current=path.lstat();cls._directory(path.parent)
+            if cls._linked(current) or cls._signature(os.fstat(stream.fileno()))!=expected or cls._signature(current)!=expected:raise OSError('PDF changed during inspection.')
+        if not re.search(br'%PDF-[12]\.\d(?:\r\n|\r|\n)',head) or not re.search(br'%%EOF[\x00\t\n\f\r ]*\Z',tail):raise OSError('PDF header or final marker is missing.')
+        return {'path':str(path),'name':path.name,'size':opened.st_size,'mtime_ns':opened.st_mtime_ns,'device':opened.st_dev,'inode':opened.st_ino}
+    def _scan(self,before=None):
+        import stat
+        result={'entries':{},'files':[],'complete':True,'directory':None};deadline=time.monotonic()+self.TIME_LIMIT;result_bytes=0
+        if not self.scope:raise OSError('No session directory to inspect.')
+        root=Path(self.scope);directory=self._directory(root);result['directory']=(directory.st_dev,directory.st_ino)
+        if before is not None and before.get('directory')!=result['directory']:raise OSError('Session directory identity changed.')
+        with os.scandir(root) as entries:
+            for count,entry in enumerate(entries):
+                if count>=self.MAX_ENTRIES or time.monotonic()>=deadline:result['complete']=False;break
+                if not entry.name.lower().endswith('.pdf'):continue
+                if len(result['entries'])>=self.MAX_PDFS:result['complete']=False;break
+                try:
+                    details=entry.stat(follow_symlinks=False)
+                    if self._linked(details):result['complete']=False;continue
+                    if not stat.S_ISREG(details.st_mode):continue
+                    # Windows DirEntry metadata may leave st_dev/st_ino as zero.
+                    details=(root/entry.name).lstat()
+                    if self._linked(details) or not stat.S_ISREG(details.st_mode):result['complete']=False;continue
+                    signature=self._signature(details);result['entries'][entry.name]=signature
+                    if before is None or before.get('entries',{}).get(entry.name)==signature:continue
+                    if entry.name not in before.get('entries',{}) and not before.get('complete'):result['complete']=False;continue
+                    if len(result['files'])>=self.MAX_RESULTS:result['complete']=False;continue
+                    descriptor=self._verify_pdf(root/entry.name,signature);cost=len(dumps(descriptor).encode('utf-8'))
+                    if result_bytes+cost>self.MAX_RESULT_BYTES:result['complete']=False;continue
+                    result['files'].append(descriptor);result_bytes+=cost
+                except (OSError,ValueError):result['complete']=False
+        current=self._directory(root)
+        if (current.st_dev,current.st_ino)!=result['directory']:raise OSError('Session directory changed during inspection.')
+        if time.monotonic()>=deadline:result['complete']=False
+        return result
+    def capture(self,before=None):
+        # A slow/disconnected filesystem must not block the COM command loop.
+        # Only one daemon scan may remain in flight; subsequent calls report unknown.
+        fallback={'entries':{},'files':[],'complete':False,'directory':None}
+        try:
+            if self.pending is not None and self.pending.is_alive():return fallback
+            holder=[]
+            def scan():
+                try:holder.append(self._scan(before))
+                except Exception:holder.append(fallback)
+            self.pending=threading.Thread(target=scan,name='excel-pdf-observer',daemon=True);self.pending.start();self.pending.join(self.TIME_LIMIT)
+            return holder[0] if not self.pending.is_alive() and holder else fallback
+        except Exception:return fallback
+    def outputs(self,before):
+        after=self.capture(before);files=after['files'];complete=bool(before.get('complete') and after['complete'])
+        return {'files':files,'scope':self.scope,'complete':complete,'status':'found' if files else ('not_observed' if complete else 'unknown')}
+
+
 class ExcelSessionWorker:
     """One bound workbook in an owned Excel process; all COM stays on its STA."""
     def __init__(self,pythoncom,output,excel=None,session_id=''):
         self.pythoncom=pythoncom;self.output=output;self.excel=excel;self.book=None
         self.session_id=session_id;self.workbook_id=session_id+'-book';self.sheet_refs={};self.control_refs={}
-        self.revision=0;self.applied=0;self.layout_applied=0;self.layout_touched=0;self.owned_excel=False;self.working_copy='';self.original_path='';self.resumed=False;self.open_events_enabled=False;self.handoff_incomplete=False
+        self.revision=0;self.applied=0;self.layout_applied=0;self.layout_touched=0;self.owned_excel=False;self.working_copy='';self.original_path='';self.resumed=False;self.open_events_enabled=False;self.handoff_incomplete=False;self.pdf_observer=None
     def send(self,event,**fields):
         data=dumps(dict(fields,event=event,session_id=self.session_id))
         if len(data.encode('utf-8'))>EXCEL_SESSION_MAX_MESSAGE:raise UserError('Snapshot exceeds 4 MiB. Read a smaller range.')
@@ -4952,20 +5037,28 @@ class ExcelSessionWorker:
         if initial_error:self.send('error',id=request.get('id'),operation='open',result=result,applied=self.applied,layout_applied=self.layout_applied,layout_touched=self.layout_touched,retry_safe=False,**initial_error)
         else:self.send('ready',id=request.get('id'),result=result)
         return result
+    def invoke_macro(self,macro,extra):
+        before=None;extra['pdf_outputs']={'files':[],'scope':'','complete':False,'status':'unknown'}
+        with contextlib.suppress(Exception):
+            if self.pdf_observer is None:self.pdf_observer=_ExcelPdfObserver(self.working_copy)
+            extra['pdf_outputs']['scope']=self.pdf_observer.scope;before=self.pdf_observer.capture()
+        try:self.excel.call('Run',macro)
+        finally:
+            if before is not None:
+                with contextlib.suppress(Exception):extra['pdf_outputs']=self.pdf_observer.outputs(before)
     def handle_command(self,command):
         if command.get('session_id')!=self.session_id:raise UserError('Wrong session identity.')
         if command.get('action')=='close':return False
-        action=command.get('action');identity=command.get('id');self.applied=0;macro='';invocation={}
+        action=command.get('action');identity=command.get('id');self.applied=0;macro='';invocation={};extra={}
         self.send('busy',id=identity,operation=action)
         try:
             self.excel.AutomationSecurity=2;self.bound_book()
             if command.get('workbook_id')!=self.workbook_id:raise UserError('Wrong workbook identity.')
             if self.handoff_incomplete and action in ('run_macro','run_control_macro','apply_edits'):raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
-            extra={}
             if action=='run_macro':
                 name=command.get('name','')
                 if not isinstance(name,str) or not re.fullmatch(r'[^\W\d]\w*(?:\.[^\W\d]\w*)?',name):raise UserError('Use a macro name or Module.Macro without workbook qualifiers or arguments.')
-                macro=self.qualified_macro(name);invocation={'method':'Application.Run','caller_emulated':False};self.book.call('Activate');self.excel.call('Run',macro);self.revision+=1
+                macro=self.qualified_macro(name);invocation={'method':'Application.Run','caller_emulated':False};self.book.call('Activate');self.invoke_macro(macro,extra);self.revision+=1
             elif action=='read_range':extra['snapshot']=self.read_range(command)
             elif action=='list_sheets':pass
             elif action=='apply_edits':self.apply_edits(command.get('edits'))
@@ -4984,7 +5077,7 @@ class ExcelSessionWorker:
                 sheet=self.find_sheet(command);shape=self.find_control(command,sheet);name=self.macro_name(shape.OnAction);availability=self.control_state(shape);macro=self.qualified_macro(name) if name else str(shape.OnAction)
                 invocation={'method':'Application.Run','on_action':str(shape.OnAction),'control_name':str(shape.Name),'control_type':int(shape.Type),'sheet':str(sheet.Name),'caller_emulated':False}
                 if int(shape.Type)==12 or not name or not availability['visible'] or not availability['enabled']:raise UserError('Use the real Excel control. Hidden, disabled or unverified controls are not invoked; Application.Caller and ActiveX events are not emulated.')
-                self.book.call('Activate');sheet.call('Activate');self.excel.call('Run',macro);self.revision+=1;extra['caller_emulated']=False
+                self.book.call('Activate');sheet.call('Activate');self.invoke_macro(macro,extra);self.revision+=1;extra['caller_emulated']=False
             elif action=='export_pdf':
                 sheet=self.excel.ActiveSheet
                 if sheet is None:raise UserError('No active sheet to export.')
@@ -4998,7 +5091,8 @@ class ExcelSessionWorker:
             result=self.session_info();result.update(extra);self.send('done',id=identity,operation=action,result=result)
         except Exception as exc:
             with contextlib.suppress(Exception):self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
-            self.send('error',id=identity,operation=action,applied=self.applied,retry_safe=False,**self.error_fields(exc,action,macro,invocation))
+            outcome={'result':{'pdf_outputs':extra['pdf_outputs']}} if 'pdf_outputs' in extra else {}
+            self.send('error',id=identity,operation=action,applied=self.applied,retry_safe=False,**outcome,**self.error_fields(exc,action,macro,invocation))
         return True
     def close(self):
         if self.owned_excel and self.excel is not None:
@@ -5068,6 +5162,77 @@ def excel_session_worker_main(stdin=None,stdout=None):
         if message_filter is not None:
             with contextlib.suppress(Exception):message_filter.close()
         if initialized:com.CoUninitialize()
+
+
+def excel_publish_macro_pdf(source_descriptor,session_dir,destination,cancelled=None,*,allow_same_directory=False):
+    """Atomically copy one observed session PDF; never move its source or run Office."""
+    import stat
+    maximum=256*1024*1024
+    def check_cancelled():
+        if cancelled is not None and cancelled.is_set():raise Cancelled('Anulowano zapis dokumentu PDF.')
+    def plain_path(raw):
+        if not isinstance(raw,(str,Path)) or not str(raw) or '\0' in str(raw) or len(str(raw))>32767:raise UserError('Nieprawidłowa ścieżka dokumentu PDF.')
+        value=Path(os.path.abspath(os.path.expanduser(str(raw))))
+        for component in (value,*value.parents):
+            try:info=component.lstat()
+            except FileNotFoundError:continue
+            if stat.S_ISLNK(info.st_mode) or getattr(info,'st_file_attributes',0)&0x400:raise UserError('Dokument PDF i jego katalogi nie mogą być dowiązaniem ani punktem ponownej analizy.')
+        return value
+    def identity(info):return (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)
+    def regular(info):
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or getattr(info,'st_file_attributes',0)&0x400:raise UserError('Wybierz zwykły plik PDF bez dowiązań.')
+    def target_state(path):
+        try:info=path.lstat()
+        except FileNotFoundError:return None
+        regular(info);return identity(info)
+    check_cancelled()
+    if type(allow_same_directory) is not bool:raise UserError('Nieprawidłowa opcja miejsca zapisu PDF.')
+    if not isinstance(source_descriptor,dict):raise UserError('Nieprawidłowy opis dokumentu z makra.')
+    for key in ('size','mtime_ns','device','inode'):
+        if type(source_descriptor.get(key)) is not int or source_descriptor[key]<0:raise UserError('Nieprawidłowa tożsamość dokumentu z makra. Odśwież listę plików.')
+    scope=plain_path(session_dir);source=plain_path(source_descriptor.get('path'));target=plain_path(destination)
+    if not scope.is_dir() or source.parent!=scope or source.suffix.lower()!='.pdf' or source_descriptor.get('name')!=source.name:raise UserError('Dokument PDF musi znajdować się bezpośrednio w folderze tej sesji.')
+    if target.suffix.lower()!='.pdf' or not target.parent.is_dir() or (not allow_same_directory and target.is_relative_to(scope)):raise UserError('Wybierz docelowy plik .pdf poza folderem sesji.')
+    if target==source:raise UserError('Zapis PDF nie może nadpisać pliku źródłowego.')
+    expected=tuple(source_descriptor[key] for key in ('device','inode','size','mtime_ns'))
+    if not 64<=source_descriptor['size']<=maximum:raise UserError('Dokument PDF jest pusty, niepełny lub przekracza limit 256 MiB.')
+    source_info=source.lstat();regular(source_info)
+    if identity(source_info)!=expected:raise UserError('Dokument z makra zmienił się. Odśwież listę plików przed zapisem.')
+    previous_target=target_state(target);temporary=None;temporary_identity=None
+    if previous_target is not None and previous_target[:2]==expected[:2]:raise UserError('Zapis PDF nie może nadpisać pliku źródłowego.')
+    try:
+        flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)
+        with os.fdopen(os.open(source,flags),'rb') as input_file:
+            opened=os.fstat(input_file.fileno());regular(opened)
+            if identity(opened)!=expected:raise UserError('Dokument z makra został zastąpiony. Odśwież listę plików.')
+            descriptor,temporary_name=tempfile.mkstemp(prefix='.'+target.stem+'.',suffix='.pdf',dir=target.parent);temporary=Path(temporary_name)
+            temporary_info=os.fstat(descriptor);temporary_identity=(temporary_info.st_dev,temporary_info.st_ino)
+            total=0;header=b'';tail=b'';fingerprint=hashlib.sha256()
+            with os.fdopen(descriptor,'wb') as output_file:
+                while True:
+                    check_cancelled();block=input_file.read(1024*1024)
+                    if not block:break
+                    total+=len(block)
+                    if total>maximum or total>source_descriptor['size']:raise UserError('Dokument PDF zmienił się podczas kopiowania.')
+                    if not header:header=block[:16]
+                    tail=(tail+block)[-4096:];fingerprint.update(block);output_file.write(block)
+                if total!=source_descriptor['size'] or not re.match(rb'%PDF-[12]\.\d[\r\n]',header) or not tail.rstrip(b'\r\n\t \x00').endswith(b'%%EOF'):raise UserError('Dokument z makra nie jest kompletnym plikiem PDF.')
+                output_file.flush();os.fsync(output_file.fileno())
+            finished=os.fstat(input_file.fileno());regular(finished)
+            if identity(finished)!=expected:raise UserError('Dokument PDF zmienił się podczas kopiowania. Odśwież listę plików.')
+            plain_path(source);current=source.lstat();regular(current)
+            if identity(current)!=expected:raise UserError('Dokument z makra został zastąpiony podczas kopiowania.')
+            plain_path(target)
+            if target_state(target)!=previous_target:raise UserError('Plik docelowy zmienił się podczas kopiowania. Wybierz miejsce zapisu ponownie.')
+            temp_current=temporary.lstat();regular(temp_current)
+            if (temp_current.st_dev,temp_current.st_ino)!=temporary_identity or temp_current.st_size!=total:raise UserError('Tymczasowy dokument PDF zmienił się przed zapisem.')
+            check_cancelled();os.replace(temporary,target)
+        return {'destination':str(target),'path':str(target),'source_path':str(source),'size':total,'bytes':total,'sha256':fingerprint.hexdigest()}
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                info=temporary.lstat()
+                if (info.st_dev,info.st_ino)==temporary_identity and stat.S_ISREG(info.st_mode):temporary.unlink()
 
 
 def excel_session_error_text(message):
@@ -11040,6 +11205,7 @@ def native_ui_types():
             self._scan_pending=False;self._action_pending=False;self._command_pending=False;self._sent_prompts={};self._retry_prompts=set();self._last_prompts=[];self._last_scan=0.;self._native_digest=None;self._event_seq=0;self._last_result_key=None
             self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
             self._last_failure=None;self._last_failure_key=None;self._show_pending=False
+            self._macro_pdf_outputs=None;self._pdf_destination='';self._pdf_destination_confirmed=False;self._pdf_publish_pending=False;self._pdf_publish_cancel=threading.Event();self._pdf_attempt_destination=''
             self._session_preferences=excel_session_preferences(window.service.root);self._resume_path='';self._resume_source_path='';self._resume_info={};self._resume_check_pending=False
             self._office_context=None;self._native_book_id='';self._native_controls=[];self._native_loading=False;self._last_view_refresh=0.;self._initial_control_pending=False;self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._companion_paths=[]
             self._tasks=AsyncTasks(self);self._timer=QC.QTimer(self);self._timer.setInterval(250);self._timer.timeout.connect(self.poll)
@@ -11071,6 +11237,11 @@ def native_ui_types():
             self.open_events=QW.QCheckBox('Uruchom także makra otwarcia');self.open_events.setToolTip('Dotyczy tylko tej zewnętrznej sesji. Excel stosuje własne ustawienia zabezpieczeń makr.');options.addWidget(self.open_events)
             self.companion_button=button('Dodaj pliki powiązane…',self.choose_companions);options.addWidget(self.companion_button,0,Qt.AlignmentFlag.AlignLeft)
             self.companion_note=label('Szablony i dokumenty zostaną skopiowane obok skoroszytu.',True,True);options.addWidget(self.companion_note)
+            self.pdf_target_frame=QW.QGroupBox('Zapis PDF z makra');pdf_target=QW.QVBoxLayout(self.pdf_target_frame)
+            self.pdf_target_path=QW.QLineEdit();self.pdf_target_path.setReadOnly(True);self.pdf_target_path.setPlaceholderText('Wybierz nazwę i miejsce zapisu PDF');self.pdf_target_path.setMinimumWidth(0);self.pdf_target_path.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed);pdf_target.addWidget(self.pdf_target_path)
+            self.pdf_target_button=button('Wybierz miejsce zapisu PDF…',self.choose_macro_pdf_destination);pdf_target.addWidget(self.pdf_target_button)
+            self.pdf_locate_button=button('Wskaż PDF zapisany przez makro…',self.locate_macro_pdf);pdf_target.addWidget(self.pdf_locate_button)
+            pdf_target.addWidget(label('Po wykonaniu makra Pivot zapisze znaleziony PDF we wskazanym miejscu. Jeśli makro zapisze go poza folderem sesji, możesz wskazać ten plik ręcznie.',True,True));options.addWidget(self.pdf_target_frame)
             self.session_options=QW.QWidget();session_options=QW.QVBoxLayout(self.session_options);session_options.setContentsMargins(0,0,0,0)
             session_options.addWidget(label('Makro po nazwie',False))
             row=QW.QHBoxLayout();self.macro_name=QW.QLineEdit();self.macro_name.setPlaceholderText('Nazwa makra, np. Moduł1.PrzygotujRaport');row.addWidget(self.macro_name,1)
@@ -11110,6 +11281,14 @@ def native_ui_types():
             self.prompt_layout.addWidget(self.failure_frame);self.failure_frame.hide()
             self.prompt_empty=label('',True,True);self.prompt_empty.setTextFormat(Qt.TextFormat.PlainText);self.prompt_layout.addWidget(self.prompt_empty)
             self.native_prompt_host=QW.QWidget();self.native_prompt_layout=QW.QVBoxLayout(self.native_prompt_host);self.native_prompt_layout.setContentsMargins(0,0,0,0);self.prompt_layout.addWidget(self.native_prompt_host)
+            self.previous_failure_button=button('Szczegóły ostatniego błędu…',self.show_error_details);self.prompt_layout.addWidget(self.previous_failure_button);self.previous_failure_button.hide()
+            self.macro_pdf_frame=QW.QGroupBox('Pliki PDF');pdf_results=QW.QVBoxLayout(self.macro_pdf_frame)
+            self.macro_pdf_note=label('',True,True);self.macro_pdf_note.setTextFormat(Qt.TextFormat.PlainText);pdf_results.addWidget(self.macro_pdf_note)
+            self.macro_pdf_files=QW.QComboBox();self.macro_pdf_files.setMinimumContentsLength(1);self.macro_pdf_files.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);self.macro_pdf_files.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed);pdf_results.addWidget(self.macro_pdf_files)
+            pdf_actions=QW.QGridLayout();self.macro_pdf_save=button('Zapisz wybrany PDF…',self.save_selected_macro_pdf);self.macro_pdf_locate=button('Wskaż PDF…',self.locate_macro_pdf)
+            pdf_actions.addWidget(self.macro_pdf_save,0,0);pdf_actions.addWidget(self.macro_pdf_locate,0,1);pdf_results.addLayout(pdf_actions)
+            self.macro_pdf_location=QW.QLineEdit();self.macro_pdf_location.setReadOnly(True);self.macro_pdf_location.setMinimumWidth(0);self.macro_pdf_location.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed);pdf_results.addWidget(self.macro_pdf_location)
+            self.macro_pdf_open=button('Otwórz zapisany PDF',self.open_saved_macro_pdf);pdf_results.addWidget(self.macro_pdf_open);self.prompt_layout.addWidget(self.macro_pdf_frame);self.macro_pdf_frame.hide()
             self.prompt_layout.addStretch()
             self.prompt_scroll=QW.QScrollArea();self.prompt_scroll.setWidgetResizable(True);self.prompt_scroll.setFrameShape(QW.QFrame.Shape.NoFrame);self.prompt_scroll.setWidget(self.prompt_frame);self.body_tabs.addTab(self.prompt_scroll,'Komunikaty')
             self.history_toggle=QW.QToolButton();self.history_toggle.setText('Historia sesji');self.history_toggle.setCheckable(True);options.addWidget(self.history_toggle,0,Qt.AlignmentFlag.AlignLeft)
@@ -11123,7 +11302,7 @@ def native_ui_types():
             for area in (self.native_scroll,self.prompt_scroll,self.options_scroll):area.setMinimumSize(0,0);area.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Ignored)
             for combo in (self.native_sheets,self.native_controls):combo.setMinimumContentsLength(1);combo.setSizeAdjustPolicy(QW.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);combo.setSizePolicy(QW.QSizePolicy.Policy.Ignored,QW.QSizePolicy.Policy.Fixed)
             for control in self.findChildren(QW.QPushButton):control.setAutoDefault(False)
-            self.file.edit.textChanged.connect(self.update_controls);self.macro_name.textChanged.connect(self.update_controls);self.body_tabs.currentChanged.connect(self.update_controls)
+            self.file.edit.textChanged.connect(self.update_controls);self.macro_name.textChanged.connect(self.update_controls);self.body_tabs.currentChanged.connect(self.update_controls);self.macro_pdf_files.currentIndexChanged.connect(self.update_controls)
             try:self._availability=excel_availability()
             except Exception as exc:self._availability={'available':False,'reason':safe_error(exc)}
             self.dependency_card.set_issue(self._availability.get('dependency'))
@@ -11156,7 +11335,12 @@ def native_ui_types():
             self.fit_to_screen();QC.QTimer.singleShot(0,self._work_area_changed)
         def show_message(self):
             self.body_tabs.setCurrentIndex(1)
-            self.prompt_scroll.ensureWidgetVisible(self.failure_frame if self._last_failure else self.prompt_empty)
+            self.prompt_scroll.ensureWidgetVisible(self.native_prompt_host if self._last_prompts else self.failure_frame if self._last_failure else self.prompt_empty)
+        def update_failure_presentation(self):
+            # An unanswered native question takes precedence over an earlier error.
+            # Keep the entire diagnostic available without pushing its buttons away.
+            self.failure_frame.setVisible(bool(self._last_failure) and not self._last_prompts)
+            self.previous_failure_button.setVisible(bool(self._last_failure and self._last_prompts))
         def error_report(self):
             failure=self._last_failure or {}
             return '\n\n'.join(str(failure[key]) for key in ('message','details','code','operation') if failure.get(key))
@@ -11177,11 +11361,11 @@ def native_ui_types():
                 message='Excel zgłosił problem z uruchomieniem makra. Nie wiadomo jeszcze, czy makro jest niedostępne, czy jego uruchomienie blokują ustawienia lub stan skoroszytu.'
             value={'message':message,'details':details,'code':str(code or ''),'operation':str(operation or '')};key=digest(value)
             if key==self._last_failure_key:return
-            self._last_failure_key=key;self._last_failure=value;self.failure_text.setPlainText(message);self.failure_frame.show()
+            self._last_failure_key=key;self._last_failure=value;self.failure_text.setPlainText(message);self.update_failure_presentation()
             self.failure_frame.setTitle('Problem z uruchomieniem makra' if code=='macro_unavailable' else 'Ostatnia operacja nie powiodła się');self.macro_recovery.setVisible(code=='macro_unavailable')
             self.body_tabs.setCurrentIndex(1);self.prompt_scroll.verticalScrollBar().setValue(0)
         def clear_failure(self):
-            self._last_failure=None;self._last_failure_key=None;self.failure_text.clear();self.failure_frame.hide();self.macro_recovery.hide()
+            self._last_failure=None;self._last_failure_key=None;self.failure_text.clear();self.update_failure_presentation();self.macro_recovery.hide()
         def reflow_footer(self):
             if not hasattr(self,'footer_layout'):return
             active=self.session_running();controls=[self.native_macro,self.native_reveal,self.close_button] if active else [self.open_button,self.close_button]
@@ -11239,6 +11423,69 @@ def native_ui_types():
         def open_workspace(self):
             path=self._resume_info.get('session_dir') if self._resume_path and not self.session_running() else self._snapshot.get('workspace_path') or self._snapshot.get('temp_root')
             if path and Path(path).is_dir():QG.QDesktopServices.openUrl(QC.QUrl.fromLocalFile(str(path)))
+        def choose_macro_pdf_destination(self):
+            if self._pdf_publish_pending or self._closing:return False
+            initial=self._pdf_destination or str(Path.home()/'Documents'/(Path(self.file.text()).stem+'.pdf'))
+            path=QW.QFileDialog.getSaveFileName(self,'Zapis PDF wygenerowanego przez makro',initial,'PDF (*.pdf)')[0]
+            if not path:return False
+            if Path(path).suffix.lower()!='.pdf':self.message.setText('Wybierz plik z rozszerzeniem .pdf.');self.update_controls();return False
+            self._pdf_destination=path;self._pdf_destination_confirmed=True;self.pdf_target_path.setText(path);self.pdf_target_path.setToolTip(path);return True
+        def reset_macro_pdf_results(self):
+            self._macro_pdf_outputs=None;self.macro_pdf_files.clear();self.macro_pdf_note.clear();self.macro_pdf_location.clear();self.macro_pdf_location.hide();self.macro_pdf_open.hide();self.macro_pdf_frame.hide()
+        def apply_macro_pdf_outputs(self,outputs):
+            if not isinstance(outputs,dict):return
+            scope=str(outputs.get('scope') or '');expected=str(self._snapshot.get('workspace_path') or self._snapshot.get('temp_root') or '')
+            raw=outputs.get('files',[]);complete=outputs.get('complete') is True and isinstance(raw,list)
+            if not isinstance(raw,list):raw=[]
+            files=[]
+            for item in raw[:128]:
+                if not isinstance(item,dict):continue
+                path=Path(str(item.get('path') or ''))
+                if not scope or not expected or Path(scope)!=Path(expected) or not path.is_absolute() or path.parent!=Path(scope) or path.suffix.lower()!='.pdf':continue
+                files.append(clone(item))
+            complete=bool(complete and len(files)==len(raw) and scope and expected and Path(scope)==Path(expected))
+            self._macro_pdf_outputs=dict(outputs,files=files,complete=complete);self.macro_pdf_files.clear()
+            for item in files:self.macro_pdf_files.addItem(str(item.get('name') or Path(item['path']).name),item)
+            if len(files)>1:self.macro_pdf_files.setCurrentIndex(-1);self.macro_pdf_files.setPlaceholderText('Wybierz PDF do zapisania')
+            if files:
+                text='Znaleziono nowe lub zmienione pliki PDF w folderze sesji: '+str(len(files))+'. Sprawdź treść dokumentu.'
+                if len(files)>1:text+=' Wybierz właściwy plik do zapisania.'
+                if not complete:text+=' Nie udało się sprawdzić wszystkich plików; wybierz wynik ręcznie.'
+            elif outputs.get('status')=='not_observed':text='Nie znaleziono nowego ani zmienionego PDF w folderze sesji. Makro mogło zakończyć się bez dokumentu lub zapisać go gdzie indziej. Jeśli znasz jego lokalizację, kliknij „Wskaż PDF…”.'
+            else:text='Nie udało się potwierdzić utworzenia PDF w folderze sesji. Jeśli plik jest już zapisany, wybierz go przez „Wskaż PDF…”.'
+            self.macro_pdf_note.setText(text);self.macro_pdf_frame.show();self.macro_pdf_files.setVisible(bool(files));self.macro_pdf_location.hide();self.macro_pdf_open.hide();self.update_controls()
+        def save_selected_macro_pdf(self):
+            item=self.macro_pdf_files.currentData()
+            if not item or self._pdf_publish_pending:return
+            if self.choose_macro_pdf_destination():self.publish_macro_pdf(item,str((self._macro_pdf_outputs or {}).get('scope','')),self._pdf_destination)
+        def locate_macro_pdf(self):
+            if self._pdf_publish_pending or self._closing:return
+            initial=str(self._snapshot.get('workspace_path') or self._snapshot.get('temp_root') or Path(self.file.text()).parent)
+            path=QW.QFileDialog.getOpenFileName(self,'Wskaż PDF utworzony przez makro',initial,'PDF (*.pdf)')[0]
+            if path and self.choose_macro_pdf_destination():self.publish_macro_pdf({'path':path},str(Path(path).parent),self._pdf_destination,manual=True)
+        def publish_macro_pdf(self,item,scope,destination,manual=False):
+            if self._pdf_publish_pending or self._disposed or self._closing:return
+            self._pdf_publish_pending=True;self._pdf_attempt_destination='';self._pdf_destination_confirmed=False;self._pdf_publish_cancel.clear();epoch=self._epoch;service=self._host_window.service;item=clone(item);cancel=self._pdf_publish_cancel
+            self.macro_pdf_frame.show();self.macro_pdf_note.setText('Zapisuję PDF w wybranym miejscu…');self.update_controls()
+            def work():
+                descriptor=clone(item)
+                if manual:
+                    stat=_excel_retained_path(descriptor['path']).stat()
+                    descriptor.update(name=Path(descriptor['path']).name,size=stat.st_size,mtime_ns=stat.st_mtime_ns,device=stat.st_dev,inode=stat.st_ino)
+                with service.lock:service.cell_export_destination(destination)
+                # Keep the chosen spelling so the publisher can reject linked paths.
+                return excel_publish_macro_pdf(descriptor,scope,destination,cancelled=cancel,allow_same_directory=manual)
+            def done(result):
+                if self._disposed or epoch!=self._epoch:return
+                self._pdf_publish_pending=False;path=str(result['destination']);self.macro_pdf_location.setText(path);self.macro_pdf_location.setToolTip(path);self.macro_pdf_location.show();self.macro_pdf_open.show()
+                self.macro_pdf_note.setText('Zapisano PDF we wskazanym miejscu. Otwórz go i sprawdź treść dokumentu.');self.message.setText('Zapisano PDF: '+path);self.history.appendPlainText('Zapisano PDF: '+path);self.update_controls()
+            def failed(error):
+                if self._disposed or epoch!=self._epoch:return
+                self._pdf_publish_pending=False;self.macro_pdf_note.setText('Nie zapisano PDF we wskazanym miejscu: '+str(error));self.message.setText(self.macro_pdf_note.text());self.update_controls()
+            self._tasks.submit(work,done,failed,'Zapis PDF z makra')
+        def open_saved_macro_pdf(self):
+            path=self.macro_pdf_location.text()
+            if path and not QG.QDesktopServices.openUrl(QC.QUrl.fromLocalFile(path)):self.message.setText('Nie udało się otworzyć zapisanego PDF. Plik: '+path);self.update_controls()
         def configure_office_context(self,context):
             if self.session_running():raise UserError('Zamknij poprzednią sesję Excela przed otwarciem innego skoroszytu.')
             self._resume_path='';self._resume_source_path='';self._resume_info={}
@@ -11256,7 +11503,7 @@ def native_ui_types():
         def update_controls(self,*_):
             state=self._snapshot.get('state','idle');active=self.session_running();ready=state=='ready' and self._snapshot.get('owned') and not self._closing and not self._command_pending
             # An automatic sheet read never disables explicit commands: they wait for it and run once.
-            usable=bool(self._snapshot.get('owned') and not self._closing and self._queued is None and (ready or self.background_read_active()));blocked=self.blocking_error()
+            usable=bool(self._snapshot.get('owned') and not self._closing and not self._pdf_publish_pending and self._queued is None and (ready or self.background_read_active()));blocked=self.blocking_error()
             selecting=not active and not self._closing and not self._resume_check_pending
             self.file.setEnabled(selecting and not self._office_context and not self._resume_path);self.open_events.setEnabled(selecting and not self._resume_path and not ((self._office_context or {}).get('edits') or (self._office_context or {}).get('layout')))
             self.companion_button.setEnabled(selecting and not self._resume_path)
@@ -11282,6 +11529,9 @@ def native_ui_types():
             self.macro_name.setEnabled(usable);self.run_button.setEnabled(bool(usable and self.macro_name.text().strip() and not blocked));self.pdf_button.setEnabled(usable);self.save_copy_button.setEnabled(usable)
             self.save_working_button.setEnabled(usable)
             self.save_session_button.setEnabled(usable)
+            pdf_idle=not self._closing and not self._pdf_publish_pending and not self._last_prompts and not self._command_pending and state not in ('busy','starting','closing')
+            self.pdf_target_button.setEnabled(pdf_idle);self.macro_pdf_save.setEnabled(bool(pdf_idle and self.macro_pdf_files.currentData()));self.macro_pdf_locate.setEnabled(pdf_idle);self.pdf_locate_button.setEnabled(pdf_idle)
+            self.macro_pdf_frame.setVisible(bool(self._macro_pdf_outputs or self._pdf_publish_pending or self.macro_pdf_location.text()) and not self._last_prompts)
             self.open_workspace_button.setEnabled(bool(self._snapshot.get('workspace_path') or self._snapshot.get('temp_root') or self._resume_info.get('session_dir')))
             self.stop_button.setEnabled(bool(active and not self._closing));self.close_button.setEnabled(not self._closing)
             native_ready=bool(ready and self._native_book_id);native_usable=bool(usable and self._native_book_id);self.native_model.editable=native_ready and not blocked
@@ -11300,12 +11550,13 @@ def native_ui_types():
             if self._snapshot.get('handoff_incomplete'):self.prompt_empty.setText('Nie przeniesiono wszystkich zmian z Pivot. Makra i edycja w tej sesji są zablokowane. Sprawdź stan kopii, zapisz ją w razie potrzeby i uruchom nową sesję. „Pokaż w Excelu” otwiera jej okno.')
             self.reflow_footer()
         def start_session(self):
-            if self._disposed or self._closing or self._resume_check_pending or not self._availability.get('available'):return
+            if self._disposed or self._closing or self._pdf_publish_pending or self._resume_check_pending or not self._availability.get('available'):return
             if self.session_running():return
             path=self._resume_source_path if self._resume_path else self.file.text().strip()
             if not path or Path(path).suffix.lower() not in WORKBOOK_SUFFIXES:self.message.setText('Wybierz plik XLSM albo XLSX.');self.update_controls();return
             self._epoch+=1;self._event_seq=0;self._last_result_key=None;self._last_scan=0;self._native_digest=None;self._scan_pending=False;self._action_pending=False;self._show_pending=False;self._sent_prompts={};self._retry_prompts=set();self.history.clear();self.message.clear();self.clear_failure();self.render_prompts([])
             self._auto_read=False;self._queued=None;self._quiet_read_error=False;self._controls_sheet=None
+            self.reset_macro_pdf_results();self._pdf_attempt_destination=''
             try:
                 self._native_book_id='';self.body_tabs.setTabVisible(0,False);self.saved_copy_path='';self.saved_copy_revision='';self._native_saved_emitted=False;self._native_loading=True
                 self.native_model.set_snapshot({});self.native_sheets.clear();self.native_controls.clear();self._native_controls=[];self._native_loading=False
@@ -11317,13 +11568,15 @@ def native_ui_types():
                     with contextlib.suppress(Exception):self._controller.cancel()
                 self._controller=None;self._snapshot={'state':'error','finished':True};self.state_note.setText('Nie otwarto sesji Excela.');self.message.setText(safe_error(exc));self.remember_failure(safe_error(exc),operation='open');self.update_controls()
         def submit(self,action,args,background=False):
-            if self._disposed or self._closing or not self._controller:return False
+            if self._disposed or self._closing or self._pdf_publish_pending or not self._controller:return False
             if self._snapshot.get('handoff_incomplete') and action in ('run_macro','run_control_macro','apply_edits'):
                 self.message.setText(EXCEL_HANDOFF_INCOMPLETE_MESSAGE);self.show_message();self.update_controls();return False
             if self._command_pending or self._snapshot.get('state')!='ready':
                 if background or self._queued is not None or not self.background_read_active():return False
                 self._queued=(action,clone(args));self.message.setText('Kończę odczyt arkusza w Excelu, potem wykonam polecenie.');self.update_controls();return True
-            controller=self._controller;epoch=self._epoch;service=self._host_window.service;self._command_pending=True;self._auto_read=bool(background);self._last_result_key=None
+            controller=self._controller;epoch=self._epoch;service=self._host_window.service;previous_result_key=self._last_result_key;self._command_pending=True;self._auto_read=bool(background);self._last_result_key=None
+            if action in ('run_macro','run_control_macro'):
+                self.reset_macro_pdf_results();self._pdf_attempt_destination=self._pdf_destination if self._pdf_destination_confirmed else '';self._pdf_destination_confirmed=False
             if not background:self._quiet_read_error=False;self.message.clear()
             self.update_controls()
             def work():
@@ -11336,13 +11589,15 @@ def native_ui_types():
                 self._command_pending=False;self.poll()
             def failed(error):
                 if self._disposed or epoch!=self._epoch:return
-                self._command_pending=False
+                self._command_pending=False;self._last_result_key=previous_result_key
+                if action in ('run_macro','run_control_macro'):self._pdf_attempt_destination=''
                 if background:self.poll();self.native_note.setText('Nie odświeżono podglądu: '+str(error));return
                 self._close_after_save=False;self.poll();self.message.setText(str(error));self.remember_failure(str(error),operation=action);self.update_controls()
             self._tasks.submit(work,done,failed,'Polecenie Excela');return True
         def run_macro(self):
             name=self.macro_name.text().strip()
             if not name:self.message.setText('Wpisz nazwę makra lub użyj przycisku w oknie Excela.');return
+            if self._pdf_destination and not self._pdf_destination_confirmed and not self.choose_macro_pdf_destination():return
             if self.submit('run_macro',{'name':name}):self.body_tabs.setCurrentIndex(1)
         def native_sheet_changed(self,*_):
             if self._native_loading:return
@@ -11382,12 +11637,14 @@ def native_ui_types():
         def run_control_macro(self):
             control=self.native_controls.currentData() or {}
             if control.get('macro_supported') and not self.blocking_error():
+                if ('pdf' in str(control.get('caption') or self.native_controls.currentText()).casefold() or self._pdf_destination) and not self._pdf_destination_confirmed and not self.choose_macro_pdf_destination():return
                 if self.submit('run_control_macro',{'workbook_id':self._native_book_id,'sheet_id':self.native_sheets.currentData(),'control_id':control['id']}):self.body_tabs.setCurrentIndex(1)
         def show_native_view(self):
             first=not self.body_tabs.isTabVisible(0);self.body_tabs.setTabVisible(0,True)
             if first and not self._last_prompts:self.body_tabs.setCurrentIndex(0)
         def apply_native_result(self,result,allow_reveal=True):
             if not isinstance(result,dict):return
+            if isinstance(result.get('pdf_outputs'),dict):self.apply_macro_pdf_outputs(result['pdf_outputs'])
             if not allow_reveal:self._initial_control_pending=False
             view=result.get('snapshot');book_id=result.get('workbook_id') or self._native_book_id
             if not book_id:return
@@ -11479,8 +11736,9 @@ def native_ui_types():
             status='Excel gotowy · odświeżam podgląd arkusza…' if self.background_read_active() else names.get(state,str(state or ''))
             self.state_note.setText(status+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
             result=snapshot.get('last_result')
-            if result and snapshot.get('error') and digest(result)!=self._last_result_key:
+            if result and snapshot.get('error') and not self._command_pending and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);self.apply_native_result(result,allow_reveal=False)
+                if isinstance(result.get('pdf_outputs'),dict):self._pdf_attempt_destination=''
             if result and state=='ready' and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);destination=result.get('destination') if isinstance(result,dict) else None
                 operation=(result.get('action') or snapshot.get('last_operation') or snapshot.get('operation') or '') if isinstance(result,dict) else ''
@@ -11489,11 +11747,19 @@ def native_ui_types():
                 if operation not in ('read_range','open'):
                     done={'show_excel':'Otwarto okno tej sesji Excela.','reveal_control':'Przycisk jest wskazany w Excelu. Kliknij „Uruchom” tutaj albo ten przycisk w Excelu.','run_control_macro':'Makro zakończyło działanie.','run_macro':'Makro zakończyło działanie.','apply_edits':'Zapisano zmianę komórki w Excelu.'}
                     text='Zapisano: '+str(destination) if destination else done.get(operation,'Operacja zakończona.')
+                    if operation in ('run_macro','run_control_macro'):
+                        outputs=result.get('pdf_outputs') or {};found=outputs.get('files') or []
+                        text='Makro zakończyło działanie. '+('Znaleziono nowe lub zmienione pliki PDF: '+str(len(found))+'.' if found else 'Utworzenie PDF nie zostało potwierdzone.')
                     if operation=='save_session':text='Zapisano kopię sesji do wznowienia: '+str(result.get('session_saved_path') or snapshot.get('working_copy') or '')
                     if operation=='save_session' and snapshot.get('handoff_incomplete'):text='Zapisano niepełną kopię do sprawdzenia: '+str(result.get('session_saved_path') or snapshot.get('working_copy') or '')+'. Wznowienie zachowa blokadę makr i edycji.'
                     if operation=='reveal_control' and result.get('foreground') is False:text+=' Jeśli okno Excela nie wyszło na wierzch, wybierz je na pasku zadań.'
                     self.message.setText(text)
                 self.apply_native_result(result)
+                if operation in ('run_macro','run_control_macro'):
+                    if not isinstance(result.get('pdf_outputs'),dict):self.apply_macro_pdf_outputs({'files':[],'status':'unknown','complete':False})
+                    outputs=self._macro_pdf_outputs or {};found=outputs.get('files') or [];target=self._pdf_attempt_destination;self._pdf_attempt_destination=''
+                    if target and len(found)==1 and outputs.get('complete') is True:self.publish_macro_pdf(found[0],outputs['scope'],target)
+                    self.body_tabs.setCurrentIndex(1)
                 if self._close_after_save and operation in ('save_session','save_working','save_copy'):self._close_after_save=False;self.begin_close()
             elif not self._native_book_id and state=='ready' and snapshot.get('snapshot'):self.apply_native_result(snapshot)
             if snapshot.get('error'):
@@ -11544,10 +11810,11 @@ def native_ui_types():
             self._tasks.submit(lambda:excel_native_dialogs(pid,hwnd),done,failed,'Komunikaty Excela')
         def render_prompts(self,items):
             key=digest([(item.get('hwnd'),item.get('fingerprint')) for item in items]) if items else None
-            if key and key!=self._prompt_tab_key:self.body_tabs.setCurrentIndex(1)
+            new_prompt=bool(key and key!=self._prompt_tab_key)
+            if new_prompt:self.body_tabs.setCurrentIndex(1)
             elif not key and self._prompt_tab_key and self._native_book_id and not self._last_failure and self.body_tabs.currentIndex()==1:self.body_tabs.setCurrentIndex(0)
             self._prompt_tab_key=key
-            self._last_prompts=clone(items)
+            self._last_prompts=clone(items);self.update_failure_presentation()
             while self.native_prompt_layout.count():
                 item=self.native_prompt_layout.takeAt(0)
                 if item.widget():item.widget().hide();item.widget().deleteLater()
@@ -11559,16 +11826,13 @@ def native_ui_types():
                 for index,native in enumerate(buttons):
                     control=button(str(native.get('text','')),lambda checked=False,s=clone(snapshot),b=clone(native):self.click_prompt(s,b));control.setAutoDefault(False)
                     control.setEnabled(bool(native.get('enabled') and snapshot.get('enabled',True) and snapshot.get('complete',True) and not self._action_pending and not pending));controls.addWidget(control,index//3,index%3)
-                suggestion=excel_native_dialog_skip_button(snapshot)
-                if suggestion:
-                    skip=button('Pomiń → '+str(suggestion.get('text','')).replace('&',''),lambda checked=False,s=clone(snapshot),b=clone(suggestion):self.click_prompt(s,b));skip.setAutoDefault(False)
-                    skip.setToolTip('Wysyła dokładnie pokazany wybór. Nie omija innych warunków makra.');skip.setEnabled(bool(suggestion.get('enabled') and snapshot.get('enabled',True) and snapshot.get('complete',True) and not self._action_pending and not pending));controls.addWidget(skip,(len(buttons)+2)//3,0,1,3)
                 layout.addLayout(controls)
                 if pending and (snapshot.get('hwnd'),snapshot.get('fingerprint')) in self._retry_prompts:
                     layout.addWidget(label('Okno nadal czeka. Możesz ponownie wybrać odpowiedź lub użyć okna Excela.',True,True))
                     layout.addWidget(button('Odblokuj odpowiedzi',lambda checked=False,s=clone(snapshot):self.retry_prompt(s)))
                 if snapshot.get('complete') is False:layout.addWidget(label('Nie odczytano całego okna. Odpowiedz bezpośrednio w Excelu.',True,True))
                 self.native_prompt_layout.addWidget(frame)
+            if new_prompt:self.prompt_scroll.verticalScrollBar().setValue(0)
         def click_prompt(self,snapshot,native):
             identity=self.session_identity()
             if self._disposed or self._closing or self._action_pending or not identity or self._sent_prompts.get(snapshot.get('hwnd'),(None,))[0]==snapshot.get('fingerprint'):return
@@ -11589,7 +11853,7 @@ def native_ui_types():
             self._controller.cancel();self.message.setText('Przerywam własną sesję Excela…');self.poll()
         def begin_close(self):
             if self._closing or self._disposed:return
-            self._closing=True;self.message.setText('Zamykanie własnej sesji Excela…')
+            self._closing=True;self._pdf_publish_cancel.set();self.message.setText('Zamykanie własnej sesji Excela…')
             try:self._controller.cancel() if self._snapshot.get('state') in ('starting','busy') else self._controller.close()
             except Exception as exc:self._closing=False;self.message.setText(safe_error(exc))
             self.update_controls()
@@ -11615,7 +11879,7 @@ def native_ui_types():
         def reject(self):self.close()
         def dispose(self):
             if self._disposed:return
-            self._disposed=True;self._epoch+=1;self._timer.stop();self._tasks.close()
+            self._disposed=True;self._pdf_publish_cancel.set();self._epoch+=1;self._timer.stop();self._tasks.close()
             if self._controller and self._snapshot.get('state')!='closed':self._controller.cancel()
             if self.saved_copy_path and not self._native_saved_emitted:self._native_saved_emitted=True;self.nativeCopyReady.emit(self.saved_copy_path)
 
@@ -19504,6 +19768,116 @@ def excel_handoff_test_suite():
     return unittest.defaultTestLoader.loadTestsFromTestCase(ExcelHandoffTests)
 
 
+def excel_macro_pdf_test_suite():
+    import unittest
+    from unittest.mock import patch
+    class ExcelMacroPdfTests(unittest.TestCase):
+        def setUp(self):
+            self.temporary=tempfile.TemporaryDirectory();self.addCleanup(self.temporary.cleanup);self.root=Path(self.temporary.name);self.session=self.root/'sesja żółć';self.session.mkdir()
+            self.source=self.session/'Raport miesiąca.pdf';self.target=self.root/'wynik końcowy.pdf';self.target.write_bytes(b'previous destination')
+            self.pdf=b'%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n';self.source.write_bytes(self.pdf)
+            self.descriptor=self.observe()
+        def observe(self,path=None):
+            path=path or self.source;info=path.stat()
+            return {'path':str(path),'name':path.name,'size':info.st_size,'mtime_ns':info.st_mtime_ns,'device':info.st_dev,'inode':info.st_ino}
+        def publish(self,descriptor=None,target=None,cancelled=None):return excel_publish_macro_pdf(descriptor if descriptor is not None else self.descriptor,self.session,target or self.target,cancelled)
+        def assert_unpublished(self):
+            self.assertEqual(self.target.read_bytes(),b'previous destination');self.assertFalse(list(self.root.glob('.'+self.target.stem+'.*.pdf')))
+        def test_copy_preserves_source_and_atomically_replaces_chosen_destination(self):
+            source_info=self.source.stat();result=self.publish()
+            self.assertEqual(self.source.read_bytes(),self.pdf);self.assertEqual(self.target.read_bytes(),self.pdf);self.assertEqual(self.source.stat().st_ino,source_info.st_ino)
+            self.assertEqual(result['destination'],str(self.target));self.assertEqual(result['source_path'],str(self.source));self.assertEqual(result['size'],len(self.pdf));self.assertEqual(result['sha256'],hashlib.sha256(self.pdf).hexdigest());self.assertFalse(list(self.root.glob('.*.pdf')))
+        def test_creates_new_destination_with_uppercase_pdf_extension(self):
+            target=self.root/'nowy dokument.PDF';result=self.publish(target=target)
+            self.assertEqual(target.read_bytes(),self.pdf);self.assertEqual(result['path'],str(target));self.assertEqual(self.source.read_bytes(),self.pdf)
+        def test_explicit_manual_copy_allows_another_name_in_same_directory(self):
+            target=self.session/'wybrana nowa nazwa.pdf';target.write_bytes(b'previous selected target')
+            result=excel_publish_macro_pdf(self.descriptor,self.session,target,allow_same_directory=True)
+            self.assertEqual(result['destination'],str(target));self.assertEqual(target.read_bytes(),self.pdf);self.assertEqual(self.source.read_bytes(),self.pdf)
+        def test_manual_copy_never_overwrites_same_source_or_hardlinked_alias(self):
+            with self.assertRaises(UserError):excel_publish_macro_pdf(self.descriptor,self.session,self.source,allow_same_directory=True)
+            alias=self.session/'alias.pdf'
+            try:os.link(self.source,alias)
+            except OSError as exc:self.skipTest(str(exc))
+            with self.assertRaises(UserError):excel_publish_macro_pdf(self.descriptor,self.session,alias,allow_same_directory=True)
+            self.assertEqual(self.source.read_bytes(),self.pdf);self.assertEqual(alias.read_bytes(),self.pdf)
+        def test_refuses_stale_descriptor_and_same_size_replaced_source(self):
+            for field in ('size','mtime_ns','device','inode'):
+                descriptor=dict(self.descriptor);descriptor[field]+=1
+                with self.subTest(field=field),self.assertRaises(UserError):self.publish(descriptor)
+                self.assert_unpublished()
+            replacement=self.session/'replacement.pdf';replacement.write_bytes(self.pdf);os.utime(replacement,ns=(self.source.stat().st_atime_ns,self.descriptor['mtime_ns']));os.replace(replacement,self.source)
+            with self.assertRaises(UserError):self.publish()
+            self.assert_unpublished()
+        def test_refuses_outside_nested_or_misnamed_source_and_reserved_destinations(self):
+            outside=self.root/'outside.pdf';outside.write_bytes(self.pdf);nested=self.session/'nested';nested.mkdir();nested_pdf=nested/'nested.pdf';nested_pdf.write_bytes(self.pdf)
+            for descriptor in (self.observe(outside),self.observe(nested_pdf),dict(self.descriptor,name='other.pdf')):
+                with self.assertRaises(UserError):self.publish(descriptor)
+            for target in (self.source,self.session/'another.pdf',nested/'another.pdf',self.root/'report.xlsm',self.root/'missing'/'report.pdf'):
+                with self.subTest(target=target),self.assertRaises(UserError):self.publish(target=target)
+            self.assert_unpublished();self.assertEqual(self.source.read_bytes(),self.pdf)
+        def test_rejects_malformed_identity_and_bounded_size_without_reading_large_file(self):
+            for field,value in (('size',True),('size',-1),('size',256*1024*1024+1),('mtime_ns',None),('inode','1'),('device',-1),('path','bad\0path')):
+                with self.subTest(field=field,value=value),self.assertRaises(UserError):self.publish(dict(self.descriptor,**{field:value}))
+            self.assert_unpublished()
+        def test_rejects_incomplete_or_invalid_pdf_without_replacing_previous_file(self):
+            for content in (b'x'*100,b'%PDF-1.7\n'+b'x'*100,b'%PDF-9.9\n'+b'x'*100+b'%%EOF',b'%PDF-1.7\n%%EOF'):
+                self.source.write_bytes(content)
+                with self.subTest(content=content[:16]),self.assertRaises(UserError):self.publish(self.observe())
+                self.assert_unpublished()
+        def test_cancellation_before_copy_and_after_fsync_preserves_previous_destination(self):
+            cancelled=threading.Event();cancelled.set()
+            with self.assertRaises(Cancelled):self.publish(cancelled=cancelled)
+            self.assert_unpublished();cancelled.clear();fsync=os.fsync
+            def stop_after_sync(fd):fsync(fd);cancelled.set()
+            with patch.object(os,'fsync',side_effect=stop_after_sync),self.assertRaises(Cancelled):self.publish(cancelled=cancelled)
+            self.assert_unpublished();self.assertEqual(self.source.read_bytes(),self.pdf)
+        def test_source_changed_during_streaming_is_never_published(self):
+            fsync=os.fsync
+            def mutate(fd):
+                fsync(fd)
+                with self.source.open('ab') as stream:stream.write(b'changed during copy')
+            with patch.object(os,'fsync',side_effect=mutate),self.assertRaises(UserError):self.publish()
+            self.assert_unpublished()
+        def test_target_changed_during_copy_requires_a_new_destination_decision(self):
+            fsync=os.fsync
+            def mutate(fd):fsync(fd);self.target.write_bytes(b'concurrently saved destination')
+            with patch.object(os,'fsync',side_effect=mutate),self.assertRaises(UserError):self.publish()
+            self.assertEqual(self.target.read_bytes(),b'concurrently saved destination');self.assertFalse(list(self.root.glob('.*.pdf')));self.assertEqual(self.source.read_bytes(),self.pdf)
+        def test_failed_atomic_publish_removes_only_own_temporary_file(self):
+            unrelated=self.root/'.unrelated.pdf';unrelated.write_bytes(b'keep')
+            with patch.object(os,'replace',side_effect=OSError('synthetic publish failure')),self.assertRaises(OSError):self.publish()
+            self.assert_unpublished();self.assertEqual(unrelated.read_bytes(),b'keep');self.assertEqual(self.source.read_bytes(),self.pdf)
+        def test_rejects_hardlinked_source_and_destination(self):
+            linked=self.session/'linked.pdf'
+            try:os.link(self.source,linked)
+            except OSError as exc:self.skipTest(str(exc))
+            with self.assertRaises(UserError):self.publish()
+            linked.unlink();os.link(self.target,linked)
+            with self.assertRaises(UserError):self.publish()
+            self.assert_unpublished()
+        def test_rejects_reparse_source_metadata_without_following_it(self):
+            original_lstat=Path.lstat
+            def reparse(path,*args,**kwargs):
+                value=original_lstat(path,*args,**kwargs)
+                if path!=self.source:return value
+                class Info:
+                    st_file_attributes=0x400
+                    def __getattr__(self,name):return getattr(value,name)
+                return Info()
+            with patch.object(Path,'lstat',reparse),self.assertRaisesRegex(UserError,'ponownej analizy'):self.publish()
+            self.assert_unpublished()
+        def test_rejects_symbolic_link_source_and_destination(self):
+            link=self.session/'link.pdf'
+            try:link.symlink_to(self.source)
+            except OSError as exc:self.skipTest(str(exc))
+            with self.assertRaises(UserError):self.publish(self.observe(link))
+            link.unlink();self.target.unlink();self.target.symlink_to(self.source)
+            with self.assertRaises(UserError):self.publish()
+            self.assertEqual(self.source.read_bytes(),self.pdf)
+    return unittest.defaultTestLoader.loadTestsFromTestCase(ExcelMacroPdfTests)
+
+
 def excel_session_test_suite():
     import unittest
     from unittest.mock import patch
@@ -20057,6 +20431,92 @@ send('closed')
             result=self.worker.error_fields(RuntimeError('macro unavailable'),'run_macro','M.Print')
             self.assertEqual(result['code'],'protected_view');self.assertIn('Widoku chronionego',result['message']);self.assertIn('nie wykrywa projektu VBA',result['message'])
             self.assertFalse(hasattr(self.excel,'AutomationSecurity'))
+        def fake_pdf(self,path,content=b'fixture document'):
+            path.write_bytes(b'%PDF-1.7\r\n'+content+b'\r\n%%EOF\r\n');return path
+        def test_macro_normal_return_without_pdf_is_only_not_observed(self):
+            self.worker.open_workbook(self.open_request());self.excel.handlers['Run']=lambda *_:True
+            event=self.session_command('run_macro',name='Generate')
+            self.assertEqual(event['event'],'done');result=event['result']['pdf_outputs']
+            self.assertEqual(result,{'files':[],'scope':str(self.path.parent),'complete':True,'status':'not_observed'})
+            self.assertEqual([name for name,_ in self.excel.calls].count('Run'),1)
+        def test_macro_observes_new_and_changed_pdfs_but_not_old_or_nested_files(self):
+            self.worker.open_workbook(self.open_request());old=self.fake_pdf(self.path.parent/'unchanged.pdf');changed=self.fake_pdf(self.path.parent/'changed.pdf');before=changed.stat()
+            nested=self.path.parent/'nested';nested.mkdir();created=self.path.parent/'new.PDF'
+            def generate(*_):
+                self.fake_pdf(created);self.fake_pdf(changed,b'changed document');os.utime(changed,ns=(before.st_atime_ns,before.st_mtime_ns+1000000000));self.fake_pdf(nested/'not-in-scope.pdf')
+            self.excel.handlers['Run']=generate;event=self.session_command('run_macro',name='Generate');result=event['result']['pdf_outputs']
+            self.assertEqual(event['event'],'done');self.assertTrue(result['complete']);self.assertEqual(result['status'],'found');self.assertEqual({item['name'] for item in result['files']},{'new.PDF','changed.pdf'})
+            for item in result['files']:
+                details=Path(item['path']).stat();self.assertEqual((item['size'],item['mtime_ns'],item['device'],item['inode']),(details.st_size,details.st_mtime_ns,details.st_dev,details.st_ino))
+            self.assertEqual(old.read_bytes(),b'%PDF-1.7\r\nfixture document\r\n%%EOF\r\n')
+        def test_macro_error_keeps_observed_pdf_without_masking_failure_or_retrying(self):
+            self.worker.open_workbook(self.open_request())
+            def generate_then_fail(*_):self.fake_pdf(self.path.parent/'partial.pdf');raise RuntimeError('failure after writing a document')
+            self.excel.handlers['Run']=generate_then_fail;event=self.session_command('run_macro',name='Generate')
+            self.assertEqual(event['event'],'error');self.assertIn('failure after writing',event['message']);self.assertFalse(event['retry_safe'])
+            result=event['result']['pdf_outputs'];self.assertEqual(result['status'],'found');self.assertEqual(result['files'][0]['name'],'partial.pdf')
+            self.assertEqual([name for name,_ in self.excel.calls].count('Run'),1)
+        def test_control_macro_uses_same_pdf_observation_without_export_fallback(self):
+            self.worker.open_workbook(self.open_request());shape=FakeCom(ID=19,Name='Generate',Type=8,OnAction='ThisWorkbook.GenerateDocument',Visible=-1,ControlFormat=FakeCom(Enabled=True),Top=0.,Left=0.,Width=60.,Height=20.,TopLeftCell=FakeCom(Row=1,Column=1))
+            self.sheet.Shapes.values=[shape];sid=self.worker.sheet_id(self.sheet);control=self.worker.controls(self.sheet,sid)[0]
+            self.excel.handlers['Run']=lambda *_:self.fake_pdf(self.path.parent/'control.pdf')
+            event=self.session_command('run_control_macro',sheet_id=sid,control_id=control['id'])
+            self.assertEqual(event['result']['pdf_outputs']['status'],'found');self.assertFalse(event['result']['caller_emulated'])
+            self.assertEqual([args for name,args in self.excel.calls if name=='Run'],[(self.worker.qualified_macro('ThisWorkbook.GenerateDocument'),)])
+            self.assertNotIn('ExportAsFixedFormat',[name for name,_ in self.sheet.calls])
+        def test_pdf_scan_failure_does_not_block_macro_or_replace_its_error(self):
+            self.worker.open_workbook(self.open_request());self.excel.handlers['Run']=lambda *_:None
+            with patch.object(_ExcelPdfObserver,'_scan',side_effect=PermissionError('denied')):event=self.session_command('run_macro',name='Generate')
+            self.assertEqual(event['event'],'done');self.assertEqual(event['result']['pdf_outputs']['status'],'unknown')
+            def fail(*_):raise RuntimeError('original macro failure')
+            self.excel.handlers['Run']=fail
+            with patch.object(_ExcelPdfObserver,'_scan',side_effect=PermissionError('denied')):event=self.session_command('run_macro',name='Generate')
+            self.assertEqual(event['event'],'error');self.assertIn('original macro failure',event['message']);self.assertNotIn('denied',event['message'])
+            self.assertEqual(event['result']['pdf_outputs']['status'],'unknown')
+        def test_pdf_without_valid_header_end_or_allowed_size_is_not_reported(self):
+            observer=_ExcelPdfObserver(str(self.path));before=observer.capture()
+            (self.path.parent/'truncated.pdf').write_bytes(b'%PDF-1.7\nnot finished yet........');(self.path.parent/'renamed.pdf').write_bytes(b'not PDF but long enough\n%%EOF\n')
+            self.fake_pdf(self.path.parent/'oversize.pdf',b'x'*100)
+            with patch.object(_ExcelPdfObserver,'MAX_SIZE',64):result=observer.outputs(before)
+            self.assertEqual(result['files'],[]);self.assertFalse(result['complete']);self.assertEqual(result['status'],'unknown')
+        def test_pdf_scan_limits_do_not_mislabel_unobserved_baseline_as_new(self):
+            observer=_ExcelPdfObserver(str(self.path));self.fake_pdf(self.path.parent/'already-existed.pdf')
+            with patch.object(_ExcelPdfObserver,'MAX_ENTRIES',0):before=observer.capture()
+            self.assertFalse(before['complete']);result=observer.outputs(before);self.assertEqual(result['files'],[]);self.assertEqual(result['status'],'unknown')
+            before=observer.capture();self.fake_pdf(self.path.parent/'new.pdf')
+            with patch.object(_ExcelPdfObserver,'MAX_PDFS',0):result=observer.outputs(before)
+            self.assertEqual(result['files'],[]);self.assertFalse(result['complete'])
+            with patch.object(_ExcelPdfObserver,'MAX_RESULT_BYTES',1):result=observer.outputs(before)
+            self.assertEqual(result['files'],[]);self.assertFalse(result['complete'])
+        def test_missing_pdf_scope_does_not_scan_the_current_directory(self):
+            observer=_ExcelPdfObserver('')
+            with patch.object(os,'scandir') as scan:result=observer.outputs(observer.capture())
+            scan.assert_not_called();self.assertEqual(result,{'files':[],'scope':'','complete':False,'status':'unknown'})
+        def test_pdf_scan_rejects_reparse_entries_without_reading_them(self):
+            import stat
+            observer=_ExcelPdfObserver(str(self.path));before=observer.capture()
+            class Entry:
+                name='external.pdf'
+                def stat(inner,follow_symlinks=True):
+                    self.assertFalse(follow_symlinks);return FakeCom(st_mode=stat.S_IFREG,st_file_attributes=0x400)
+            with patch.object(os,'scandir',return_value=contextlib.nullcontext(iter([Entry()]))),patch.object(_ExcelPdfObserver,'_verify_pdf') as verify:
+                result=observer.outputs(before)
+            verify.assert_not_called();self.assertFalse(result['complete']);self.assertEqual(result['files'],[])
+            self.assertTrue(_ExcelPdfObserver._linked(FakeCom(st_mode=stat.S_IFLNK,st_file_attributes=0)))
+        def test_pdf_scan_rejects_linked_directory_or_changed_directory_identity(self):
+            observer=_ExcelPdfObserver(str(self.path));before=observer.capture();self.fake_pdf(self.path.parent/'new.pdf')
+            before['directory']=(-1,-1);result=observer.outputs(before);self.assertEqual(result['status'],'unknown');self.assertFalse(result['files'])
+            with patch.object(_ExcelPdfObserver,'_directory',side_effect=OSError('linked directory')):result=observer.outputs(before)
+            self.assertEqual(result['status'],'unknown');self.assertFalse(result['files'])
+        def test_pdf_scan_timeout_returns_without_accumulating_blocked_threads(self):
+            observer=_ExcelPdfObserver(str(self.path));release=threading.Event();entered=threading.Event();calls=[]
+            def blocked(*_):
+                calls.append(1);entered.set();release.wait(2);return {'entries':{},'files':[],'complete':True,'directory':None}
+            try:
+                with patch.object(observer,'_scan',side_effect=blocked),patch.object(_ExcelPdfObserver,'TIME_LIMIT',.02):
+                    started=time.monotonic();first=observer.capture();self.assertTrue(entered.wait(.5));pending=observer.pending;second=observer.capture()
+                    self.assertLess(time.monotonic()-started,.5);self.assertIs(observer.pending,pending);self.assertEqual(calls,[1]);self.assertFalse(first['complete']);self.assertFalse(second['complete'])
+            finally:release.set();observer.pending.join(2)
         def test_control_macro_keeps_exact_assignment_context_and_never_invokes_activex(self):
             self.worker.open_workbook(self.open_request());self.book.FullName=str(self.path)
             on_action="'"+str(self.path).replace("'","''")+"'!Moduł.Generuj"
@@ -22355,6 +22815,7 @@ def self_test():
     suite.addTests(database_cell_service_test_suite())
     suite.addTests(database_cell_test_suite())
     suite.addTests(excel_native_dialog_test_suite())
+    suite.addTests(excel_macro_pdf_test_suite())
     suite.addTests(excel_session_test_suite())
     suite.addTests(excel_handoff_test_suite())
     suite.addTests(sheet_office_fidelity_test_suite())
@@ -23865,7 +24326,7 @@ def ui_test():
         def test_office_compact_tabs_show_prompt_actions_at_900_by_760_without_stealing_manual_tab(self):
             dialog,instances,scan,action=self.excel_session_fixture();dialog.start_session();self.wait(lambda:not dialog._scan_pending);instances[0].snapshot['last_result']=self.native_excel_payload();dialog.poll()
             prompt=self.excel_prompt_fixture();dialog.render_prompts([prompt]);dialog.resize(900,760);QTest.qWait(60);app.processEvents()
-            self.assertLessEqual(dialog.height(),760);self.assertEqual(dialog.body_tabs.currentIndex(),1);skip=self.excel_button(dialog,'Pomiń → Nie');self.assertTrue(dialog.prompt_scroll.viewport().rect().contains(skip.mapTo(dialog.prompt_scroll.viewport(),skip.rect().center())))
+            self.assertLessEqual(dialog.height(),760);self.assertEqual(dialog.body_tabs.currentIndex(),1);answer=self.excel_button(dialog,'Nie');self.assertTrue(dialog.prompt_scroll.viewport().rect().contains(answer.mapTo(dialog.prompt_scroll.viewport(),answer.rect().center())))
             dialog.body_tabs.setCurrentIndex(0);dialog.render_prompts([prompt]);self.assertEqual(dialog.body_tabs.currentIndex(),0)
             prompt['fingerprint']='new-prompt';dialog.render_prompts([prompt]);self.assertEqual(dialog.body_tabs.currentIndex(),1);dialog.render_prompts([]);self.assertEqual(dialog.body_tabs.currentIndex(),0)
         def test_office_screen_matrix_keeps_footer_inside_work_area_with_large_font_and_long_context(self):
@@ -23955,6 +24416,105 @@ def ui_test():
         def native_session(self,payload=None):
             dialog,instances,scan,action=self.excel_session_fixture();dialog._timer.stop();dialog.start_session();controller=instances[0]
             controller.snapshot['last_result']=payload or self.native_excel_payload();dialog.poll();app.processEvents();return dialog,controller
+        def macro_pdf_session(self):
+            payload=self.native_excel_payload();payload['snapshot']['controls'][0]['caption']='Generuj PDF';dialog,controller=self.native_session(payload)
+            workspace=self.root/'macro-session';workspace.mkdir();controller.snapshot['workspace_path']=str(workspace);dialog.poll();self.wait(lambda:not dialog._scan_pending)
+            return dialog,controller,workspace
+        def macro_pdf_file(self,folder,name='report.pdf'):
+            path=folder/name;path.write_bytes(b'%PDF-1.4\n% Inert GUI fixture: '+name.encode('utf-8')+b'; never produced by Office.\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n');info=path.stat()
+            return {'path':str(path),'name':path.name,'size':info.st_size,'mtime_ns':info.st_mtime_ns,'device':info.st_dev,'inode':info.st_ino}
+        def macro_pdf_start(self,dialog,target):
+            from unittest import mock
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(target),'')):dialog.run_control_macro()
+            self.wait(lambda:not dialog._command_pending)
+        def macro_pdf_finish(self,dialog,controller,workspace,files,complete=True,error=''):
+            outputs={'scope':str(workspace),'files':files,'complete':complete,'status':'observed' if files else 'not_observed'}
+            controller.snapshot.update(state='ready',operation='',last_operation='run_control_macro',last_result={'action':'run_control_macro','workbook_id':'native-book','pdf_outputs':outputs},error=error,error_operation='run_control_macro' if error else '')
+            dialog.poll();app.processEvents();return outputs
+        def test_office_macro_pdf_cancelled_destination_never_runs_control(self):
+            from unittest import mock
+            dialog,controller,workspace=self.macro_pdf_session();before=list(controller.calls)
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=('','')) as save:dialog.native_macro.click();save.assert_called_once()
+            self.assertEqual(controller.calls,before);self.assertFalse(dialog._command_pending);self.assertEqual(dialog._pdf_attempt_destination,'');self.assertEqual(list(workspace.iterdir()),[])
+            invalid=self.root/'report.docx'
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(invalid),'')):self.assertFalse(dialog.choose_macro_pdf_destination())
+            self.assertEqual(dialog._pdf_destination,'');self.assertIn('.pdf',dialog.message.text());self.assertFalse(invalid.exists())
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(self.root/'no-extension'),'')):self.assertFalse(dialog.choose_macro_pdf_destination())
+            self.assertEqual(dialog._pdf_destination,'');self.assertFalse((self.root/'no-extension.pdf').exists())
+        def test_office_macro_pdf_one_complete_output_copies_bytes_and_survives_background_read(self):
+            from unittest import mock
+            dialog,controller,workspace=self.macro_pdf_session();target=self.root/'chosen-report.pdf';descriptor=self.macro_pdf_file(workspace)
+            with mock.patch.object(ui['QtGui'].QDesktopServices,'openUrl',return_value=True) as opened:
+                self.macro_pdf_start(dialog,target);self.assertEqual(controller.calls[-1][0],'run_control_macro');self.assertEqual(dialog._pdf_destination,str(target));self.assertFalse(target.exists())
+                self.macro_pdf_finish(dialog,controller,workspace,[descriptor]);self.wait(lambda:not dialog._pdf_publish_pending)
+                self.assertEqual(target.read_bytes(),Path(descriptor['path']).read_bytes());self.assertEqual(dialog.macro_pdf_location.text(),str(target));self.assertTrue(dialog.macro_pdf_open.isVisible());opened.assert_not_called()
+                retained=clone(dialog._macro_pdf_outputs);dialog.refresh_native(background=True);self.wait(lambda:not dialog._command_pending)
+                controller.snapshot.update(state='ready',operation='',last_operation='read_range',last_result=dict(self.native_excel_payload(),action='read_range'),error='');dialog.poll()
+                self.assertEqual(dialog._macro_pdf_outputs,retained);self.assertEqual(dialog.macro_pdf_location.text(),str(target));self.assertTrue(dialog.macro_pdf_open.isVisible());opened.assert_not_called()
+                dialog.macro_pdf_open.click();opened.assert_called_once();self.assertEqual(Path(opened.call_args.args[0].toLocalFile()),target)
+        def test_office_macro_pdf_no_observed_file_never_manufactures_document(self):
+            dialog,controller,workspace=self.macro_pdf_session();target=self.root/'missing.pdf';self.macro_pdf_start(dialog,target);self.macro_pdf_finish(dialog,controller,workspace,[])
+            self.assertFalse(target.exists());self.assertFalse(dialog._pdf_publish_pending);self.assertEqual(list(workspace.iterdir()),[]);self.assertEqual(dialog.macro_pdf_files.count(),0)
+            self.assertIn('Nie znaleziono',dialog.macro_pdf_note.text());self.assertFalse(dialog.macro_pdf_save.isEnabled());self.assertTrue(dialog.macro_pdf_locate.isEnabled());self.assertFalse(any(call[0]=='export_pdf' for call in controller.calls))
+        def test_office_macro_pdf_destination_confirmation_is_consumed_by_one_attempt(self):
+            from unittest import mock
+            dialog,controller,workspace=self.macro_pdf_session();target=self.root/'one-attempt.pdf'
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(target),'')):self.assertTrue(dialog.choose_macro_pdf_destination())
+            self.assertTrue(dialog._pdf_destination_confirmed)
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName') as choose:dialog.run_control_macro();choose.assert_not_called()
+            self.wait(lambda:not dialog._command_pending);self.assertFalse(dialog._pdf_destination_confirmed);self.macro_pdf_finish(dialog,controller,workspace,[]);calls=list(controller.calls)
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=('','')) as choose:dialog.run_control_macro();choose.assert_called_once()
+            self.assertEqual(controller.calls,calls);dialog.macro_name.setText('Report')
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=('','')) as choose:dialog.run_macro();choose.assert_called_once()
+            self.assertEqual(controller.calls,calls);self.assertFalse(target.exists())
+        def test_office_macro_pdf_multiple_outputs_require_explicit_file_and_destination(self):
+            from unittest import mock
+            dialog,controller,workspace=self.macro_pdf_session();target=self.root/'selected.pdf';first=self.macro_pdf_file(workspace,'first.pdf');second=self.macro_pdf_file(workspace,'second.pdf')
+            self.macro_pdf_start(dialog,target);self.macro_pdf_finish(dialog,controller,workspace,[first,second])
+            self.assertFalse(target.exists());self.assertEqual(dialog.macro_pdf_files.currentIndex(),-1);self.assertFalse(dialog.macro_pdf_save.isEnabled());self.assertIn('Wybierz właściwy',dialog.macro_pdf_note.text())
+            dialog.macro_pdf_files.setCurrentIndex(1);self.assertTrue(dialog.macro_pdf_save.isEnabled())
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=('','')):dialog.macro_pdf_save.click()
+            self.assertFalse(target.exists());self.assertFalse(dialog._pdf_publish_pending)
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(target),'')):dialog.macro_pdf_save.click()
+            self.wait(lambda:not dialog._pdf_publish_pending);self.assertEqual(target.read_bytes(),Path(second['path']).read_bytes());self.assertTrue(Path(first['path']).is_file());self.assertTrue(Path(second['path']).is_file())
+        def test_office_macro_pdf_partial_observation_requires_manual_save(self):
+            from unittest import mock
+            dialog,controller,workspace=self.macro_pdf_session();target=self.root/'partial-observation.pdf';descriptor=self.macro_pdf_file(workspace)
+            self.macro_pdf_start(dialog,target);self.macro_pdf_finish(dialog,controller,workspace,[descriptor],complete=False)
+            self.assertFalse(target.exists());self.assertFalse(dialog._pdf_publish_pending);self.assertIn('wybierz wynik ręcznie',dialog.macro_pdf_note.text())
+            with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(target),'')):dialog.save_selected_macro_pdf()
+            self.wait(lambda:not dialog._pdf_publish_pending);self.assertEqual(target.read_bytes(),Path(descriptor['path']).read_bytes())
+        def test_office_macro_pdf_error_with_output_never_publishes_automatically(self):
+            dialog,controller,workspace=self.macro_pdf_session();target=self.root/'do-not-overwrite.pdf';target.write_bytes(b'KEEP EXISTING DESTINATION');descriptor=self.macro_pdf_file(workspace)
+            self.macro_pdf_start(dialog,target);self.macro_pdf_finish(dialog,controller,workspace,[descriptor],error='Makro przerwało pracę po utworzeniu części wyniku.')
+            self.assertEqual(target.read_bytes(),b'KEEP EXISTING DESTINATION');self.assertFalse(dialog._pdf_publish_pending);self.assertEqual(dialog._pdf_attempt_destination,'');self.assertEqual(dialog.macro_pdf_files.count(),1);self.assertIsNotNone(dialog._last_failure)
+        def test_office_macro_pdf_manual_locate_other_folder_cancellation_then_explicit_copy(self):
+            from unittest import mock
+            dialog,controller,workspace=self.macro_pdf_session();external=self.root/'macro-custom-folder';external.mkdir();descriptor=self.macro_pdf_file(external);target=external/'manual-report.pdf'
+            dialog.apply_macro_pdf_outputs({'scope':str(workspace),'files':[],'complete':True,'status':'not_observed'});calls=list(controller.calls)
+            with mock.patch.object(QW.QFileDialog,'getOpenFileName',return_value=(descriptor['path'],'')),mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=('','')):dialog.locate_macro_pdf()
+            self.assertFalse(target.exists());self.assertFalse(dialog._pdf_publish_pending);self.assertEqual(controller.calls,calls)
+            with mock.patch.object(ui['QtGui'].QDesktopServices,'openUrl') as opened,mock.patch.object(QW.QFileDialog,'getOpenFileName',return_value=(descriptor['path'],'')),mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(target),'')):
+                dialog.locate_macro_pdf();self.wait(lambda:not dialog._pdf_publish_pending);self.assertEqual(target.read_bytes(),Path(descriptor['path']).read_bytes());opened.assert_not_called()
+            self.assertEqual(dialog.macro_pdf_location.text(),str(target));self.assertEqual(controller.calls,calls)
+        def test_office_macro_pdf_rejected_next_command_cannot_publish_previous_output(self):
+            from unittest import mock
+            dialog,controller,workspace=self.macro_pdf_session();first_target=self.root/'first.pdf';next_target=self.root/'must-stay-untouched.pdf';descriptor=self.macro_pdf_file(workspace)
+            self.macro_pdf_start(dialog,first_target);self.macro_pdf_finish(dialog,controller,workspace,[descriptor]);self.wait(lambda:not dialog._pdf_publish_pending);self.assertTrue(first_target.is_file());next_target.write_bytes(b'KEEP')
+            with mock.patch.object(controller,'submit',side_effect=UserError('Odrzucono nowe polecenie.')),mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(next_target),'')):
+                dialog.run_control_macro();self.wait(lambda:not dialog._command_pending and not dialog._pdf_publish_pending)
+            self.assertEqual(next_target.read_bytes(),b'KEEP');self.assertEqual(dialog._pdf_attempt_destination,'');self.assertIn('Odrzucono nowe',dialog.error_report())
+        def test_office_macro_pdf_new_macro_clears_previous_result_and_published_link(self):
+            dialog,controller,workspace=self.macro_pdf_session();target=self.root/'first-result.pdf';descriptor=self.macro_pdf_file(workspace)
+            self.macro_pdf_start(dialog,target);self.macro_pdf_finish(dialog,controller,workspace,[descriptor]);self.wait(lambda:not dialog._pdf_publish_pending);self.assertTrue(target.is_file())
+            self.macro_pdf_start(dialog,self.root/'next-result.pdf');self.assertIsNone(dialog._macro_pdf_outputs);self.assertEqual(dialog.macro_pdf_files.count(),0);self.assertEqual(dialog.macro_pdf_location.text(),'');self.assertFalse(dialog.macro_pdf_frame.isVisible());self.assertTrue(target.is_file())
+        def test_office_macro_pdf_output_list_rejects_foreign_scope_and_nested_paths(self):
+            dialog,controller,workspace=self.macro_pdf_session();valid=self.macro_pdf_file(workspace);external=self.root/'external.pdf';external.write_bytes(Path(valid['path']).read_bytes());nested=workspace/'nested';nested.mkdir();nested_file=self.macro_pdf_file(nested)
+            dialog.apply_macro_pdf_outputs({'scope':str(self.root),'files':[dict(valid,path=str(external))],'complete':True});self.assertEqual(dialog.macro_pdf_files.count(),0);self.assertFalse(dialog._macro_pdf_outputs['complete'])
+            dialog.apply_macro_pdf_outputs({'scope':str(workspace),'files':[dict(valid,path='relative.pdf'),dict(valid,path=str(external)),nested_file,valid],'complete':True})
+            self.assertEqual(dialog.macro_pdf_files.count(),1);self.assertEqual(dialog.macro_pdf_files.currentData(),valid);self.assertFalse(dialog._macro_pdf_outputs['complete'])
+            target=self.root/'must-not-select-filtered-result.pdf';self.macro_pdf_start(dialog,target);self.macro_pdf_finish(dialog,controller,workspace,[dict(valid,path=str(external)),valid])
+            self.assertEqual(dialog.macro_pdf_files.count(),1);self.assertFalse(dialog._macro_pdf_outputs['complete']);self.assertFalse(dialog._pdf_publish_pending);self.assertFalse(target.exists());self.assertIn('wybierz wynik ręcznie',dialog.macro_pdf_note.text())
         def test_office_run_clicked_during_automatic_read_is_queued_and_sent_once(self):
             dialog,controller=self.native_session();self.assertTrue(dialog.native_macro.isEnabled())
             self.assertTrue(dialog.refresh_native(background=True));self.wait(lambda:not dialog._command_pending);self.assertEqual(controller.calls[-1][0],'read_range');self.assertTrue(dialog.background_read_active())
@@ -24025,6 +24585,21 @@ def ui_test():
             dialog.run_control_macro();self.wait(lambda:not dialog._command_pending);payload['revision']=1
             controller.snapshot.update(state='ready',operation='',last_operation='run_control_macro',last_result=payload,error='');dialog.poll();app.processEvents()
             self.assertIsNone(dialog._last_failure);self.assertFalse(dialog.failure_frame.isVisible());self.assertNotIn('nie powiodła',dialog.state_note.text())
+        def test_office_active_question_takes_priority_without_losing_error_details(self):
+            from unittest import mock
+            dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);details='COM diagnostic\n'+('full detail '*120)
+            dialog.remember_failure('Poprzedni problem z makrem',details,'macro_unavailable','run_macro');before=dialog.error_report();self.assertTrue(dialog.failure_frame.isVisible())
+            dialog.history.appendPlainText('Zachowana historia sesji');prompt=self.excel_prompt_fixture();available=QC.QRect(0,0,683,364)
+            with mock.patch.object(dialog,'available_work_area',return_value=available):
+                dialog.fit_to_screen(available);dialog.render_prompts([prompt]);dialog.show_message();app.processEvents()
+                self.assertFalse(dialog.failure_frame.isVisible());self.assertTrue(dialog.previous_failure_button.isVisible());self.assertEqual(dialog.error_report(),before)
+                self.assertEqual([b.text() for b in dialog.native_prompt_host.findChildren(QW.QPushButton) if b.isVisible()],['Tak','Nie'])
+                answer=self.excel_button(dialog,'Nie');dialog.prompt_scroll.ensureWidgetVisible(answer,4,4);app.processEvents()
+                self.assertTrue(dialog.prompt_scroll.viewport().rect().contains(QC.QRect(answer.mapTo(dialog.prompt_scroll.viewport(),QC.QPoint(0,0)),answer.size())))
+                with mock.patch.object(ui['FormDialog'],'exec',return_value=0) as opened:dialog.previous_failure_button.click();opened.assert_called_once()
+                dialog.copy_error_details();self.assertIn(details,QW.QApplication.clipboard().text());self.assertEqual(dialog.history.toPlainText(),'Zachowana historia sesji')
+                dialog.remember_failure('Nowszy błąd',details+'\nnew','operation_failed','read_range');self.assertFalse(dialog.failure_frame.isVisible());self.assertTrue(dialog.previous_failure_button.isVisible())
+                dialog.render_prompts([]);app.processEvents();self.assertTrue(dialog.failure_frame.isVisible());self.assertFalse(dialog.previous_failure_button.isVisible());self.assertEqual(dialog.failure_text.toPlainText(),'Nowszy błąd');self.assertIn('new',dialog.error_report())
         def test_office_show_window_works_without_control_and_during_blocked_macro(self):
             payload=self.native_excel_payload();payload['snapshot']['controls']=[];dialog,controller=self.native_session(payload)
             self.assertTrue(dialog.native_reveal.isEnabled());dialog.native_reveal.click();self.wait(lambda:not dialog._command_pending)
@@ -24143,20 +24718,26 @@ def ui_test():
             controller.snapshot.update(state='ready',last_result={},error='');dialog.poll();before=len(controller.calls)
             with mock.patch.object(QW.QFileDialog,'getSaveFileName',return_value=(str(self.service.root/'protected.xlsm'),'')):dialog.save_copy_button.click()
             self.wait(lambda:not dialog._command_pending);self.assertEqual(len(controller.calls),before);self.assertTrue(dialog.message.text())
-        def test_excel_session_skip_sends_exact_no_once_and_keeps_pending(self):
+        def test_excel_session_original_no_sends_exact_answer_once_and_keeps_pending(self):
             prompt=self.excel_prompt_fixture();dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);dialog.start_session();self.wait(lambda:not dialog._scan_pending)
             self.assertEqual(dialog._last_prompts,[prompt]);self.assertIn(prompt['text'],[v.toPlainText() for v in dialog.prompt_frame.findChildren(QW.QPlainTextEdit)])
-            self.excel_button(dialog,'Pomiń → Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending);action.assert_called_once_with(701,702,prompt,705)
-            self.assertIn('Wysłano wybór „Nie”',dialog.message.text());self.assertFalse(self.excel_button(dialog,'Pomiń → Nie').isEnabled());dialog.click_prompt(prompt,prompt['buttons'][1]);self.assertEqual(action.call_count,1)
+            self.assertEqual([b.text() for b in dialog.native_prompt_host.findChildren(QW.QPushButton) if b.isVisible()],['Tak','Nie'])
+            self.excel_button(dialog,'Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending);action.assert_called_once_with(701,702,prompt,705)
+            self.assertIn('Wysłano wybór „Nie”',dialog.message.text());self.assertFalse(self.excel_button(dialog,'Nie').isEnabled());dialog.click_prompt(prompt,prompt['buttons'][1]);self.assertEqual(action.call_count,1)
+        def test_excel_session_ignore_is_only_an_original_choice_without_recommendation(self):
+            prompt=self.excel_prompt_fixture();prompt['buttons']=[{'hwnd':704,'text':'Przerwij','id':3,'enabled':True},{'hwnd':705,'text':'Ponów próbę','id':4,'enabled':True},{'hwnd':706,'text':'Ignoruj','id':5,'enabled':True}]
+            dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);dialog.start_session();self.wait(lambda:not dialog._scan_pending)
+            self.assertEqual([b.text() for b in dialog.native_prompt_host.findChildren(QW.QPushButton) if b.isVisible()],['Przerwij','Ponów próbę','Ignoruj']);action.assert_not_called()
+            self.excel_button(dialog,'Ignoruj').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending);action.assert_called_once_with(701,702,prompt,706)
         def test_excel_session_prompt_stale_error_never_clicks_an_alternative(self):
             prompt=self.excel_prompt_fixture();dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);action.side_effect=UserError('Komunikat zmienił się; niczego nie kliknięto.')
-            dialog.start_session();self.wait(lambda:not dialog._scan_pending);self.excel_button(dialog,'Pomiń → Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending)
+            dialog.start_session();self.wait(lambda:not dialog._scan_pending);self.excel_button(dialog,'Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending)
             self.assertEqual(action.call_count,1);self.assertIn('niczego nie kliknięto',dialog.message.text());self.assertFalse(dialog._sent_prompts)
         def test_excel_session_unanswered_prompt_can_be_manually_reenabled(self):
             prompt=self.excel_prompt_fixture();dialog,instances,scan,action=self.excel_session_fixture(prompts=[prompt]);dialog.start_session();self.wait(lambda:not dialog._scan_pending)
-            self.excel_button(dialog,'Pomiń → Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending);dialog._sent_prompts[703]=('prompt-one',time.monotonic()-4);dialog.poll()
-            self.excel_button(dialog,'Odblokuj odpowiedzi').click();self.assertEqual(action.call_count,1);self.assertTrue(self.excel_button(dialog,'Pomiń → Nie').isEnabled())
-            self.excel_button(dialog,'Pomiń → Nie').click();self.wait(lambda:not dialog._action_pending);self.assertEqual(action.call_count,2)
+            self.excel_button(dialog,'Nie').click();self.wait(lambda:not dialog._action_pending and not dialog._scan_pending);dialog._sent_prompts[703]=('prompt-one',time.monotonic()-4);dialog.poll()
+            self.excel_button(dialog,'Odblokuj odpowiedzi').click();self.assertEqual(action.call_count,1);self.assertTrue(self.excel_button(dialog,'Nie').isEnabled())
+            self.excel_button(dialog,'Nie').click();self.wait(lambda:not dialog._action_pending);self.assertEqual(action.call_count,2)
         def test_excel_session_scan_runs_off_gui_and_foreign_session_cannot_publish(self):
             from unittest import mock
             dialog,instances,scan,action=self.excel_session_fixture();gate=threading.Event();started=threading.Event();thread_ids=[]
