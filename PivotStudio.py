@@ -5755,6 +5755,41 @@ def _vba_plan_masked(text):
     return re.sub(r'"(?:[^"]|"")*"', lambda match: " " * len(match[0]), text)
 
 
+def _vba_plan_logical_lines(code):
+    """Join explicit continuations for analysis, retaining exact source spans."""
+    lines=[];cleaned=[];raw=[];parts=[]
+    for line in code.splitlines(keepends=True):
+        text=_vba_plan_code(line);raw.append(line)
+        continued=bool(re.search(r"\s_\s*$",_vba_plan_masked(text)))
+        parts.append(re.sub(r"\s_\s*$","",text) if continued else text)
+        if len(raw)>64:raise ValueError("Zbyt długa kontynuacja instrukcji VBA.")
+        if not continued:
+            lines.append(''.join(raw));cleaned.append(' '.join(parts).strip());raw=[];parts=[]
+    if raw:raise ValueError("Niepełna kontynuacja instrukcji VBA.")
+    return lines,cleaned
+
+
+def _vba_plan_local_scalars(cleaned, start, end):
+    # Never synthesize assignments to properties, globals, arrays or ByRef args.
+    result={}
+    for line in cleaned[start+1:end]:
+        match=re.fullmatch(r"Dim\s+(.+)",line,re.I)
+        if not match:continue
+        for part in _vba_plan_split_args(match[1]):
+            item=re.fullmatch(r"([A-Za-z_]\w*)(?:\s+As\s+(\w+))?",part,re.I)
+            if item and item[2] and item[2].casefold() in _VBA_PLAN_PRIMITIVE:result[item[1].casefold()]=item[2].casefold()
+    return result
+
+
+def _vba_plan_response(statement):
+    """A single Yes/No comparison, optionally followed by an inline return."""
+    match=re.fullmatch(r"If\s+(.+?)\s*(=|<>)\s*(vbYes|vbNo|6|7)\s+Then(?:\s+(.+))?",statement,re.I)
+    if not match:return None
+    answer=6 if match[3].casefold() in ('vbyes','6') else 7
+    return {'expression':match[1].strip(),'tail':match[4],
+            'continue_answer':(13-answer) if match[2]=='=' else answer}
+
+
 def _vba_plan_split_args(text):
     result = []
     quoted = False
@@ -5868,20 +5903,26 @@ def _vba_plan_declared_symbols(declaration, cleaned, start, end):
     return symbols
 
 
-def _vba_plan_message(statement, symbols, shadowed):
-    match = re.fullmatch(r"(?:Call\s+)?MsgBox\s*(.*)", statement, re.I)
-    if not match or "msgbox" in shadowed or "msgbox" in symbols:
+def _vba_plan_message(statement, symbols, shadowed, bindings=None):
+    match = re.fullmatch(r"(?:Call\s+)?((?:VBA\.)?(?:Interaction\.)?MsgBox)\b\s*(.*)", statement, re.I)
+    qualified=bool(match and match[1].casefold().startswith('vba.'))
+    if not match or (qualified and 'vba' in shadowed) or (not qualified and ('msgbox' in shadowed or 'msgbox' in symbols or '.' in match[1])):
         raise ValueError("Blok nie zawiera pojedynczego standardowego MsgBox.")
-    arguments = match[1].strip()
+    arguments = match[2].strip()
     if arguments.startswith("(") and arguments.endswith(")"):
         arguments = arguments[1:-1]
     args = _vba_plan_split_args(arguments)
     if not 1 <= len(args) <= 3 or not args[0]:
         raise ValueError("Nieobsługiwane argumenty MsgBox.")
-    for argument in args:
-        _vba_plan_pure_expression(argument, symbols, shadowed)
-    literals = [match[1].replace('""', '"') for match in re.finditer(r'"((?:[^"]|"")*)"', args[0])]
-    return args[0], literals
+    for index,argument in enumerate(args):
+        if argument or index==0:_vba_plan_pure_expression(argument, symbols, shadowed)
+    expression=args[0]
+    if bindings:
+        tokens=_vba_plan_tokens(expression)
+        expression=' '.join(bindings.get(token.casefold(),token) for token in tokens)
+        if len(expression)>2048:raise ValueError('Treść komunikatu przekracza limit analizy.')
+    literals = [match[1].replace('""', '"') for match in re.finditer(r'"((?:[^"]|"")*)"', expression)]
+    return expression, literals
 
 
 def _vba_plan_match_prompt(expression, literals, prompt):
@@ -5942,12 +5983,11 @@ def _vba_plan_boolean_success(cleaned, declaration, proc_start, block_start, blo
 def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
     """Return preview-only proposals; callers must revalidate before writing a COPY.
 
-    Supported: a multiline If/End If without Else, whose only executable body
-    is MsgBox plus Exit Sub/Function, optionally its Boolean Function=False.
-    A single inner `If MsgBox(...) = vbYes/vbNo Then Exit ...` is also recognized.
-    The outer condition is kept verbatim and evaluated as before, including
-    unknown calls and object reads. Only its verified message/early-return body
-    is disabled by an inner False guard. Other work in that body is rejected.
+    Recognizes direct/assigned MsgBox and Yes/No return guards, with explicit
+    continuations and preserved local message construction. An assigned numeric
+    response is set to the reviewed continuation value inside the original guard.
+    Ordinary outer conditions remain evaluated; a direct MsgBox condition is
+    itself disabled. Only verified message/early-return code is skipped.
     No live VBA branches are inferred.
     """
     result = {"status": "unsupported", "candidates": [], "rejections": [], "complete": True,
@@ -5972,10 +6012,10 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
             result["complete"] = False
             continue
         module_names.add(module_key)
+        shadowed.add(module_key)
         code = module["code"]
-        lines = code.splitlines(keepends=True)
         try:
-            cleaned = [_vba_plan_code(line) for line in lines]
+            lines,cleaned = _vba_plan_logical_lines(code)
         except ValueError as error:
             result["complete"] = False
             result["rejections"].append({"module": module["name"], "reason": str(error)})
@@ -6017,6 +6057,7 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                 if proc_end - proc_start > 5000:
                     raise ValueError("Procedura przekracza limit analizy planera.")
                 symbols = _vba_plan_declared_symbols(declaration, cleaned, proc_start, proc_end)
+                locals_ = _vba_plan_local_scalars(cleaned, proc_start, proc_end)
             except ValueError as error:
                 result["complete"] = False
                 result["rejections"].append({"module": module_name, "procedure": declaration[2], "reason": str(error)})
@@ -6025,12 +6066,15 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                 continue
             for block_start in range(proc_start + 1, proc_end):
                 header = re.fullmatch(r"If\s+(.+?)\s+Then", cleaned[block_start], re.I)
-                if not header:
+                direct_response = _vba_plan_response(cleaned[block_start])
+                direct_message = bool(direct_response and re.match(r'(?:VBA\.(?:Interaction\.)?)?MsgBox\s*\(',direct_response['expression'],re.I))
+                inline_message = bool(direct_message and direct_response['tail'])
+                if not header and not inline_message:
                     continue
                 depth = 1
-                block_end = None
+                block_end = block_start if inline_message else None
                 has_else = False
-                for position in range(block_start + 1, proc_end):
+                for position in (() if inline_message else range(block_start + 1, proc_end)):
                     body_line = cleaned[position]
                     if re.fullmatch(r"If\s+.+?\s+Then", body_line, re.I):
                         depth += 1
@@ -6044,44 +6088,82 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                 if block_end is None:
                     continue
                 body = [text for text in cleaned[block_start + 1:block_end] if text]
+                if inline_message:body=[direct_response['tail']]
                 # Reject only blocks containing a related literal, so unrelated
                 # business code does not produce a wall of refusal messages.
-                literal_values = [match[1].replace('""', '"') for text in body for match in re.finditer(r'"((?:[^"]|"")*)"', text)]
+                literal_values = [match[1].replace('""', '"') for text in [cleaned[block_start]]+body for match in re.finditer(r'"((?:[^"]|"")*)"', text)]
                 visible_prompt=_vba_plan_normal(prompt_text)
                 literal_parts=[_vba_plan_normal(value) for value in literal_values]
                 if not any(len(value)>=20 and value in visible_prompt for value in literal_parts) and sum(len(value) for value in literal_parts if value and value in visible_prompt)<20:
                     continue
-                context = {"module": module_name, "procedure": declaration[2], "line": block_start + 1, "end_line": block_end + 1}
+                context = {"module": module_name, "procedure": declaration[2], "line": 1+sum(len(text.splitlines()) for text in lines[:block_start]), "end_line": sum(len(text.splitlines()) for text in lines[:block_end+1])}
                 try:
                     if has_else:
                         raise ValueError("Else/ElseIf mogłoby wykonać inną pracę po zmianie warunku; nie proponuję takiej zmiany.")
                     if any(text.startswith("#") for text in cleaned):
                         raise ValueError("Moduł zawiera dyrektywy kompilacji; wybrana wersja kodu nie została potwierdzona.")
-                    if any(":" in _vba_plan_masked(text) or re.search(r"\s_\s*$", text) for text in cleaned[block_start:block_end + 1]):
-                        raise ValueError("Etykiety, wiele instrukcji w wierszu lub kontynuacje są poza obsługiwanym wzorcem.")
-                    _vba_plan_split_args(header[1])  # Balanced strings/parentheses; no execution.
+                    if any(":" in _vba_plan_masked(text) for text in cleaned[block_start:block_end + 1]):
+                        raise ValueError("Etykiety lub wiele instrukcji w wierszu są poza obsługiwanym wzorcem.")
+                    _vba_plan_split_args(direct_response['expression'] if direct_message else header[1])
                     # Preserve the original condition and its evaluation. It may
                     # read cells or prepare data; only the verified body below
                     # is skipped, so no purity claim is made about the condition.
                     exit_text = "exit " + declaration[1].casefold()
                     boolean_return = False
-                    response_conditional = False
-                    if len(body) == 1:
-                        inner = re.fullmatch(r"If\s+(MsgBox\s*\(.*\))\s*=\s*(?:vbYes|vbNo|6|7)\s+Then\s+(Exit\s+(?:Sub|Function))", body[0], re.I)
-                        if not inner or _vba_plan_normal_spaces(inner[2]) != exit_text:
+                    response_conditional = direct_message
+                    response_assignment = None
+                    prefix_count = 0
+                    bindings = {}
+                    # Preserve local message construction; only its standard
+                    # MsgBox and the proven early-return branch may be disabled.
+                    if not direct_message:
+                        for statement in body:
+                            assignment=re.fullmatch(r'(?:Let\s+)?([A-Za-z_]\w*)\s*=\s*(.+)',statement,re.I)
+                            if not assignment or locals_.get(assignment[1].casefold())!='string':break
+                            _vba_plan_pure_expression(assignment[2],symbols,shadowed)
+                            expression=' '.join(bindings.get(token.casefold(),token) for token in _vba_plan_tokens(assignment[2]))
+                            if len(expression)>2048:raise ValueError('Treść komunikatu przekracza limit analizy.')
+                            bindings[assignment[1].casefold()]=expression;prefix_count+=1
+                        body=body[prefix_count:]
+                        if not body:raise ValueError('Brak komunikatu po przygotowaniu jego treści.')
+                        if declaration[1].casefold()=='function' and re.fullmatch(re.escape(declaration[2])+r'\s*=\s*False',body[0],re.I):
+                            boolean_return=True;body=body[1:]
+                    if not body:raise ValueError('Brak komunikatu walidacji.')
+                    assignment=re.fullmatch(r'(?:Let\s+)?([A-Za-z_]\w*)\s*=\s*((?:VBA\.(?:Interaction\.)?)?MsgBox\s*\(.*\))',body[0],re.I) if not direct_message else None
+                    if assignment:
+                        response_name=assignment[1]
+                        if locals_.get(response_name.casefold()) not in {'byte','integer','long','longlong','longptr','vbmsgboxresult'}:
+                            raise ValueError('Wynik MsgBox musi być zapisany w lokalnej zmiennej liczbowej lub VbMsgBoxResult; nie zmieniam parametrów, obiektów ani zmiennych globalnych.')
+                        inner=_vba_plan_response(body[1]) if len(body)>1 else None
+                        if not inner or inner['expression'].casefold()!=response_name.casefold():raise ValueError('Brak bezpośredniego sprawdzenia odpowiedzi zapisanej z MsgBox.')
+                        message_expression,message_literals=_vba_plan_message(assignment[2],symbols,shadowed,bindings)
+                        if inner['tail']:
+                            if len(body)!=2:raise ValueError('Po odpowiedzi MsgBox blok wykonuje dodatkową pracę.')
+                            remaining_body=[inner['tail']]
+                        else:
+                            if not re.fullmatch(r'End\s+If',body[-1],re.I):raise ValueError('Niepełny blok sprawdzenia odpowiedzi MsgBox.')
+                            remaining_body=body[2:-1]
+                        response_assignment=response_name+' = '+str(inner['continue_answer'])
+                        response_conditional=True
+                    elif direct_message:
+                        message_expression,message_literals=_vba_plan_message(direct_response['expression'],symbols,shadowed)
+                        remaining_body=body
+                    elif len(body) == 1:
+                        inner = _vba_plan_response(body[0])
+                        if not inner or not inner['tail'] or _vba_plan_normal_spaces(inner['tail']) != exit_text:
                             raise ValueError("Brak prostego MsgBox i wyjścia z tej samej procedury.")
-                        message_expression, message_literals = _vba_plan_message(inner[1], symbols, shadowed)
-                        remaining_body = [inner[2]]
+                        message_expression, message_literals = _vba_plan_message(inner['expression'], symbols, shadowed,bindings)
+                        remaining_body = [inner['tail']]
                         response_conditional = True
                     elif len(body) >= 3 and re.fullmatch(r"End\s+If", body[-1], re.I):
-                        inner = re.fullmatch(r"If\s+(MsgBox\s*\(.*\))\s*=\s*(?:vbYes|vbNo|6|7)\s+Then", body[0], re.I)
-                        if not inner:
+                        inner = _vba_plan_response(body[0])
+                        if not inner or inner['tail']:
                             raise ValueError("Zagnieżdżony blok nie jest prostym pytaniem MsgBox z wyjściem.")
-                        message_expression, message_literals = _vba_plan_message(inner[1], symbols, shadowed)
+                        message_expression, message_literals = _vba_plan_message(inner['expression'], symbols, shadowed,bindings)
                         remaining_body = body[1:-1]
                         response_conditional = True
                     else:
-                        message_expression, message_literals = _vba_plan_message(body[0], symbols, shadowed)
+                        message_expression, message_literals = _vba_plan_message(body[0], symbols, shadowed,bindings)
                         remaining_body = body[1:]
                     if response_conditional and {"vbyes", "vbno"} & shadowed:
                         raise ValueError("Nazwy odpowiedzi MsgBox są przesłonięte przez kod projektu.")
@@ -6104,8 +6186,18 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                     indent = re.match(r"\s*", lines[block_start])[0].rstrip("\r\n")
                     new_header = lines[block_start]
                     inner_indent = indent + '    '
-                    new_block = (new_header + inner_indent + "If False Then ' Pivot Studio: selected validation body bypass in reviewed copy" + ending
-                                 + "".join(lines[block_start + 1:block_end]) + inner_indent + 'End If' + ending + lines[block_end])
+                    guard="If False Then ' Pivot Studio: selected validation body bypass in reviewed copy"
+                    if direct_message:
+                        new_block=indent+guard+ending+old_block+indent+'End If'+ending
+                    else:
+                        prefix_end=block_start+1
+                        for _ in range(prefix_count):
+                            while not cleaned[prefix_end]:prefix_end+=1
+                            prefix_end+=1
+                        prefix=''.join(lines[block_start+1:prefix_end])
+                        response_line=inner_indent+response_assignment+ending if response_assignment else ''
+                        new_block = (new_header + prefix + response_line + inner_indent + guard + ending
+                                     + "".join(lines[prefix_end:block_end]) + inner_indent + 'End If' + ending + lines[block_end])
                     relation = "entry" if requested in (declaration[2].casefold(), (module_name + "." + declaration[2]).casefold()) else "unproven"
                     warnings = ["Pominięcie tej kontroli może dopuścić niepoprawne dane do dalszej pracy.", "Nie jest to dowód wykonanej gałęzi ani gwarancja utworzenia dokumentu.", "Zmieniaj tylko odrębną kopię, po sprawdzeniu całego proponowanego bloku."]
                     if relation == "unproven":
@@ -6116,9 +6208,11 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                                      source_sha256=_vba_plan_sha(code), old_block_sha256=_vba_plan_sha(old_block), new_block_sha256=_vba_plan_sha(new_block),
                                      start_offset=sum(map(len, lines[:block_start])), end_offset=sum(map(len, lines[:block_end + 1])),
                                      old_block=old_block, new_block=new_block, old_header=lines[block_start], new_header=new_header,
-                                     condition=header[1], match=match, entry_relation=relation, requires_confirmation=True,
+                                     condition=direct_response['expression'] if direct_message else header[1], match=match, entry_relation=relation, requires_confirmation=True,
                                      reason="Zachowano oryginalny warunek i jego wywołania. Pomijane jest tylko rozpoznane wnętrze: komunikat i wyjście, bez dodatkowej pracy. " + semantic_note,
                                      warnings=warnings)
+                    if direct_message:candidate['reason']='Pominięto rozpoznane pytanie MsgBox i jego gałąź wyjścia. '+semantic_note
+                    if response_assignment:candidate['reason']+=' Lokalna odpowiedź otrzyma wartość kontynuacji: '+response_assignment+'. Nie jest to odpowiedź odczytana z okna.'
                     if len(old_block) > 12000 or len(result["candidates"]) >= 8:
                         result["complete"] = False
                     else:
@@ -6134,6 +6228,13 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
         # A truncated inspection cannot establish a unique relationship to a dialog.
         result["candidates"] = []
         result["rejections"].append({"reason": "Nie przeanalizowano całego przekazanego kodu; nie proponuję niepełnej zmiany."})
+    # The enclosing recognized guard and its nested direct MsgBox branch are
+    # two descriptions of the same question, not two competing edit locations.
+    candidates=result['candidates']
+    result['candidates']=[item for item in candidates if not any(
+        other is not item and other['module']==item['module'] and
+        other['start_offset']<item['start_offset'] and item['end_offset']<=other['end_offset']
+        for other in candidates)]
     if result["candidates"]:
         result["status"] = "candidate" if len(result["candidates"]) == 1 else "ambiguous"
         for candidate in result["candidates"]:
@@ -13377,12 +13478,16 @@ def native_ui_types():
             candidates=plan.get('candidates') or []
             if not candidates:
                 reasons=plan.get('rejections') or [plan.get('reason') or 'Nie znaleziono jednoznacznego bloku walidacji, który można pominąć.']
-                descriptions=[]
+                grouped={}
                 for item in reasons:
-                    if not isinstance(item,dict):descriptions.append(str(item));continue
-                    location='.'.join(str(item.get(key) or '') for key in ('module','procedure')).strip('.')
-                    if item.get('line'):location+=' · wiersz '+str(item['line'])
-                    descriptions.append((location+': ' if location else '')+str(item.get('reason',item)))
+                    location='';reason=str(item)
+                    if isinstance(item,dict):
+                        location='.'.join(str(item.get(key) or '') for key in ('module','procedure')).strip('.')
+                        if item.get('line'):location+=' · wiersz '+str(item['line'])
+                        reason=str(item.get('reason',item))
+                    locations=grouped.setdefault(reason,[])
+                    if location and location not in locations:locations.append(location)
+                descriptions=[('; '.join(locations)+': ' if locations else '')+reason for reason,locations in grouped.items()]
                 self.patch_note.setText('Nie utworzono zmienionej kopii. '+'\n'.join(descriptions)[:2500]);return
             if self._patch_preview is not None:return
             dialog=QW.QDialog(self);dialog.setWindowTitle('Pierdol to — podgląd zmiany VBA');dialog.setWindowModality(Qt.WindowModality.WindowModal);layout=QW.QVBoxLayout(dialog)
@@ -13492,12 +13597,15 @@ def native_ui_types():
             self.fit_to_screen();QC.QTimer.singleShot(0,self._work_area_changed)
         def show_message(self):
             self.body_tabs.setCurrentIndex(1)
-            self.prompt_scroll.ensureWidgetVisible(self.native_prompt_host if self._last_prompts else self.failure_frame if self._last_failure else self.prompt_empty)
+            self.prompt_scroll.ensureWidgetVisible(self.native_prompt_host if self._last_prompts else self.failure_frame if self._last_failure and not self.foreground_command_active() else self.prompt_empty)
+        def foreground_command_active(self):
+            return bool((self._command_pending or self._snapshot.get('state')=='busy') and not self.background_read_active())
         def update_failure_presentation(self):
-            # An unanswered native question takes precedence over an earlier error.
+            # A new command or unanswered question takes precedence over an earlier error.
             # Keep the entire diagnostic available without pushing its buttons away.
-            self.failure_frame.setVisible(bool(self._last_failure) and not self._last_prompts)
-            self.previous_failure_button.setVisible(bool(self._last_failure and self._last_prompts))
+            previous=bool(self._last_prompts or self.foreground_command_active())
+            self.failure_frame.setVisible(bool(self._last_failure) and not previous)
+            self.previous_failure_button.setVisible(bool(self._last_failure) and previous)
         def error_report(self):
             failure=self._last_failure or {}
             return '\n\n'.join(str(failure[key]) for key in ('message','details','code','operation') if failure.get(key))
@@ -13505,7 +13613,7 @@ def native_ui_types():
         def show_error_details(self):
             if not self._last_failure:return
             dialog=QW.QDialog(self);dialog.setWindowTitle('Szczegóły błędu sesji Excel');layout=QW.QVBoxLayout(dialog)
-            if self._last_prompts or self._snapshot.get('state')=='busy':layout.addWidget(label('To szczegóły wcześniejszego błędu. Bieżące zadanie lub pytanie Excela jest pokazane w głównym oknie sesji.',True,True))
+            if self._last_prompts or self.foreground_command_active():layout.addWidget(label('To szczegóły wcześniejszego błędu. Bieżące zadanie lub pytanie Excela jest pokazane w głównym oknie sesji.',True,True))
             text=QW.QPlainTextEdit();text.setReadOnly(True);text.setPlainText(self.error_report());text.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.WidgetWidth);text.setWordWrapMode(QG.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere);layout.addWidget(text,1)
             layout.addWidget(button('Kopiuj szczegóły',self.copy_error_details));layout.addWidget(button('Zamknij',dialog.accept));limited_dialog_size(dialog,720,480);dialog.exec()
         def remember_failure(self,message,details='',code='',operation=''):
@@ -13681,7 +13789,7 @@ def native_ui_types():
             self.session_options.setVisible(active or bool(self._snapshot.get('workspace_path')) or bool(self._resume_path));self.control_bar.setVisible(active);self.native_macro.setVisible(active);self.native_reveal.setVisible(active);self.stop_button.setVisible(active)
             target=(self._office_context or {}).get('control') or {};caption=str(target.get('caption') or target.get('name') or '')
             self.selected_note.setText('Wybrany przycisk: '+caption);self.selected_note.setToolTip(self.selected_note.text());self.selected_note.setVisible(bool(caption and not active))
-            self.state_note.setToolTip(self.state_note.text());notice=(self._last_failure or {}).get('message') or self.message.text();self.notice_button.set_full_text(notice)
+            self.state_note.setToolTip(self.state_note.text());notice=self.state_note.text() if self.foreground_command_active() else (self._last_failure or {}).get('message') or self.message.text();self.notice_button.set_full_text(notice)
             self.notice_button.setVisible(bool(notice) and self.body_tabs.currentWidget() is not self.prompt_scroll)
             self.open_button.setText('Wznów tę kopię' if self._resume_path else 'Uruchom sesję Excela');self.open_button.setEnabled(bool(self._availability.get('available') and self.file.text().strip() and selecting))
             self.macro_name.setEnabled(usable);self.run_button.setEnabled(bool(usable and self.macro_name.text().strip() and not blocked));self.pdf_button.setEnabled(usable);self.save_copy_button.setEnabled(usable)
@@ -13696,9 +13804,9 @@ def native_ui_types():
             saved_patch=bool(state=='disconnected' and self._controller and not self._snapshot.get('finished') and not self._snapshot.get('handoff_incomplete') and not self._closing and not self._command_pending)
             self.patch_button.setEnabled(bool((ready and not blocked or saved_patch) and not self._action_pending and not self._last_prompts and not self._queued and self._patch_question and self._patch_preview is None))
             self.patch_diagnostic_button.setVisible(bool(active or self._patch_question));self.patch_diagnostic_button.setEnabled(self.patch_button.isEnabled())
-            if state=='disconnected' and self._patch_question and not self._snapshot.get('handoff_incomplete'):patch_status='Excel jest rozłączony. „Pierdol to” użyje ostatniej zapisanej kopii sesji, bez niezapisanych zmian. Możesz przygotować zmianę bez ponownego łączenia.'
+            if self._last_prompts or state=='busy' or self._command_pending:patch_status='Odpowiedz na pytania Excela i poczekaj na zakończenie bieżącej operacji.'
+            elif state=='disconnected' and self._patch_question and not self._snapshot.get('handoff_incomplete'):patch_status='Excel jest rozłączony. „Pierdol to” użyje ostatniej zapisanej kopii sesji, bez niezapisanych zmian. Możesz przygotować zmianę bez ponownego łączenia.'
             elif state=='disconnected':patch_status='Excel jest rozłączony. Nie ma zapamiętanego pytania lub kopia sesji jest niekompletna; zmiana VBA nie jest dostępna.'
-            elif self._last_prompts or state=='busy' or self._command_pending:patch_status='Odpowiedz na pytania Excela i poczekaj na zakończenie bieżącej operacji.'
             elif not self._patch_question:patch_status='Pivot nie odczytał jeszcze pytania walidacji w tej sesji. Uruchom makro; odpowiedź możesz wybrać tutaj albo w Excelu.'
             elif blocked:patch_status='Najpierw rozwiąż problem sesji pokazany powyżej. Zmiana VBA wymaga kompletnej kopii skoroszytu.'
             elif not ready:patch_status='Do przygotowania zmiany potrzebne jest połączenie z otwartą kopią skoroszytu.'
@@ -13724,7 +13832,9 @@ def native_ui_types():
             if self.message.text() and not self._last_failure:prompt_hint=self.message.text()+'\n\n'+prompt_hint
             self.prompt_empty.setText(prompt_hint if not self._last_failure else 'Możesz ponowić polecenie po usunięciu przyczyny błędu. „Pokaż w Excelu” otwiera okno tej sesji.')
             if (self._last_failure or {}).get('code')=='macro_unavailable':self.prompt_empty.setText('Komunikaty i pytania tej sesji będą widoczne tutaj. Makro nie jest ponawiane automatycznie.')
+            if self.foreground_command_active():self.prompt_empty.setText('Trwa bieżąca operacja. Pytania i komunikaty Excela pojawią się tutaj.')
             if self._snapshot.get('handoff_incomplete'):self.prompt_empty.setText('Nie przeniesiono wszystkich zmian z Pivot. Makra i edycja w tej sesji są zablokowane. Sprawdź stan kopii, zapisz ją w razie potrzeby i uruchom nową sesję. „Pokaż w Excelu” otwiera jej okno.')
+            self.update_failure_presentation()
             self.reflow_footer()
         def start_session(self):
             if self._disposed or self._closing or self._pdf_publish_pending or self._resume_check_pending or not self._availability.get('available'):return
@@ -13769,7 +13879,7 @@ def native_ui_types():
                 self._vba_macro=macro
             elif action=='inspect_vba':
                 self.reset_vba_diagnostics(True);control=self.native_controls.currentData() or {};self._vba_macro=self.macro_name.text().strip() or str(control.get('on_action') or control.get('macro_name') or '')
-            if not background:self._quiet_read_error=False;self.message.clear()
+            if not background:self._quiet_read_error=False;self.message.clear();self.state_note.setText('Wysyłam polecenie do sesji…')
             self.update_controls()
             def work():
                 payload=dict(args)
@@ -13953,6 +14063,7 @@ def native_ui_types():
             names={'starting':'Otwieranie kopii w Excelu…','ready':'Sesja Excela gotowa.','busy':'Excel wykonuje zadanie…','disconnected':'Utracono połączenie z Excelem.','closing':'Zamykanie własnej sesji Excela…','closed':'Sesja Excela zakończona.','error':'Nie udało się wykonać operacji Excela.'}
             status='Excel gotowy · odświeżam podgląd arkusza…' if self.background_read_active() else names.get(state,str(state or ''))
             if state=='busy' and snapshot.get('operation') in ('prepare_vba_patch','apply_vba_patch'):status='Przygotowuję zmianę VBA…'
+            if self._command_pending and not self.background_read_active():status='Wysyłam polecenie do sesji…'
             self.state_note.setText(status+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
             self.update_vba_source(snapshot)
             result=snapshot.get('last_result')
@@ -13993,7 +14104,7 @@ def native_ui_types():
                         self.patch_note.setText('Utworzono zmienioną kopię. Otwieram ją do jednej próby generatora i zapisu PDF: '+path);self.open_vba_patch_copy(request)
                 if self._close_after_save and operation in ('save_session','save_working','save_copy'):self._close_after_save=False;self.begin_close()
             elif not self._native_book_id and state=='ready' and snapshot.get('snapshot'):self.apply_native_result(snapshot)
-            if snapshot.get('error'):
+            if snapshot.get('error') and not self._command_pending and state!='busy':
                 diagnostic_key=(snapshot.get('error_operation'),snapshot.get('error'),snapshot.get('error_details'))
                 if self._diag_macro_job and not self._command_pending and diagnostic_key!=self._diag_terminal_key and snapshot.get('error_operation') in ('run_macro','run_control_macro'):
                     self._diag_terminal_key=diagnostic_key;self.diagnostic_event('Błąd wywołania makra: '+str(snapshot['error']))
@@ -14007,7 +14118,7 @@ def native_ui_types():
                     unavailable=snapshot.get('error_code')=='macro_unavailable';self._generator_stage='needs_content' if unavailable else 'failed'
                     self.generator_note.setText('Excel nie udostępnił generatora. Pokaż tę kopię i sprawdź pasek zabezpieczeń. Jeśli jest „Włącz zawartość”, kliknij go w Excelu, a następnie „Włączono zawartość — uruchom generator” tutaj. Ta decyzja ponowi generator raz.' if unavailable else 'Próba generatora nie powiodła się. Sprawdź błąd i wynik przed ponowieniem; nie uruchamiam makra automatycznie.')
                 self._close_after_save=False
-            if state=='ready' and self._last_failure and not self.background_read_active():
+            if state=='ready' and self._last_failure and not self.background_read_active() and not self._command_pending:
                 self.state_note.setText('Sesja Excela gotowa · ostatnia operacja nie powiodła się.'+(' · '+str(snapshot['active_sheet']) if snapshot.get('active_sheet') else ''))
             if self._queued and state=='ready' and not self._command_pending and not self._closing:
                 action,args=self._queued;self._queued=None
@@ -17173,16 +17284,22 @@ def native_ui_types():
                 r=min(9,d1/2,d2/2);before=p+(prev-p)*(r/d1);after=p+(nxt-p)*(r/d2)
                 path.lineTo(before);path.quadTo(p,after)
             path.lineTo(points[-1]);self.setPath(path)
-            selected=src.isSelected() and dst.isSelected();color=ui_color('accent' if selected or self._hover else 'muted')
-            pen=QG.QPen(color,2.2 if selected or self._hover else 1.5);pen.setCosmetic(True)
-            if self._route.get('blocked'):pen.setStyle(Qt.PenStyle.DotLine)
-            self.setPen(pen)
             self.setToolTip(self._base_tooltip+('\nKarty zasłaniają port połączenia. Uporządkuj mapę lub odsuń nakładające się tabele.' if self._route.get('blocked') else ''))
             end,before=points[-1],points[-2];angle=math.atan2(end.y()-before.y(),end.x()-before.x())
             tip=QG.QPolygonF([end,end-QC.QPointF(8*math.cos(angle-.48),8*math.sin(angle-.48)),end-QC.QPointF(8*math.cos(angle+.48),8*math.sin(angle+.48))])
-            self.arrow.setPolygon(tip);self.arrow.setPen(QG.QPen(color));self.arrow.setBrush(QG.QBrush(color))
-        def hoverEnterEvent(self,event):self._hover=True;self.refresh();super().hoverEnterEvent(event)
-        def hoverLeaveEvent(self,event):self._hover=False;self.refresh();super().hoverLeaveEvent(event)
+            self.arrow.setPolygon(tip);self.refresh_appearance()
+        def refresh_appearance(self,has_selection=None):
+            graph=self._graph;src=graph._nodes.get(self._edge['source']);dst=graph._nodes.get(self._edge['target'])
+            selected=bool((src is not None and src.isSelected()) or (dst is not None and dst.isSelected()))
+            if has_selection is None:has_selection=any(node.isSelected() for node in graph._nodes.values())
+            emphasized=selected or self._hover;color=ui_color('accent' if emphasized else 'muted')
+            pen=QG.QPen(color,2.4 if emphasized else 1.5);pen.setCosmetic(True)
+            if self._route and self._route.get('blocked'):pen.setStyle(Qt.PenStyle.DotLine)
+            self.setPen(pen);self.arrow.setPen(QG.QPen(color));self.arrow.setBrush(QG.QBrush(color))
+            self.setOpacity(.22 if has_selection and not emphasized else 1.0)
+            self.setZValue(-.5 if emphasized else -1)
+        def hoverEnterEvent(self,event):self._hover=True;self.refresh_appearance();super().hoverEnterEvent(event)
+        def hoverLeaveEvent(self,event):self._hover=False;self.refresh_appearance();super().hoverLeaveEvent(event)
         def mousePressEvent(self,event):
             self._graph.select_relation(self._edge);self._graph.setFocus();event.accept()
 
@@ -17202,7 +17319,7 @@ def native_ui_types():
             self.setDragMode(QW.QGraphicsView.DragMode.RubberBandDrag);self.setRubberBandSelectionMode(Qt.ItemSelectionMode.IntersectsItemShape)
             self.setTransformationAnchor(QW.QGraphicsView.ViewportAnchor.AnchorUnderMouse);self.setResizeAnchor(QW.QGraphicsView.ViewportAnchor.AnchorViewCenter)
             self.setFocusPolicy(Qt.FocusPolicy.StrongFocus);self.setMinimumSize(240,200)
-            self.setAccessibleName('Mapa relacji. Ctrl+klik lub prostokąt: zaznacz. Enter: otwórz połączone dane. Spacja lub środkowy przycisk: przesuwaj mapę.')
+            self.setAccessibleName('Mapa relacji. Klik tabeli: wyróżnij jej połączenia. Ctrl+klik lub prostokąt: zaznacz kilka tabel. Enter: otwórz połączone dane. Spacja lub środkowy przycisk: przesuwaj mapę.')
             self._scene.selectionChanged.connect(self._selection_changed)
             self.horizontalScrollBar().valueChanged.connect(self.schedule_save);self.verticalScrollBar().valueChanged.connect(self.schedule_save)
         def _settings(self):
@@ -17225,7 +17342,8 @@ def native_ui_types():
                     self._highlight_fields.setdefault(edge['source'],set()).update(edge['source_columns'])
                     self._highlight_fields.setdefault(edge['target'],set()).update(edge['target_columns'])
             for node in self._nodes.values():node.update()
-            self.schedule_edges();self.schedule_save();self.selectionChanged.emit(list(self.selected_ids()))
+            for edge in self._edges:edge.refresh_appearance(bool(ids))
+            self.schedule_save();self.selectionChanged.emit(list(self.selected_ids()))
         def schedule_edges(self):
             if not self._building:self._edge_timer.start()
         def redraw_edges(self):
@@ -20962,17 +21080,17 @@ def excel_native_dialog_test_suite():
             result=excel_native_dialog_action(20,100,snapshot,202);self.assertTrue(result['sent']);self.assertEqual(api.clicked,[202])
         def test_hidden_excel_still_exposes_its_modal_question_and_real_yes_no_buttons(self):
             api=self.fake();api.nodes[100]['visible']=False
-            api.nodes[201]['text']='Brak wymaganych pozycji KIT. Czy kontynuować mimo braków?'
+            api.nodes[201]['text']='Brak wymaganych pozycji dokumentu. Czy kontynuować mimo braków?'
             api.nodes[202].update(text='&Tak',id=6);api.nodes[203].update(text='&Nie',id=7)
             with patch.object(os,'name','nt'):values=excel_native_dialogs(20,100)
-            self.assertEqual(len(values),1);snapshot=values[0];self.assertIn('KIT',snapshot['text'])
+            self.assertEqual(len(values),1);snapshot=values[0];self.assertIn('pozycji dokumentu',snapshot['text'])
             self.assertEqual([(b['text'],b['id']) for b in snapshot['buttons']],[('&Tak',6),('&Nie',7)])
             self.assertIsNone(excel_native_dialog_skip_button(snapshot));self.assertEqual(api.clicked,[])
             self.assertTrue(excel_native_dialog_action(20,100,snapshot,203)['sent']);self.assertEqual(api.clicked,[203])
             self.assertEqual(api.activated,[200]);self.assertFalse(api.visible(100))
         def test_hidden_excel_prompt_keeps_process_ownership_and_stale_text_guards(self):
             api=self.fake();api.nodes[100]['visible']=False;snapshot=self.snapshot(api)
-            api.nodes[201]['text']='A new question replaced the KIT prompt'
+            api.nodes[201]['text']='A new question replaced the previous prompt'
             with self.assertRaises(UserError):excel_native_dialog_action(20,100,snapshot,202)
             api.nodes[200]['owner']=0
             with patch.object(os,'name','nt'):self.assertEqual(excel_native_dialogs(20,100),[])
@@ -22384,6 +22502,37 @@ def excel_vba_package_test_suite():
             self.assertIn('If False Then',updated);self.assertIn('ExportAsFixedFormat 0, "fixture.pdf"',updated)
             self.assertEqual(self.source.read_bytes(),original)
 
+        def test_native_xlsm_assigned_yes_no_response_patch_roundtrip(self):
+            prompt='Nieprawidłowy numer projektu. Czy przerwać sprawdzanie?'
+            export=' ThisWorkbook.Worksheets(1).ExportAsFixedFormat 0, "fixture.pdf"\r\n'
+            code=('Attribute VB_Name = "Module1"\r\nSub GenerateDocument()\r\n'
+                  ' Dim projectCode As String\r\n Dim answer As VbMsgBoxResult\r\n projectCode = ""\r\n'
+                  ' If Len(projectCode) < 5 Then\r\n'
+                  '  answer = MsgBox("'+prompt+'", vbYesNo)\r\n'
+                  '  If answer = vbYes Then Exit Sub\r\n End If\r\n'+export+'End Sub\r\n')
+            report=self.package(binary=fixture_binary(code));original=self.source.read_bytes()
+            plan=v.plan_vba_validation_patch(report['modules'],"'source.xlsm'!Module1.GenerateDocument",prompt)
+            self.assertEqual(plan['status'],'candidate',plan);self.assertEqual(len(plan['candidates']),1)
+            candidate=plan['candidates'][0]
+            self.assertEqual(code[candidate['start_offset']:candidate['end_offset']],candidate['old_block'])
+            updated=code[:candidate['start_offset']]+candidate['new_block']+code[candidate['end_offset']:]
+            result=v.excel_vba_package_patch(self.source,self.dest,report['file_sha256'],'Module1',code,updated)
+            reread=v.excel_vba_package_read(result['path'])
+            self.assertEqual(reread['status'],'available',reread);self.assertEqual(reread['modules'][0]['code'],updated)
+            self.assertIn('Dim answer As VbMsgBoxResult\r\n',updated)
+            self.assertIn('If Len(projectCode) < 5 Then\r\n',updated)
+            response=re.search(r'(?im)^\s*answer\s*=\s*7(?:\s*\x27[^\r\n]*)?\r?$',updated)
+            self.assertIsNotNone(response,updated)
+            guard=updated.index('If False Then');abort=updated.index('If answer = vbYes Then Exit Sub')
+            original_question=updated.index('answer = MsgBox("'+prompt+'", vbYesNo)')
+            self.assertLess(response.start(),guard);self.assertLess(guard,original_question);self.assertLess(original_question,abort)
+            self.assertEqual(updated.count('End If'),2);self.assertEqual(updated.count(export),1)
+            self.assertEqual(self.source.read_bytes(),original)
+            with zipfile.ZipFile(self.source) as source,zipfile.ZipFile(self.dest) as patched:
+                self.assertEqual(patched.namelist(),source.namelist());self.assertEqual(patched.comment,source.comment)
+                for part in source.namelist():
+                    if part!='xl/vbaProject.bin':self.assertEqual(source.read(part),patched.read(part))
+
 
 
     return unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(CompressionTests),unittest.defaultTestLoader.loadTestsFromTestCase(FileTests)])
@@ -22470,9 +22619,85 @@ def excel_vba_patch_test_suite():
                 result = self.plan(self.code(['MsgBox "' + self.prompt + '"', operation, 'Exit Sub']))
                 self.assertFalse(result["candidates"])
 
-        def test_else_labels_and_continuations_are_rejected(self):
-            for code in (self.code().replace('    End If', '    Else\n        SaveDocument\n    End If'), self.code().replace('        Exit Sub', '100     Exit Sub'), self.code().replace('Len(Trim(projectCode))', 'Len( _\n        projectCode)')):
+        def test_else_labels_and_multiple_statements_are_rejected(self):
+            for code in (self.code().replace('    End If', '    Else\n        SaveDocument\n    End If'), self.code().replace('        Exit Sub', '100     Exit Sub'), self.code().replace('        Exit Sub', '        SaveDocument: Exit Sub')):
                 self.assertFalse(self.plan(code)["candidates"])
+
+        def test_assigned_response_keeps_local_continuation_value_inside_original_guard(self):
+            for operator,exit_answer,value in (('=','vbYes',7),('=','vbNo',6),('<>','vbYes',6),('<>','7',7)):
+                with self.subTest(operator=operator,exit_answer=exit_answer):
+                    code=self.code(['answer = MsgBox("'+self.prompt+'", vbYesNo)', 'If answer '+operator+' '+exit_answer+' Then Exit Sub'],tail='    ExportDocument answer\n').replace('    If','    Dim answer As VbMsgBoxResult\n    If',1)
+                    result=self.plan(code);self.assertEqual(result['status'],'candidate');item=result['candidates'][0]
+                    self.assertEqual(code[item['start_offset']:item['end_offset']],item['old_block'])
+                    changed=code[:item['start_offset']]+item['new_block']+code[item['end_offset']:]
+                    self.assertLess(changed.index('If Len'),changed.index('answer = '+str(value)))
+                    self.assertLess(changed.index('answer = '+str(value)),changed.index('If False Then'))
+                    self.assertIn('ExportDocument answer',changed)
+                    self.assertEqual(changed.count('answer = MsgBox('),1)
+                    self.assertIn('odpowiedź otrzyma wartość kontynuacji',item['reason'])
+
+        def test_assigned_multiline_response_and_boolean_return_order(self):
+            code=self.code(['answer = MsgBox("'+self.prompt+'", vbYesNo)', 'If answer = vbYes Then','Exit Sub','End If']).replace('    If','    Dim answer As Long\n    If',1)
+            self.assertEqual(self.plan(code)['status'],'candidate')
+            function=code.replace('Sub GenerateDocument(ByVal projectCode As String)','Function GenerateDocument(ByVal projectCode As String) As Boolean').replace('Exit Sub','Exit Function').replace('End Sub','End Function').replace('    ExportDocument','    GenerateDocument = True')
+            function=function.replace('        answer = MsgBox','        GenerateDocument = False\n        answer = MsgBox')
+            result=self.plan(function);self.assertEqual(result['status'],'candidate');item=result['candidates'][0]
+            self.assertLess(item['new_block'].index('If False Then'),item['new_block'].index('GenerateDocument = False'))
+            self.assertFalse(self.plan(function.replace('    GenerateDocument = True\n',''))['candidates'])
+
+        def test_response_assignment_requires_local_numeric_storage(self):
+            body=['answer = MsgBox("'+self.prompt+'", vbYesNo)','If answer = vbYes Then Exit Sub']
+            for decl in ('Dim answer As Boolean','Dim answer As String','Dim answer As Date','Dim answer As Variant','Dim answer','Dim answer As Object','Dim answer(2) As Long','Static answer As Long',''):
+                with self.subTest(declaration=decl):
+                    code=self.code(body).replace('    If','    '+decl+'\n    If',1)
+                    self.assertFalse(self.plan(code)['candidates'])
+            for decl in ('ByRef answer As Long','ByVal answer As Long'):
+                code=self.code(body).replace('ByVal projectCode As String','ByVal projectCode As String, '+decl)
+                self.assertFalse(self.plan(code)['candidates'])
+
+        def test_assigned_response_does_not_disable_unrelated_work_or_else(self):
+            base=self.code(['answer = MsgBox("'+self.prompt+'", vbYesNo)','If answer = vbYes Then Exit Sub']).replace('    If','    Dim answer As Long\n    If',1)
+            for changed in (base.replace('Then Exit Sub','Then ExportDocument'),base.replace('Then Exit Sub','Then Exit Sub Else ExportDocument'),base.replace('        If answer','        SaveDocument\n        If answer'),base.replace('    End If','        answer = 4\n    End If')):
+                self.assertFalse(self.plan(changed)['candidates'])
+
+        def test_qualified_msgbox_and_missing_optional_style(self):
+            for name in ('VBA.MsgBox','VBA.Interaction.MsgBox'):
+                code=self.code([name+' "'+self.prompt+'", , "Walidacja"','Exit Sub'])
+                self.assertEqual(self.plan(code)['status'],'candidate')
+                self.assertFalse(self.plan('Dim VBA As Object\n'+code)['candidates'])
+                self.assertFalse(plan_vba_validation_patch([{'name':'VBA','code':code}],prompt_text=self.prompt)['candidates'])
+
+        def test_continuations_preserve_physical_lines_offsets_and_comments(self):
+            code=self.code(['answer = VBA.MsgBox( _','"'+self.prompt+'", _','vbYesNo)', 'If answer = vbYes Then Exit Sub']).replace('    If','    Dim answer As Long\n    If',1).replace('Len(Trim(projectCode))','Len( _\n        projectCode)').replace('\n','\r\n')
+            result=self.plan(code);self.assertEqual(result['status'],'candidate');item=result['candidates'][0]
+            self.assertEqual(code[item['start_offset']:item['end_offset']],item['old_block'])
+            self.assertEqual(item['line'],4);self.assertEqual(item['end_line'],10)
+            self.assertIn('VBA.MsgBox( _\r\n',item['new_block'])
+            self.assertIn('Len( _\r\n',item['new_block'])
+            self.assertFalse(self.plan(code+'MsgBox _\r\n')['candidates'])
+            literal=self.code(['MsgBox "'+self.prompt+' _"','Exit Sub'])
+            self.assertEqual(self.plan(literal,self.prompt+' _')['status'],'candidate')
+
+        def test_local_message_construction_is_preserved_outside_disabled_body(self):
+            code=self.code(['message = "Nieprawidlowy kod projektu."','message = message & vbCrLf & "Czy przerwac sprawdzanie?"','MsgBox message, vbExclamation','Exit Sub']).replace('    If','    Dim message As String\n    If',1)
+            result=self.plan(code);self.assertEqual(result['status'],'candidate');item=result['candidates'][0]
+            self.assertLess(item['new_block'].index('message = message'),item['new_block'].index('If False Then'))
+            self.assertEqual(item['new_block'].count('message ='),2)
+            self.assertFalse(self.plan(code.replace('message = message &','message = SaveDocument() &'))['candidates'])
+
+        def test_direct_msgbox_if_supports_inline_and_multiline_exact_question_only(self):
+            for body in ('If VBA.MsgBox("'+self.prompt+'", vbYesNo) = vbYes Then Exit Sub', 'If MsgBox("'+self.prompt+'", vbYesNo) = vbYes Then\n    Exit Sub\nEnd If'):
+                code='Sub GenerateDocument()\n'+body+'\nExportDocument\nEnd Sub\n'
+                result=self.plan(code);self.assertEqual(result['status'],'candidate');item=result['candidates'][0]
+                self.assertTrue(item['new_block'].startswith('If False Then'))
+                self.assertIn(item['old_block'],item['new_block'])
+                self.assertIn('ExportDocument',code[item['end_offset']:])
+                self.assertFalse(self.plan(code.replace('If VBA.MsgBox','If SaveDocument() And VBA.MsgBox').replace('If MsgBox','If SaveDocument() And MsgBox'))['candidates'])
+
+        def test_parent_guard_and_inner_question_offer_single_patch(self):
+            code=self.code(['If MsgBox("'+self.prompt+'", vbYesNo) = vbYes Then','Exit Sub','End If'])
+            result=self.plan(code);self.assertEqual(result['status'],'candidate');self.assertEqual(len(result['candidates']),1)
+            self.assertEqual(result['candidates'][0]['condition'],'Len(Trim(projectCode)) < 5')
 
         def test_boolean_false_exit_requires_proven_success_value(self):
             code = 'Function CheckProject(ByVal invalid As Boolean) As Boolean\nIf invalid Then\nMsgBox "' + self.prompt + '"\nCheckProject = False\nExit Function\nEnd If\nCheckProject = True\nEnd Function\n'
@@ -22527,7 +22752,7 @@ def excel_vba_patch_test_suite():
             self.assertFalse(self.plan(short,'Czy przerwac? Bledny numer.')['candidates'])
 
         def test_standard_scalar_message_conversions_and_checks_are_supported(self):
-            for expression in ('CStr(42)', 'CStr(CBool(True))', 'CStr(CInt(42))', 'CStr(CLng(42))', 'CStr(CDbl(42))', 'CStr(CSng(42))', 'CStr(CDate("2026-10-08"))', 'CStr(IsDate(projectCode))', 'CStr(IsError(projectCode))', 'Replace(projectCode, "KIT", "P")'):
+            for expression in ('CStr(42)', 'CStr(CBool(True))', 'CStr(CInt(42))', 'CStr(CLng(42))', 'CStr(CDbl(42))', 'CStr(CSng(42))', 'CStr(CDate("2026-10-08"))', 'CStr(IsDate(projectCode))', 'CStr(IsError(projectCode))', 'Replace(projectCode, "OLD", "NEW")'):
                 with self.subTest(expression=expression):
                     result = self.plan(self.code(['MsgBox "' + self.prompt + '" & ' + expression, 'Exit Sub']))
                     self.assertEqual(result['status'], 'candidate')
@@ -28170,6 +28395,27 @@ def ui_test():
         def test_office_vba_patch_unsupported_is_explained_without_creating_or_running_copy(self):
             dialog,controller,instances,scan,action,prompt=self.vba_patch_session();before=list(controller.calls);dialog.present_vba_patch({'status':'unsupported','candidates':[],'rejections':[{'reason':'Nie potwierdzono braku skutków ubocznych ValidateProject.'}]})
             self.assertIsNone(dialog._patch_preview);self.assertIn('Nie utworzono',dialog.patch_note.text());self.assertIn('ValidateProject',dialog.patch_note.text());self.assertFalse(dialog.patch_open_button.isVisible());self.assertEqual(controller.calls,before);self.assertEqual(len(instances),1)
+        def test_office_vba_patch_duplicate_refusals_keep_all_locations_without_repeating_reason(self):
+            dialog,controller,instances,scan,action,prompt=self.vba_patch_session();before=list(controller.calls);reason='Blok nie zawiera pojedynczego standardowego MsgBox.'
+            first={'module':'Validator','procedure':'CheckProject','line':18,'reason':reason};second=dict(first,line=23)
+            dialog.present_vba_patch({'status':'unsupported','candidates':[],'rejections':[first,dict(first),second,reason,{'reason':'Dodatkowe wyjście z procedury.'}]})
+            text=dialog.patch_note.text();self.assertEqual(text.count(reason),1);self.assertIn('Validator.CheckProject · wiersz 18',text);self.assertIn('Validator.CheckProject · wiersz 23',text);self.assertIn('Dodatkowe wyjście',text)
+            self.assertIsNone(dialog._patch_preview);self.assertEqual(controller.calls,before);self.assertEqual(len(instances),1)
+        def test_office_pending_saved_patch_keeps_disconnect_only_in_previous_error_details(self):
+            from unittest import mock
+            dialog,controller,instances,scan,action,prompt=self.vba_patch_session();details='COM disconnected during previous macro'
+            controller.snapshot.update(state='disconnected',operation='',last_result={},error='Utracono połączenie z Excelem.',error_code='excel_disconnected',error_details=details,error_operation='run_control_macro');dialog.poll();before=dialog.error_report()
+            gate=threading.Event();started=threading.Event();self.addCleanup(gate.set);original_submit=controller.submit
+            def delayed(*args):started.set();gate.wait(3);return original_submit(*args)
+            with mock.patch.object(controller,'submit',side_effect=delayed):
+                self.assertTrue(dialog.prepare_vba_patch());self.wait(started.is_set);dialog.poll();app.processEvents()
+                self.assertTrue(dialog._command_pending);self.assertFalse(dialog.failure_frame.isVisible());self.assertTrue(dialog.previous_failure_button.isVisible());self.assertEqual(dialog.error_report(),before)
+                self.assertIn('Analizuję ostatnią zapisaną',dialog.patch_note.text());self.assertNotIn('Utracono',dialog.message.text());self.assertNotIn('Utracono',dialog.state_note.text());self.assertNotIn('rozłączony',dialog.patch_status.text());self.assertIn('bieżąca operacja',dialog.prompt_empty.text())
+                gate.set();self.wait(lambda:not dialog._command_pending)
+            self.assertEqual(controller.calls[-1][0],'prepare_vba_patch');self.assertEqual(controller.calls[-1][1]['source_mode'],'saved_file');self.assertEqual(dialog._snapshot['state'],'busy');self.assertFalse(dialog.failure_frame.isVisible());self.assertTrue(dialog.previous_failure_button.isVisible())
+            dialog.body_tabs.setCurrentWidget(dialog.vba_scroll);app.processEvents();self.assertNotIn('Utracono',dialog.notice_button.toolTip());self.assertIn('VBA',dialog.notice_button.toolTip());dialog.copy_error_details();self.assertIn(details,QW.QApplication.clipboard().text())
+            controller.snapshot.update(state='disconnected',operation='',error='Nie odczytano zapisanej kopii.',error_code='operation_failed',error_details='new failure',error_operation='prepare_vba_patch');dialog.poll();app.processEvents()
+            self.assertTrue(dialog.failure_frame.isVisible());self.assertFalse(dialog.previous_failure_button.isVisible());self.assertEqual(dialog.failure_text.toPlainText(),'Nie odczytano zapisanej kopii.');self.assertIn('new failure',dialog.error_report());self.assertFalse(any(call[0] in ('run_macro','run_control_macro','reconnect_workbook') for call in controller.calls))
         def test_office_vba_patch_stale_preview_cannot_apply_and_new_macro_clears_question(self):
             dialog,controller,instances,scan,action,prompt=self.vba_patch_session();dialog.present_vba_patch(self.vba_patch_plan_fixture());preview=dialog._patch_preview;before=list(controller.calls);dialog._patch_plan['token']='different-plan'
             next(b for b in preview.findChildren(QW.QPushButton) if b.text()=='Zastosuj w nowej kopii').click();app.processEvents();self.assertEqual(controller.calls,before)
@@ -28537,7 +28783,7 @@ def ui_test():
             controller.snapshot.update(state='ready',error=raw,error_operation='run_macro');dialog.poll();app.processEvents()
             self.assertIn('Excel nie wykonał polecenia',dialog.failure_text.toPlainText());self.assertNotIn('-2147352567',dialog.failure_text.toPlainText());self.assertIn(raw,dialog.error_report())
         def excel_prompt_fixture(self):
-            return {'pid':701,'main_hwnd':702,'hwnd':703,'title':'Microsoft Excel','text':'Znaleziono błąd: Nieprawidłowy numer projektu. Dopuszczalne: Pxxxx KIT-xxxxx KIT-xxxxx Czy przerwać sprawdzanie?',
+            return {'pid':701,'main_hwnd':702,'hwnd':703,'title':'Microsoft Excel','text':'Znaleziono błąd: Nieprawidłowy identyfikator dokumentu. Dopuszczalny format: DOC-12345. Czy przerwać sprawdzanie?',
                 'buttons':[{'hwnd':704,'text':'Tak','id':6,'enabled':True},{'hwnd':705,'text':'Nie','id':7,'enabled':True}],'fingerprint':'prompt-one','complete':True,'enabled':True}
         def excel_button(self,dialog,text):
             app.processEvents();return next(b for b in dialog.findChildren(QW.QPushButton) if b.text()==text and b.isVisible())
