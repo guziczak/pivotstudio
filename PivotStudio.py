@@ -4911,32 +4911,37 @@ def _excel_native_dispatch(pythoncom,hwnd,accessible=None):
 
 def excel_native_application(pythoncom,owned,native=None):
     """Refresh only an originally owned, still-live Excel window's COM proxy."""
-    if owned is None or not owned.alive():raise _ExcelDisconnected('Własny proces Excel już nie działa. Nie uruchomiono nowej instancji.')
+    def failure(message,**details):
+        error=_ExcelDisconnected(message);error.recovery=dict(excel_owned_process_diagnostics(owned,native),**details);return error
+    if owned is None or not owned.alive():raise failure('Własny proces Excel już nie działa. Nie uruchomiono nowej instancji.',native_stage='native_owned_process')
     api=native if native is not None else _ExcelNativeWindows();pid=owned.pid;hwnd=owned.hwnd
     def valid_root(root):return owned.alive() and _excel_native_target(api,pid,root) and api.class_name(root)=='XLMAIN'
     def valid_child(root,child):return valid_root(root) and api.pid(child)==pid and api.root(child)==root and api.child(root,child) and api.class_name(child)=='EXCEL7'
     # Excel SDI may replace the old root while preserving the owned process.
     # The retained process HANDLE prevents a recycled PID from qualifying.
-    roots=[hwnd] if valid_root(hwnd) else [];deadline=time.monotonic()+1;last_error=None
+    roots=[hwnd] if valid_root(hwnd) else [];deadline=time.monotonic()+1;last_error=None;diagnostics={'native_stage':'native_windows','candidate_count':0}
     windows,complete=api.windows(deadline=deadline,limit=1024)
-    if not complete:raise _ExcelDisconnected('Nie udało się odczytać pełnej listy okien własnej sesji Excel.')
+    if not complete:raise failure('Nie udało się odczytać pełnej listy okien własnej sesji Excel.',**diagnostics)
     roots.extend(root for root in windows if root not in roots and valid_root(root))
     for root in roots:
         children,complete=api.windows(root,deadline=deadline,limit=1024)
-        if not complete:raise _ExcelDisconnected('Nie udało się odczytać pełnej listy okien dokumentu Excel.')
+        if not complete:raise failure('Nie udało się odczytać pełnej listy okien dokumentu Excel.',native_stage='native_child_windows',root_hwnd=root)
         for child in children:
             if not valid_child(root,child):continue
             try:
+                diagnostics.update(native_stage='native_accessibility',root_hwnd=root,child_hwnd=child,candidate_count=diagnostics['candidate_count']+1)
                 window=_excel_native_dispatch(pythoncom,child)
                 if not valid_child(root,child):raise _ExcelDisconnected('Okno sesji Excel zmieniło się podczas odzyskiwania połączenia.')
+                diagnostics['native_stage']='native_window_application'
                 application=window.Application
                 # Application.Hwnd can be another SDI root in this same process.
-                app_hwnd=int(application.Hwnd)
+                diagnostics['native_stage']='native_application_hwnd';app_hwnd=int(application.Hwnd)
                 if not valid_child(root,child) or not valid_root(app_hwnd):raise _ExcelDisconnected('Odzyskany obiekt nie należy do własnej sesji Excel.')
                 return application
             except Exception as exc:last_error=exc
     detail=' '+excel_worker_error_text(last_error) if last_error is not None else ''
-    raise _ExcelDisconnected('Nie udało się odzyskać obiektu istniejącego okna Excel.'+detail)
+    if last_error is not None:diagnostics['last_error']=excel_worker_error_text(last_error)[:1600]
+    raise failure('Nie udało się odzyskać obiektu istniejącego okna Excel.'+detail,**diagnostics)
 
 
 class _ExcelOleMessageFilter:
@@ -5003,6 +5008,37 @@ def excel_worker_error_text(exc):
 class _ExcelDisconnected(UserError):pass
 
 
+def excel_owned_process_diagnostics(owned,native=None):
+    """Use retained OS identity only; diagnostics never dereference Office COM."""
+    result={'owned_process_alive':None,'owned_window_valid':None}
+    if owned is None:return result
+    for key,name in (('owned_pid','pid'),('owned_hwnd','hwnd')):
+        with contextlib.suppress(Exception):
+            value=getattr(owned,name)
+            if type(value) is int and value>0:result[key]=value
+    with contextlib.suppress(Exception):result['owned_process_alive']=bool(owned.alive())
+    if result.get('owned_pid') and result.get('owned_hwnd'):
+        with contextlib.suppress(Exception):
+            api=native if native is not None else _ExcelNativeWindows();hwnd=result['owned_hwnd'];pid=result['owned_pid']
+            result['owned_window_pid']=int(api.pid(hwnd));result['owned_window_valid']=bool(result['owned_process_alive'] and _excel_native_target(api,pid,hwnd) and api.class_name(hwnd)=='XLMAIN')
+    return result
+
+
+def excel_session_diagnostics(value):
+    """Bound transport metadata; VBA source and unrecognized fields stay private."""
+    if not isinstance(value,dict):return {}
+    limits={'operation_stage':128,'stage':128,'job_id':200,'attempt_id':64,'operation':100,'source_mode':20,'working_copy':2048,'snapshot_path':2048,'candidate_path':2048,'candidate_id':128,'source_sha256':64,'primary_error':2400,'restore_events_error':1600,'initial_error':1600,'native_stage':128,'last_error':1600,'method':100,'on_action':1000,'control_name':200,'sheet':200,'preflight_error':1600}
+    flags={'savecopy_attempted','savecopy_completed','native_refresh_attempted','live_rebind_attempted','snapshot_included','owned_process_alive','owned_window_valid','open_events_enabled','protected_view','has_vba_project','caller_emulated','connection_lost_during_restore'}
+    numbers={'owned_pid','owned_hwnd','owned_window_pid','root_hwnd','child_hwnd','candidate_count','elapsed_ms','control_type'}
+    result={}
+    for key,item in value.items():
+        if key in limits and isinstance(item,str):result[key]=item[:limits[key]]
+        elif key in flags and (type(item) is bool or item is None):result[key]=item
+        elif key in numbers and type(item) is int:result[key]=item
+        elif key=='recovery' and isinstance(item,dict):result[key]=excel_session_diagnostics({k:v for k,v in item.items() if k!='recovery'})
+    return result
+
+
 class _ExcelWorkbookRebound(UserError):
     def __init__(self,result):
         super().__init__('Odświeżono obiekt skoroszytu przed wykonaniem polecenia.');self.result=result
@@ -5025,7 +5061,7 @@ def excel_worker_error_fields(exc,operation='',macro_name='',diagnostics=None):
     description=str(info[2]).strip() if isinstance(info,(tuple,list)) and len(info)>2 and info[2] else str(exc).strip()
     description=description[:2500];diagnostics=diagnostics or {};code='operation_failed'
     busy=bool(re.search(r'0x800AC472|0x8001010A|0x80010001|RPC_E_SERVERCALL_RETRYLATER|RPC_E_CALL_REJECTED',details,re.IGNORECASE))
-    if excel_connection_lost(exc):
+    if excel_connection_lost(exc) or diagnostics.get('connection_lost_during_restore'):
         code='excel_disconnected';message='Utracono połączenie z tą sesją Excela. Kliknij „Połącz ponownie z Excelem”, aby odszukać tę samą kopię w istniejącej sesji.'
         if operation in ('run_macro','run_control_macro'):message+=' Makro nie zostało ponowione; mogło wykonać część pracy. Sprawdź wynik przed kolejnym uruchomieniem.'
     elif isinstance(exc,_ExcelWorkbookRebound):
@@ -5045,8 +5081,9 @@ def excel_worker_error_fields(exc,operation='',macro_name='',diagnostics=None):
     if diagnostics.get('protected_view') and code not in ('excel_disconnected','workbook_reloaded'):
         code='protected_view';message+=' Excel ma otwarte okno Widoku chronionego. Sprawdź je przez „Pokaż Excel”; ustawienia zabezpieczeń pozostają bez zmian.'
     if macro_name:details='Makro: '+macro_name+'\n'+details
+    diagnostics=excel_session_diagnostics(diagnostics)
     if diagnostics:details+='\nStan Excela: '+dumps(diagnostics)
-    result={'message':message,'details':details[:6000],'code':code}
+    result={'message':message,'details':details[:16384],'code':code,'diagnostics':diagnostics}
     if macro_name:result['macro_name']=macro_name
     return result
 
@@ -6207,7 +6244,326 @@ def _vba_plan_anchor_guards(procedure, cleaned, locals_, symbols, prompt):
 def _vba_plan_presentation(statement):
     # Preserved, NOT pure: activation can fire events and changes ActiveSheet.
     return bool(re.fullmatch(r'(?:Call\s+)?[A-Za-z_]\w*\.Activate(?:\s*\(\s*\))?', statement, re.I)
-                or re.fullmatch(r'(?:Application\.)?ActiveWindow\.(?:ScrollRow|ScrollColumn)\s*=\s*[1-9]\d{0,6}', statement, re.I))
+                or re.fullmatch(r'(?:Application\.)?ActiveWindow\.(?:ScrollRow|ScrollColumn)\s*=\s*[1-9]\d{0,6}', statement, re.I)
+                or re.fullmatch(r'(?:Call\s+)?(?:[A-Za-z_]\w*\.)?Range\s*\(\s*"(?:[^"]|"")*"\s*\)\.Select(?:\s*\(\s*\))?', statement, re.I))
+
+
+@dataclasses.dataclass(frozen=True)
+class _VbaHelperSummary:
+    module: str
+    procedure: str
+    message: str
+    yes_result: bool
+    no_result: bool
+    question_line: int
+
+
+def _vba_plan_helper_summary(procedure, cleaned, actuals, caller_symbols, caller_shadowed, caller_bindings):
+    """Summarize a small Boolean dialog helper, without running its VBA.
+
+    Only local scalar preparation, one standard Yes/No MsgBox and Boolean
+    return flow are supported. Each answer is interpreted symbolically; any
+    other effect, ByRef write, unknown dispatch or input-dependent flow refuses.
+    """
+    declaration = _VBA_PLAN_PROC.fullmatch(cleaned[procedure.start])
+    if not declaration or declaration[1].casefold() != 'function' or (declaration[4] or '').casefold() != 'boolean':
+        raise ValueError('Procedura pomocnicza nie ma jawnego wyniku Boolean.')
+    if re.search(r'\bStatic\b',cleaned[procedure.start],re.I):raise ValueError('Pomocnik ma stan Static, którego nie można odtworzyć jako nowej lokalnej wartości.')
+    if procedure.end - procedure.start > 120:raise ValueError('Procedura pomocnicza przekracza limit 120 instrukcji.')
+    parameters = _vba_plan_split_args(declaration[3]) if declaration[3].strip() else []
+    if len(parameters) != len(actuals) or len(parameters) > 4:raise ValueError('Argumenty procedury pomocniczej nie mają jednoznacznego przypisania.')
+    types = _vba_plan_local_scalars(cleaned, procedure.start, procedure.end)
+    parameter_bindings = {};byref = set()
+    for parameter, actual in zip(parameters, actuals):
+        match = re.fullmatch(r'(?:(ByVal|ByRef)\s+)?([A-Za-z_]\w*)\s+As\s+String', parameter, re.I)
+        if not match:raise ValueError('Obsługiwane argumenty pomocnika muszą być jawnie typu String, bez Optional i tablic.')
+        _vba_plan_pure_expression(actual, caller_symbols, caller_shadowed)
+        bound = ' '.join(caller_bindings.get(token.casefold(),token) for token in _vba_plan_tokens(actual))
+        if len(bound) > 4096:raise ValueError('Związany argument pytania przekracza limit analizy.')
+        name = match[2].casefold();parameter_bindings[name] = bound;types[name] = 'string'
+        if (match[1] or '').casefold() != 'byval':byref.add(name)
+    types[procedure.name.casefold()] = 'boolean'
+    symbols = _vba_plan_declared_symbols(declaration, cleaned, procedure.start, procedure.end) | set(types)
+    body = cleaned[procedure.start + 1:procedure.end]
+    forbidden = re.compile(r'^(?:On\s+Error|Resume|GoTo|GoSub|Return|Static|For|Next|Do|Loop|While|Wend|With|Select|Case|Set|Call)\b',re.I)
+    for text in body:
+        masked = _vba_plan_masked(text)
+        if forbidden.match(masked) or ':' in masked or masked.startswith('#'):
+            raise ValueError('Pomocnik zawiera nieobsługiwane sterowanie lub operację o możliwych skutkach ubocznych: '+text[:200])
+        variable = re.fullmatch(r'Dim\s+(.+)',text,re.I)
+        if variable:
+            if any(not re.fullmatch(r'[A-Za-z_]\w*\s+As\s+(?:String|Boolean|Byte|Integer|Long|VbMsgBoxResult)',part,re.I) for part in _vba_plan_split_args(variable[1])):
+                raise ValueError('Pomocnik deklaruje obiekt, tablicę lub nieobsługiwany stan.')
+    constants = {'true':True,'false':False,'vbyes':6,'vbno':7,'vbyesno':4,'vbexclamation':48,'vbquestion':32,'vbcritical':16,'vbinformation':64,
+                 'vbdefaultbutton1':0,'vbdefaultbutton2':256,'vbdefaultbutton3':512,'vbdefaultbutton4':768,'vbapplicationmodal':0,'vbsystemmodal':4096}
+    if set(constants) & procedure.shadowed:raise ValueError('Pomocnik przesłania standardową stałą odpowiedzi lub stylu MsgBox.')
+    question_nodes = [node for node in procedure.statements[1:-1] if re.search(r'(?<![\w.])(?:VBA\.(?:Interaction\.)?)?MsgBox\s*\(',_vba_plan_masked(node.text),re.I)]
+    if len(question_nodes) != 1:raise ValueError('Pomocnik musi zawierać dokładnie jedno standardowe pytanie MsgBox z wynikiem.')
+    summaries = []
+    for response in (6,7):
+        values = {name:False if kind=='boolean' else 0 for name,kind in types.items() if kind!='string'}
+        bindings = {name:'""' for name,kind in types.items() if kind=='string'};bindings.update(parameter_bindings);messages = [];executed = 0
+        def expression(text, allow_question=True):
+            nonlocal executed
+            if len(text)>4096:raise ValueError('Wyrażenie pomocnika przekracza limit.')
+            found = re.search(r'(?<![\w.])(?:VBA\.(?:Interaction\.)?)?MsgBox\s*\(',_vba_plan_masked(text),re.I)
+            if found:
+                if not allow_question:raise ValueError('Zagnieżdżone pytanie w argumentach pomocnika.')
+                opening = text.find('(',found.start());depth = 1;quoted = False;index = opening + 1
+                while index<len(text) and depth:
+                    char=text[index]
+                    if char=='"':
+                        if quoted and index+1<len(text) and text[index+1]=='"':index+=2;continue
+                        quoted=not quoted
+                    elif not quoted:
+                        if char=='(':depth+=1
+                        elif char==')':depth-=1
+                    index+=1
+                if depth or quoted:raise ValueError('Niepełne wywołanie MsgBox w pomocniku.')
+                call=text[found.start():index]
+                prompt,_ = _vba_plan_message(call,symbols,procedure.shadowed,bindings)
+                arguments=_vba_plan_split_args(text[opening+1:index-1])
+                if len(arguments)<2:raise ValueError('Nie potwierdzono stylu Tak/Nie w pomocniku.')
+                style_names=set(constants)-{'true','false','vbyes','vbno'}
+                if any(token.casefold() not in style_names|{'or','+','(',')'} and not re.fullmatch(r'\d+',token) for token in _vba_plan_tokens(arguments[1])):
+                    raise ValueError('Styl pomocnika wymaga znanych flag MsgBox; konwersje i zmienne nie są podsumowywane.')
+                style=expression(arguments[1],False)
+                if type(style) is not int or style & 15 != 4:raise ValueError('Pomocnik nie używa potwierdzonego zestawu odpowiedzi Tak/Nie.')
+                messages.append(prompt);executed+=1
+                if executed>1:raise ValueError('Pomocnik wykonałby więcej niż jedno pytanie.')
+                text=text[:found.start()]+str(response)+text[index:]
+            tokens=_vba_plan_tokens(text);position=0
+            def parse(minimum=0,depth=0):
+                nonlocal position
+                if depth>24 or position>=len(tokens):raise ValueError('Niepełne wyrażenie wyniku pomocnika.')
+                token=tokens[position];position+=1;lower=token.casefold()
+                if lower=='not':
+                    operand=parse(6,depth+1)
+                    if type(operand) is not bool:raise ValueError('Bitowe Not na odpowiedzi liczbowej wykracza poza podsumowanie pomocnika.')
+                    value=not operand
+                elif token in ('+','-'):
+                    if allow_question:raise ValueError('Arytmetyka wyniku pomocnika wykracza poza obsługiwane mapowanie odpowiedzi.')
+                    number=parse(12,depth+1)
+                    if type(number) not in (int,bool):raise ValueError('Nieobsługiwana konwersja pomocnika.')
+                    value=(-1 if number is True else 0 if number is False else number)*(1 if token=='+' else -1)
+                elif token=='(':
+                    value=parse(0,depth+1)
+                    if position>=len(tokens) or tokens[position]!=')':raise ValueError('Niepełne nawiasy pomocnika.')
+                    position+=1
+                elif re.fullmatch(r'\d+',token):
+                    value=int(token)
+                    if value>=2**31:raise ValueError('Literał pomocnika przekracza obsługiwany zakres Long.')
+                elif lower in constants:value=constants[lower]
+                elif lower in values:value=values[lower]
+                elif lower in ('cbool','cint','clng') and position<len(tokens) and tokens[position]=='(':
+                    if lower in procedure.shadowed:raise ValueError('Pomocnik przesłania funkcję konwersji.')
+                    position+=1;value=parse(0,depth+1)
+                    if position>=len(tokens) or tokens[position]!=')':raise ValueError('Niepełna konwersja pomocnika.')
+                    position+=1;value=bool(value) if lower=='cbool' else -1 if value is True else 0 if value is False else value
+                    if lower!='cbool' and not (-(2**(15 if lower=='cint' else 31)) <= value < 2**(15 if lower=='cint' else 31)):
+                        raise ValueError('Konwersja liczbowa pomocnika przekracza zakres VBA.')
+                else:raise ValueError('Wynik pomocnika zależy od nieustalonej wartości lub wywołania: '+token)
+                while position<len(tokens):
+                    operator=tokens[position].casefold();precedence=_VBA_PLAN_BINARY.get(operator)
+                    if precedence is None or precedence<minimum:break
+                    position+=1;right=parse(precedence+1,depth+1)
+                    if allow_question and (operator=='+' or operator in ('and','or') and (type(value) is not bool or type(right) is not bool)):
+                        raise ValueError('Arytmetyka lub operacja bitowa wyniku pomocnika wykracza poza obsługiwane mapowanie odpowiedzi.')
+                    left_number=-1 if value is True else 0 if value is False else value
+                    right_number=-1 if right is True else 0 if right is False else right
+                    if operator=='=':value=left_number==right_number
+                    elif operator=='<>':value=left_number!=right_number
+                    elif operator=='and':value=(value and right) if type(value) is bool and type(right) is bool else left_number & right_number
+                    elif operator=='or':value=(value or right) if type(value) is bool and type(right) is bool else left_number | right_number
+                    elif operator=='+':value=left_number+right_number
+                    else:raise ValueError('Nieobsługiwany operator wyniku pomocnika: '+operator)
+                    bound=2**31 if allow_question else 2**15
+                    if type(value) is int and not -bound<=value<bound:raise ValueError('Wyrażenie pomocnika przekracza potwierdzony zakres liczbowy VBA.')
+                return value
+            value=parse()
+            if position!=len(tokens):raise ValueError('Dodatkowa składnia wyrażenia pomocnika.')
+            return value
+        def assignment(text):
+            if not text or re.match(r'^Dim\b',text,re.I):return False
+            if re.fullmatch(r'Exit\s+Function',text,re.I):return True
+            match=re.fullmatch(r'(?:Let\s+)?([A-Za-z_]\w*)\s*=\s*(.+)',text,re.I)
+            if not match:raise ValueError('Pomocnik wykonuje dodatkową operację, której nie wolno pominąć: '+text[:200])
+            name=match[1].casefold()
+            if name in byref:raise ValueError('Pomocnik zapisuje argument ByRef: '+match[1])
+            if name not in types:raise ValueError('Pomocnik zapisuje stan poza jawnymi zmiennymi lokalnymi: '+match[1])
+            if types[name]=='string':
+                _vba_plan_pure_expression(match[2],symbols,procedure.shadowed)
+                bound=' '.join(bindings.get(token.casefold(),token) for token in _vba_plan_tokens(match[2]))
+                if len(bound)>4096:raise ValueError('Przygotowany tekst pomocnika przekracza limit.')
+                bindings[name]=bound
+            else:
+                value=expression(match[2]);converted=bool(value) if types[name]=='boolean' else -1 if value is True else 0 if value is False else value
+                limits={'byte':(0,255),'integer':(-32768,32767),'long':(-(2**31),2**31-1),'vbmsgboxresult':(-(2**31),2**31-1)}
+                if types[name] in limits and not limits[types[name]][0]<=converted<=limits[types[name]][1]:raise ValueError('Zapis lokalnej odpowiedzi przekracza zakres typu VBA.')
+                values[name]=converted
+            return False
+        def walk(start,end,depth=0):
+            if depth>16:raise ValueError('Zbyt głębokie warunki pomocnika.')
+            index=start
+            while index<end:
+                text=cleaned[index];conditional=re.fullmatch(r'If\s+(.+?)\s+Then(?:\s+(.+))?',text,re.I)
+                if not conditional:
+                    if assignment(text):return True
+                    index+=1;continue
+                condition=bool(expression(conditional[1]))
+                if conditional[2]:
+                    branches=re.split(r'\s+Else\s+',conditional[2],maxsplit=1,flags=re.I)
+                    selected=branches[0] if condition else branches[1] if len(branches)>1 else ''
+                    if assignment(selected):return True
+                    index+=1;continue
+                level=1;alternative=None;finish=None
+                for scan in range(index+1,end):
+                    current=cleaned[scan]
+                    if re.fullmatch(r'If\s+.+?\s+Then',current,re.I):level+=1
+                    elif re.fullmatch(r'End\s+If',current,re.I):
+                        level-=1
+                        if not level:finish=scan;break
+                    elif level==1 and current.casefold()=='else':alternative=scan
+                    elif level==1 and re.match(r'ElseIf\b',current,re.I):raise ValueError('ElseIf pomocnika wymaga osobnej analizy przepływu.')
+                if finish is None:raise ValueError('Niepełny warunek pomocnika.')
+                if condition:
+                    if walk(index+1,alternative if alternative is not None else finish,depth+1):return True
+                elif alternative is not None and walk(alternative+1,finish,depth+1):return True
+                index=finish+1
+            return False
+        walk(procedure.start+1,procedure.end)
+        if executed!=1:raise ValueError('Nie potwierdzono dokładnie jednego pytania na każdej ścieżce odpowiedzi.')
+        summaries.append((values[procedure.name.casefold()],messages[0]))
+    if summaries[0][0]==summaries[1][0]:raise ValueError('Wynik Boolean pomocnika nie rozróżnia odpowiedzi Tak/Nie.')
+    if summaries[0][1]!=summaries[1][1]:raise ValueError('Treść pytania pomocnika zależy od odpowiedzi.')
+    return _VbaHelperSummary(procedure.module,procedure.name,summaries[0][1],summaries[0][0],summaries[1][0],question_nodes[0].line)
+
+
+def _vba_plan_helper_continuation(cleaned, start, end, target, exit_text):
+    """Derive continuation from the first caller use, never identifier spelling."""
+    for index in range(start,end):
+        text=cleaned[index]
+        if not re.search(r'\b'+re.escape(target)+r'\b',_vba_plan_masked(text),re.I):continue
+        conditional=re.fullmatch(r'If\s+(.+?)\s+Then(?:\s+(.+))?',text,re.I)
+        if not conditional:break
+        condition=_vba_plan_normal_spaces(conditional[1])
+        positive=target.casefold()
+        if condition in ('not '+positive,positive+' = false',positive+' <> true'):value=True
+        elif condition in (positive,positive+' = true',positive+' <> false'):value=False
+        else:break
+        if conditional[2]:
+            if _vba_plan_normal_spaces(conditional[2])==exit_text:return value,index
+        else:
+            following=[(position,cleaned[position]) for position in range(index+1,min(end,index+8)) if cleaned[position]]
+            if len(following)>=2 and _vba_plan_normal_spaces(following[0][1])==exit_text and _vba_plan_normal_spaces(following[1][1])=='end if':return value,index
+        break
+    raise ValueError('Nie potwierdzono w kodzie wywołującym, która wartość pomocnika oznacza kontynuację. Nazwa zmiennej ani odpowiedź z okna nie wystarcza.')
+
+
+def _vba_plan_helper_guard(module, code, lines, cleaned, physical_starts, declaration, proc_start, proc_end,
+                           block_start, block_end, program, sources, call_paths, unresolved_calls, locals_, symbols, prompt):
+    """A source-proven helper call can replace the question inside ONE guard."""
+    caller=program[(module.casefold(),declaration[2].casefold())]
+    scope_names=_vba_plan_names(declaration[3])
+    for text in cleaned[proc_start+1:proc_end]:
+        declared=re.match(r'^(?:Dim|Static|Const)\s+(.+)$',text,re.I)
+        if declared:scope_names.update(_vba_plan_names(declared[1]))
+    calls=[]
+    for position in range(block_start+1,block_end):
+        match=re.fullmatch(r'(?:Let\s+)?([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\((.*)\)',cleaned[position],re.I)
+        if not match:continue
+        names=match[2].split('.');qualified=len(names)==2
+        key=(names[0].casefold(),names[1].casefold()) if qualified else (module.casefold(),names[0].casefold())
+        if key not in program and not qualified:
+            matches=[candidate for candidate in program if candidate[1]==key[1]]
+            if len(matches)==1:key=matches[0]
+        if key not in program:continue
+        helper=program[key];helper_declaration=_VBA_PLAN_PROC.fullmatch(sources[helper.module][2][helper.start])
+        if (helper_declaration[4] or '').casefold()!='boolean':continue
+        if next((node.parent for node in caller.statements if node.index==position),-1)!=block_start:continue
+        calls.append((position,match,helper,names[0].casefold() in scope_names))
+    if not calls:return None
+    position,call,helper,shadowed_call=calls[0]
+    helper_code,helper_lines,helper_cleaned=sources[helper.module]
+    helper_excerpt='\n'.join(str(node.line)+': '+''.join(helper_lines[node.index:node.index+1]).rstrip('\r\n') for node in helper.statements)
+    if len(helper_excerpt)>3500:helper_excerpt=helper_excerpt[:3450]+'\n… źródło pomocnika skrócone'
+    context={'module':module,'procedure':declaration[2],'helper_module':helper.module,'helper_procedure':helper.name,'helper_excerpt':helper_excerpt}
+    focus=position;stage='Analiza pomocnika pytania'
+    try:
+        if len(calls)!=1:raise ValueError('Blok wywołuje kilka pomocników Boolean; nie ustalono pojedynczego wpływu kontroli.')
+        if shadowed_call:raise ValueError('Nazwa pomocnika jest przesłonięta zmienną wywołującej procedury.')
+        if helper.module.casefold()!=module.casefold():raise ValueError('Znaleziono źródło pomocnika w innym module. Bieżąca analiza potwierdza wyłącznie wywołania w tym samym module; widoczność i rodzaj modułu wymagają osobnego dowodu.')
+        target=call[1];target_key=target.casefold()
+        if locals_.get(target_key)!='boolean':raise ValueError('Wynik pomocnika musi trafić do jawnej lokalnej zmiennej Boolean.')
+        if any(text.startswith('#') for text in cleaned):raise ValueError('Moduł zawiera dyrektywy kompilacji; nie ustalono wersji pomocnika.')
+        preserved=[];false_assignments=[];bindings={}
+        for index in range(block_start+1,block_end):
+            text=cleaned[index]
+            if not text:continue
+            focus=index
+            if index==position:continue
+            if declaration[1].casefold()=='function' and re.fullmatch(re.escape(declaration[2])+r'\s*=\s*False',text,re.I):
+                false_assignments.append(index);continue
+            if _vba_plan_presentation(text):preserved.append(index);continue
+            assignment=re.fullmatch(r'(?:Let\s+)?([A-Za-z_]\w*)\s*=\s*(.+)',text,re.I)
+            if assignment and locals_.get(assignment[1].casefold())=='string':
+                _vba_plan_pure_expression(assignment[2],symbols,caller.shadowed)
+                if index<position:
+                    expression=' '.join(bindings.get(token.casefold(),token) for token in _vba_plan_tokens(assignment[2]))
+                    if len(expression)>4096:raise ValueError('Tekst pytania w miejscu wywołania przekracza limit.')
+                    bindings[assignment[1].casefold()]=expression
+                preserved.append(index);continue
+            raise ValueError('Blok zawiera dodatkową operację poza rozpoznanym przygotowaniem pytania: '+text[:200])
+        if len(false_assignments)>1:raise ValueError('Blok wielokrotnie zmienia wynik walidatora; nie ustalono pojedynczego wpływu.')
+        focus=position
+        summary=_vba_plan_helper_summary(helper,helper_cleaned,_vba_plan_split_args(call[3]),symbols,caller.shadowed,bindings)
+        literals=[match[1].replace('""','"') for match in re.finditer(r'"((?:[^"]|"")*)"',summary.message)]
+        match=_vba_plan_match_prompt(summary.message,literals,prompt)
+        if not match:return {'unmatched':True,'helper_targets':[(item[2].module,item[2].name) for item in calls]}
+        if match['kind'] not in ('literal_exact','literal_normalized'):
+            raise ValueError('Dopasowano tylko wspólny fragment pytania pomocnika. Nie potwierdzono pełnej treści związanej z tym miejscem wywołania.')
+        stage='Wartość kontynuacji w kodzie wywołującym'
+        continuation,consumer=_vba_plan_helper_continuation(cleaned,block_end+1,proc_end,target,'exit '+declaration[1].casefold())
+        stage='Wartość zwracana przez walidator'
+        semantic='Zmieniono tylko lokalny wynik wybranego pomocnika zgodnie z późniejszym warunkiem wyjścia.'
+        if declaration[1].casefold()=='function':
+            if (declaration[4] or '').casefold()!='boolean':raise ValueError('Walidator nie ma jawnego wyniku Boolean.')
+            try:semantic=_vba_plan_boolean_success(cleaned,declaration,proc_start,block_start,block_end,proc_end)
+            except ValueError:semantic=_vba_plan_boolean_flow(cleaned,declaration,proc_start,block_start,proc_end,set(false_assignments))
+        ending='\r\n' if lines[block_start].endswith('\r\n') else '\n' if lines[block_start].endswith('\n') else '\r'
+        old=''.join(lines[block_start:block_end+1]);parts=[]
+        for index in range(block_start,block_end+1):
+            raw=lines[index]
+            if index in false_assignments or index==position:
+                indent=re.match(r'\s*',raw)[0].rstrip('\r\n')
+                if index==position:parts.append(indent+target+' = '+('True' if continuation else 'False')+ending)
+                parts.extend((indent+"If False Then ' Pivot Studio: selected validation effect in reviewed copy"+ending,raw,indent+'End If'+ending))
+            else:parts.append(raw)
+        new=''.join(parts);key=(module.casefold(),declaration[2].casefold());path=call_paths.get(key,())
+        warnings=['Zmieniana jest osobna kopia; pozostałe kontrole walidatora pozostają aktywne.',
+                  'Podsumowanie pomocnika jest statyczne. Nie potwierdza wykonanej ścieżki ani powstania PDF.',
+                  'Aktywacja i wybór komórki pozostają w kolejności źródła i mogą uruchamiać zdarzenia Excela.']
+        if not path:warnings.append('Nie potwierdzono bezpośredniej ścieżki od makra startowego do wywołującej procedury.')
+        if len(old)>12000 or len(preserved)>254:raise ValueError('Podgląd pojedynczej kontroli przekracza limit.')
+        reason=('Odczytano pomocnik '+helper.name+': Tak → '+str(summary.yes_result)+', Nie → '+str(summary.no_result)+'. '
+                'Warunek wyjścia w wierszu '+str(physical_starts[consumer])+' potwierdza kontynuację przy '+target+' = '+str(continuation)+'. '
+                'Zachowano przygotowanie tekstu, aktywację, przewijanie i wybór komórki. '+semantic)
+        evidence=_VbaPatchEvidence('summarized_message_helper',tuple(physical_starts[index] for index in sorted(set(preserved)|{block_start,block_end})),
+                                  tuple(physical_starts[index] for index in sorted(false_assignments+[position])),reason,
+                                  tuple((path+((helper.module+'.'+helper.name).casefold(),))[:64]) if path else (),tuple(unresolved_calls.get(key,()))[:16])
+        candidate={'module':module,'procedure':declaration[2],'line':physical_starts[block_start],
+                   'end_line':physical_starts[block_end]+len(lines[block_end].splitlines())-1,
+                   'id':_vba_plan_sha(module+'\0'+str(block_start)+'\0'+old),'source_sha256':_vba_plan_sha(code),
+                   'old_block_sha256':_vba_plan_sha(old),'new_block_sha256':_vba_plan_sha(new),
+                   'start_offset':sum(map(len,lines[:block_start])),'end_offset':sum(map(len,lines[:block_end+1])),
+                   'old_block':old,'new_block':new,'old_header':lines[block_start],'new_header':lines[block_start],
+                   'condition':cleaned[block_start],'match':match,'entry_relation':'entry' if len(path)==1 else 'direct' if len(path)==2 else 'transitive' if path else 'unproven',
+                   'requires_confirmation':True,'reason':reason,'warnings':warnings,'semantic_evidence':dataclasses.asdict(evidence),
+                   'helper_target':(helper.module,helper.name)}
+        return {'candidate':candidate,'helper_targets':[(item[2].module,item[2].name) for item in calls]}
+    except ValueError as error:
+        context.update(reason=str(error));context.update(_vba_plan_rejection_context(lines,cleaned,physical_starts,focus,block_start,block_end,stage))
+        return {'rejection':context,'helper_targets':[(item[2].module,item[2].name) for item in calls]}
 
 
 def _vba_plan_boolean_success(cleaned, declaration, proc_start, block_start, block_end, proc_end):
@@ -6373,6 +6729,8 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
         result['complete'] = False
         result['rejections'].append({'reason': str(error)})
         return finish()
+    source_by_module={name:(code,lines,cleaned) for name,code,lines,cleaned in prepared}
+    helper_targets=set()
 
     for module_name, code, lines, cleaned in prepared:
         physical_starts = []
@@ -6430,6 +6788,17 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
                     elif depth == 1 and re.match(r"Else(?:If|\b)", body_line, re.I):
                         has_else = True
                 if block_end is None:
+                    continue
+                helper_plan=_vba_plan_helper_guard(module_name,code,lines,cleaned,physical_starts,declaration,proc_start,proc_end,
+                    block_start,block_end,program,source_by_module,call_paths,unresolved_calls,locals_,symbols,prompt_text)
+                if helper_plan:
+                    helper_targets.update(helper_plan['helper_targets'])
+                    if helper_plan.get('unmatched'):continue
+                    analysis['matched_blocks']+=1
+                    if 'candidate' in helper_plan:
+                        if len(result['candidates'])>=8:result['complete']=False
+                        else:result['candidates'].append(helper_plan['candidate'])
+                    elif len(result['rejections'])<24:result['rejections'].append(helper_plan['rejection'])
                     continue
                 contained_anchors = [position for position in message_anchors if block_start <= position <= block_end]
                 if contained_anchors and block_start not in selected_guards:
@@ -6660,7 +7029,9 @@ def plan_vba_validation_patch(modules, macro_name="", prompt_text=""):
         result["rejections"].append({"reason": "Nie przeanalizowano całego przekazanego kodu; nie proponuję niepełnej zmiany."})
     # The enclosing recognized guard and its nested direct MsgBox branch are
     # two descriptions of the same question, not two competing edit locations.
-    candidates=result['candidates']
+    # A refused caller summary must not fall back to changing a shared helper:
+    # that would affect other validation sites and bypass the refusal itself.
+    candidates=[item for item in result['candidates'] if item.get('helper_target') or (item['module'],item['procedure']) not in helper_targets]
     result['candidates']=[item for item in candidates if not any(
         other is not item and other['module']==item['module'] and
         other['start_offset']<item['start_offset'] and item['end_offset']<=other['end_offset']
@@ -7018,7 +7389,7 @@ def excel_vba_semantic_evidence(value):
         item=value.get(key,'')
         if not isinstance(item,str) or len(item)>maximum:raise UserError('Nieprawidłowe uzasadnienie zmiany VBA.')
         result[key]=item
-    if result['strategy'] not in ('guard_body','selected_validation_effect'):raise UserError('Nieznana metoda zmiany VBA.')
+    if result['strategy'] not in ('guard_body','selected_validation_effect','summarized_message_helper'):raise UserError('Nieznana metoda zmiany VBA.')
     for key in ('preserved_lines','neutralized_lines'):
         items=value.get(key,[])
         if not isinstance(items,(list,tuple)) or len(items)>256 or any(type(n) is not int or not 1<=n<=2147483647 for n in items):raise UserError('Nieprawidłowe wiersze zmiany VBA.')
@@ -7033,12 +7404,13 @@ def excel_vba_semantic_evidence(value):
 class ExcelVbaSnapshotProvider:
     """Capture provenance once; only the injected live-copy callback may use COM."""
     @staticmethod
-    def capture(working,mode,regular_file,capture_live=None):
+    def capture(working,mode,regular_file,capture_live=None,progress=None):
         if mode not in ('live','saved_file'):raise UserError('Nieprawidłowe źródło analizy VBA.')
         working=Path(working);regular_file(working,256*1024*1024)
         folder=Path(tempfile.mkdtemp(prefix='vba-edit-',dir=working.parent));base=folder/'base';base.mkdir(mode=0o700);snapshot=base/working.name
         saved_mtime=''
         if mode=='saved_file':
+            if progress:progress('saved_snapshot_copy',snapshot_path=str(snapshot))
             info=regular_file(working,256*1024*1024);signature=_ExcelPdfObserver._signature(info);expected=file_digest(working)
             saved_mtime=dt.datetime.fromtimestamp(info.st_mtime,dt.timezone.utc).isoformat()
             excel_copy_workbook(working,snapshot,threading.Event())
@@ -7047,7 +7419,11 @@ class ExcelVbaSnapshotProvider:
         else:
             if capture_live is None:raise UserError('Brak połączenia do odczytu bieżącego skoroszytu.')
             capture_live(snapshot)
-        regular_file(snapshot,256*1024*1024);_vba_copy_zone(working,snapshot)
+        if progress:progress('vba_snapshot_validate',snapshot_path=str(snapshot))
+        regular_file(snapshot,256*1024*1024)
+        if progress:progress('vba_snapshot_preserve_zone')
+        _vba_copy_zone(working,snapshot)
+        if progress:progress('vba_snapshot_hash')
         return ExcelVbaSourceSnapshot(str(snapshot),file_digest(snapshot),mode,utcnow(),saved_mtime)
 
 
@@ -7133,16 +7509,18 @@ class ExcelSessionWorker:
             for candidate in self.excel.Workbooks:
                 if self.same_com(self.book,candidate):return
         raise _ExcelDisconnected('The bound workbook has been closed. Reconnect to this session; writes were not retried.')
-    def reconnect_workbook(self):
+    def reconnect_workbook(self,include_snapshot=True,force_native=False):
         """Read only: never attach to another Excel process or reopen a file."""
         if not self.owned_excel or not self.working_copy or not Path(self.working_copy).is_absolute():
-            raise _ExcelDisconnected('Nie potwierdzono własnej sesji ani pełnej ścieżki jej kopii.')
+            error=_ExcelDisconnected('Nie potwierdzono własnej sesji ani pełnej ścieżki jej kopii.');error.recovery=dict(excel_owned_process_diagnostics(self.owned_process),stage='reconnect_ownership',native_refresh_attempted=False);raise error
         expected=os.path.normcase(os.path.abspath(self.working_copy));application=self.excel
         def find_book(application):
+            nonlocal stage
+            prefix='native' if native_attempted else 'cached';stage=prefix+'_workbooks'
             matches=[];disconnected=None;books=list(itertools.islice(application.Workbooks,101))
             if len(books)>100:raise _ExcelDisconnected('Za dużo skoroszytów w sesji, aby potwierdzić właściwą kopię.')
             for book in books:
-                try:path=str(book.FullName)
+                try:stage=prefix+'_workbook_fullname';path=str(book.FullName)
                 except Exception as exc:
                     if excel_connection_lost(exc):disconnected=exc;continue
                     raise
@@ -7150,7 +7528,7 @@ class ExcelSessionWorker:
             if not matches and disconnected is not None:raise disconnected
             if len(matches)!=1:raise _ExcelDisconnected('Nie znaleziono dokładnie jednej otwartej kopii sesji pod oczekiwaną ścieżką. Nowy Excel nie został uruchomiony.')
             # Force a server roundtrip before replacing any cached identities.
-            str(matches[0].Name);int(matches[0].Worksheets.Count)
+            stage=prefix+'_workbook_name';str(matches[0].Name);stage=prefix+'_worksheets_count';int(matches[0].Worksheets.Count)
             return matches[0]
         def snapshot(application,book):
             # Rebuilding the sheet/control snapshot is part of reconnecting:
@@ -7159,29 +7537,33 @@ class ExcelSessionWorker:
             # for a VBA proposal prepared against an older connection.
             previous=(self.excel,self.book,self.sheet_refs,self.control_refs,self.revision)
             self.excel=application;self.book=book;self.sheet_refs={};self.control_refs={};self.vba_patch_plan=None;self.revision+=1
-            try:return self.connection_snapshot()
+            try:return self.connection_snapshot() if include_snapshot else {'workbook_id':self.workbook_id,'workbook_rebound':True,'controls_invalidated':True}
             except Exception:
                 self.excel,self.book,self.sheet_refs,self.control_refs,self.revision=previous
                 raise
         stage='cached_workbook';initial_error='';native_attempted=False
+        def native_refresh():
+            nonlocal stage,native_attempted
+            native_attempted=True;stage='native_application';fresh=excel_native_application(self.pythoncom,self.owned_process)
+            stage='native_workbook';book=find_book(fresh);stage='native_snapshot';return snapshot(fresh,book)
         try:
-            try:
-                book=find_book(application);stage='cached_snapshot'
-                result=snapshot(application,book)
-            except Exception as exc:
-                if isinstance(exc,_ExcelDisconnected) or not excel_connection_lost(exc):raise
-                # Reacquire once from the retained process's native window.
-                # Only these reads are repeated, never the interrupted command.
-                initial_error=excel_worker_error_text(exc)[:1200];native_attempted=True;stage='native_application'
-                application=excel_native_application(self.pythoncom,self.owned_process)
-                stage='native_workbook';book=find_book(application)
-                stage='native_snapshot';result=snapshot(application,book)
+            if force_native:result=native_refresh()
+            else:
+                try:
+                    book=find_book(application);stage='cached_snapshot';result=snapshot(application,book)
+                except Exception as exc:
+                    if isinstance(exc,_ExcelDisconnected) or not excel_connection_lost(exc):raise
+                    # Repeat only reads, never the interrupted command.
+                    initial_error=excel_worker_error_text(exc)[:1200];result=native_refresh()
             result['recovery_method']='native_window' if native_attempted else 'cached_application'
+            result['diagnostics']=dict(excel_owned_process_diagnostics(self.owned_process),operation_stage='reconnect_complete',working_copy=self.working_copy,recovery={'stage':stage,'native_refresh_attempted':native_attempted,'snapshot_included':include_snapshot})
+            if initial_error:result['diagnostics']['recovery']['initial_error']=initial_error
             return result
         except Exception as exc:
             message=str(exc) if isinstance(exc,_ExcelDisconnected) else 'Nie udało się odczytać istniejącej sesji. '+excel_worker_error_text(exc)
             error=_ExcelDisconnected(message)
-            error.recovery={'stage':stage,'native_refresh_attempted':native_attempted}
+            error.recovery=dict(excel_owned_process_diagnostics(self.owned_process),stage=stage,native_refresh_attempted=native_attempted,snapshot_included=include_snapshot)
+            if isinstance(getattr(exc,'recovery',None),dict):error.recovery.update({k:v for k,v in exc.recovery.items() if k not in ('stage','native_refresh_attempted','initial_error')})
             if initial_error:error.recovery['initial_error']=initial_error
             raise error from exc
     def connection_snapshot(self):
@@ -7337,11 +7719,11 @@ class ExcelSessionWorker:
         return match[3]
     def qualified_macro(self,name):return "'"+str(self.book.Name).replace("'","''")+"'!"+name
     def error_fields(self,exc,operation='',macro_name='',context=None):
-        diagnostics=dict(context or {})
+        diagnostics=dict(getattr(self,'_command_diagnostics',{}) or {});diagnostics.update(context or {});diagnostics.update(excel_owned_process_diagnostics(self.owned_process))
         if self.working_copy:diagnostics.update(working_copy=self.working_copy,open_events_enabled=self.open_events_enabled)
         if isinstance(getattr(exc,'recovery',None),dict):diagnostics['recovery']=exc.recovery
         # A rejected call must not trigger more Office calls (or another wait).
-        if not excel_connection_lost(exc) and not isinstance(exc,_ExcelWorkbookRebound) and not re.search(r'0x800AC472|0x8001010A|0x80010001',excel_worker_error_text(exc),re.IGNORECASE):
+        if operation not in ('prepare_vba_patch','apply_vba_patch','reconnect_workbook') and not excel_connection_lost(exc) and not diagnostics.get('connection_lost_during_restore') and not isinstance(exc,_ExcelWorkbookRebound) and not re.search(r'0x800AC472|0x8001010A|0x80010001',excel_worker_error_text(exc),re.IGNORECASE):
             with contextlib.suppress(Exception):diagnostics['protected_view']=bool(self.excel.ProtectedViewWindows.Count)
             if macro_name and self.book is not None:
                 with contextlib.suppress(Exception):diagnostics['has_vba_project']=bool(self.book.HasVBProject)
@@ -7561,35 +7943,63 @@ class ExcelSessionWorker:
         qualifier=match[1].replace("''","'") if match[1] is not None else match[2]
         if qualifier is not None and qualifier.replace('/','\\').casefold() not in {working.name.casefold(),str(working).replace('/','\\').casefold()}:return ''
         return "'"+working.name.replace("'","''")+"'!"+match[3]
+    def command_stage(self,stage,**fields):
+        if not hasattr(self,'_command_diagnostics'):self._command_diagnostics={}
+        self._command_diagnostics.update(fields,operation_stage=stage,elapsed_ms=max(0,int((time.monotonic()-getattr(self,'_command_started',time.monotonic()))*1000)))
+    def rebind_before_vba_capture(self,exc,force_native=False):
+        # Only reads can be retried here. Once SaveCopyAs or event-setting starts,
+        # the capture is never repeated, even if Office reports disconnection.
+        if not excel_connection_lost(exc) or getattr(self,'_live_capture_rebound',False):raise exc
+        self._live_capture_rebound=True;self.command_stage('live_capture_rebind',live_rebind_attempted=True,preflight_error=excel_worker_error_text(exc))
+        rebound=self.reconnect_workbook(include_snapshot=False,force_native=force_native);self._command_rebound=rebound
+        self._command_diagnostics['recovery']=rebound.get('diagnostics',{}).get('recovery',{})
+    def vba_live_patch_path(self):
+        self.command_stage('live_capture_validate_path')
+        try:return self.session_save_path()
+        except Exception as exc:
+            self.rebind_before_vba_capture(exc);self.command_stage('live_capture_validate_rebound_path');return self.session_save_path()
+    def capture_live_vba_snapshot(self,snapshot):
+        self.command_stage('live_capture_validate_before_save',snapshot_path=str(snapshot),savecopy_attempted=False,savecopy_completed=False)
+        try:
+            self.session_save_path();self.command_stage('live_capture_read_events');previous_events=self.excel.EnableEvents
+        except Exception as exc:
+            self.rebind_before_vba_capture(exc,force_native=self._command_diagnostics.get('operation_stage')=='live_capture_read_events');self.command_stage('live_capture_read_rebound_events');self.session_save_path();previous_events=self.excel.EnableEvents
+        primary=None;stage='live_capture_disable_events';self.command_stage(stage)
+        try:
+            self.excel.EnableEvents=False;stage='live_capture_savecopyas';self.command_stage(stage,savecopy_attempted=True)
+            self.book.call('SaveCopyAs',str(snapshot));self.command_stage('live_capture_saved',savecopy_completed=True)
+        except Exception as exc:
+            primary=exc;self.command_stage(stage,primary_error=excel_worker_error_text(exc));raise
+        finally:
+            try:self.excel.EnableEvents=previous_events
+            except Exception as restore:
+                self._command_diagnostics.update(restore_events_error=excel_worker_error_text(restore),connection_lost_during_restore=excel_connection_lost(restore))
+                if primary is None:self.command_stage('live_capture_restore_events');raise
+        self.command_stage('live_capture_confirm_path');self.session_save_path()
     def prepare_vba_patch(self,command):
         import difflib
-        self.vba_patch_plan=None;mode=self.vba_patch_source_mode(command);saved=mode=='saved_file';working=self.vba_saved_patch_path() if saved else self.session_save_path()
+        self.vba_patch_plan=None;mode=self.vba_patch_source_mode(command);saved=mode=='saved_file';self.command_stage('vba_source_validate',source_mode=mode);working=self.vba_saved_patch_path() if saved else self.vba_live_patch_path()
         if working.suffix.lower()!='.xlsm':raise UserError('Zmiana VBA wymaga kopii XLSM.')
         prompt=command.get('prompt_text');answer=command.get('answer_text','');requested=command.get('macro_name') or self.last_macro
         if not isinstance(prompt,str) or not prompt.strip() or len(prompt)>8000 or not isinstance(answer,str) or len(answer)>200:raise UserError('Przygotowanie zmiany wymaga tekstu ostatniego pytania.')
         if not isinstance(requested,str) or len(requested)>1000:raise UserError('Nieprawidłowa nazwa makra do analizy.')
-        macro=(self.vba_saved_macro(requested,working) if saved else self.qualified_macro(self.macro_name(requested)) if self.macro_name(requested) else '') if requested else ''
+        macro=self.vba_saved_macro(requested,working) if requested else ''
         if requested and not macro:raise UserError('Makro do analizy musi należeć do tej kopii skoroszytu.')
-        workspace=working.parent;companions=self.vba_patch_companions(workspace)
-        def capture_live(snapshot):
-            previous_events=self.excel.EnableEvents
-            try:self.excel.EnableEvents=False;self.book.call('SaveCopyAs',str(snapshot))
-            finally:self.excel.EnableEvents=previous_events
-            self.session_save_path()
-        snapshot_record=ExcelVbaSnapshotProvider.capture(working,mode,self.vba_regular_file,None if saved else capture_live)
-        snapshot=Path(snapshot_record.path);source=excel_vba_package_read(snapshot)
+        self.command_stage('vba_companions');workspace=working.parent;companions=self.vba_patch_companions(workspace)
+        self.command_stage('vba_snapshot_capture');snapshot_record=ExcelVbaSnapshotProvider.capture(working,mode,self.vba_regular_file,None if saved else self.capture_live_vba_snapshot,self.command_stage)
+        snapshot=Path(snapshot_record.path);self.command_stage('vba_snapshot_read',snapshot_path=str(snapshot),source_sha256=snapshot_record.sha256);source=excel_vba_package_read(snapshot)
         token=uid();preview={'token':token,'status':'unsupported','candidates':[],'rejections':[],'created_at':snapshot_record.captured_at,'workbook_id':self.workbook_id,'macro_name':macro,'answer_text':answer,'source_mode':mode,'saved_source_mtime':snapshot_record.saved_source_mtime,'file_sha256':snapshot_record.sha256,'source_note':snapshot_record.note}
         if source.get('status')!='available':
-            preview['reason']=str(source.get('reason') or 'Nie odczytano pełnego, obsługiwanego źródła VBA.')[:1800];return preview
+            preview['reason']=str(source.get('reason') or 'Nie odczytano pełnego, obsługiwanego źródła VBA.')[:1800];self.command_stage('vba_analysis_unavailable');return preview
         expected=source.get('file_sha256','')
         if expected!=snapshot_record.sha256 or file_digest(snapshot)!=snapshot_record.sha256:raise UserError('Nie potwierdzono skrótu kopii przygotowanej do zmiany.')
-        modules=source.get('modules',[]);plan=plan_vba_validation_patch(modules,macro_name=macro,prompt_text=prompt);preview['status']=str(plan.get('status','unsupported'))[:100]
+        self.command_stage('vba_analysis');modules=source.get('modules',[]);plan=plan_vba_validation_patch(modules,macro_name=macro,prompt_text=prompt);preview['status']=str(plan.get('status','unsupported'))[:100]
         preview['reason']=str(plan.get('reason',''))[:1800];preview['rejections']=[];preview['analysis']=dict(plan.get('analysis',{}))
         preview['file_sha256']=expected
         for item in plan.get('rejections',[])[:24]:
             record={'reason':str(item.get('reason',''))[:1800]} if isinstance(item,dict) else {'reason':str(item)[:1800]}
             if isinstance(item,dict):
-                for key,maximum in (('module',128),('procedure',128),('stage',128),('statement',1800),('excerpt',3500)):
+                for key,maximum in (('module',128),('procedure',128),('stage',128),('statement',1800),('excerpt',3500),('helper_module',128),('helper_procedure',128),('helper_excerpt',3500)):
                     if key in item:record[key]=str(item[key])[:maximum]
                 for key in ('line','end_line','block_line','block_end_line'):
                     if type(item.get(key)) is int:record[key]=item[key]
@@ -7611,9 +8021,9 @@ class ExcelSessionWorker:
             if len(dumps(proposed).encode('utf-8'))>256*1024:
                 preview.update(status='unsupported',candidates=[],reason='Podgląd zmiany przekracza limit. Nie przygotowano niepełnej propozycji.');candidates={};break
             preview['candidates'].append(item);candidates[cid]=_ExcelVbaModulePatch(cid,module,old,new)
-        if saved:self.vba_saved_patch_path()
-        else:self.session_save_path()
+        self.vba_saved_patch_path()  # Frozen-source analysis needs no further COM calls.
         if candidates:self.vba_patch_plan=_ExcelVbaPreparedPatch(token,snapshot_record,tuple(candidates.values()),self.revision,tuple(_ExcelVbaCompanion(item['path'],item['name'],tuple(item['signature'])) for item in companions))
+        self.command_stage('vba_analysis_complete')
         return preview
     def apply_vba_patch(self,command):
         mode=self.vba_patch_source_mode(command);saved=mode=='saved_file';working=self.vba_saved_patch_path() if saved else self.session_save_path();plan=self.vba_patch_plan;token=command.get('token');cid=command.get('candidate_id')
@@ -7626,6 +8036,7 @@ class ExcelSessionWorker:
             if _ExcelPdfObserver._signature(self.vba_regular_file(item.path,500*1024*1024))!=item.signature:raise UserError('Plik towarzyszący zmienił się od przygotowania propozycji: '+item.name)
         self.vba_patch_plan=None  # Applying a frozen proposal is one-shot, including failures.
         folder=Path(tempfile.mkdtemp(prefix='vba-patched-',dir=working.parent));destination=folder/working.name;candidate=next(item for item in plan.candidates if item.id==cid)
+        self.command_stage('vba_patch_write',snapshot_path=str(snapshot),source_sha256=plan.source.sha256,candidate_id=cid,candidate_path=str(destination))
         patched=excel_vba_package_patch(snapshot,destination,plan.source.sha256,candidate.module,candidate.old_source,candidate.new_source)
         if _excel_retained_path(patched.get('path',''))!=destination:raise UserError('Zapis zmiany zwrócił inną kopię niż oczekiwana.')
         self.vba_regular_file(destination,256*1024*1024);sha256=file_digest(destination)
@@ -7635,8 +8046,7 @@ class ExcelSessionWorker:
             source=Path(item.path);target=folder/item.name;excel_copy_workbook(source,target,cancelled)
             if _ExcelPdfObserver._signature(self.vba_regular_file(source,500*1024*1024))!=item.signature or self.vba_regular_file(target,500*1024*1024).st_size!=item.signature[2]:raise UserError('Plik towarzyszący zmienił się podczas kopiowania: '+item.name)
             paths.append(str(target))
-        if saved:self.vba_saved_patch_path()
-        else:self.session_save_path()
+        self.vba_saved_patch_path()
         return {'path':str(destination),'sha256':sha256,'token':token,'candidate_id':cid,'label':'Zmieniona kopia — niezweryfikowana','verified':False,'snapshot_created_at':plan.source.captured_at,'companions':[item.name for item in plan.companions],'companion_paths':paths,'source_mode':mode,'source_note':plan.source.note,'saved_source_mtime':plan.source.saved_source_mtime}
     def invoke_macro(self,macro,extra,diagnostics=False,identity=None,action='run_macro'):
         self.last_macro=macro;self.vba_patch_plan=None
@@ -7647,7 +8057,7 @@ class ExcelSessionWorker:
             extra['pdf_outputs']['scope']=self.pdf_observer.scope;before=self.pdf_observer.capture()
         extra['macro_outcome']='running'
         try:
-            self.excel.call('Run',macro);extra['macro_outcome']='returned'
+            self.command_stage('macro_run');self.excel.call('Run',macro);extra['macro_outcome']='returned';self.command_stage('macro_returned')
         except Exception as exc:
             extra['macro_outcome']='unknown' if excel_connection_lost(exc) else 'failed'
             raise
@@ -7659,13 +8069,16 @@ class ExcelSessionWorker:
         if command.get('action')=='close':return False
         action=command.get('action');identity=command.get('id');self.applied=0;macro='';invocation={};extra={};file_only=action in ('prepare_vba_patch','apply_vba_patch') and command.get('source_mode')=='saved_file'
         self._command_id=identity;self._command_attempt_id=command.get('attempt_id','')
+        self._command_started=time.monotonic();self._command_diagnostics={'operation':str(action or ''),'job_id':str(identity or ''),'attempt_id':self._command_attempt_id,'working_copy':self.working_copy};self._live_capture_rebound=False;self._command_rebound={};self.command_stage('command_validate')
+        if action in ('prepare_vba_patch','apply_vba_patch'):self._command_diagnostics.update(source_mode=command.get('source_mode','live'),candidate_id=command.get('candidate_id',''))
         self.send('busy',id=identity,operation=action)
         try:
             if not isinstance(self._command_attempt_id,str) or (self._command_attempt_id and not re.fullmatch('[0-9a-f]{32}',self._command_attempt_id)):raise UserError('Nieprawidłowy identyfikator próby Excel.')
             if type(command.get('diagnostics',False)) is not bool:raise UserError('Nieprawidłowa opcja diagnostyki VBA.')
             isolated=action in ('inspect_vba','prepare_vba_patch','apply_vba_patch','reconnect_workbook')
             if command.get('workbook_id')!=self.workbook_id:raise UserError('Wrong workbook identity.')
-            if action!='reconnect_workbook' and not file_only:self.preflight_connection()
+            if action not in ('reconnect_workbook','prepare_vba_patch') and not file_only:self.command_stage('connection_preflight');self.preflight_connection()
+            self.command_stage(str(action or 'command_execute'))
             if not isolated:self.excel.AutomationSecurity=2
             if self.handoff_incomplete and action in ('run_macro','run_control_macro','apply_edits','prepare_vba_patch','apply_vba_patch'):raise UserError(EXCEL_HANDOFF_INCOMPLETE_MESSAGE)
             if action=='run_macro':
@@ -7675,7 +8088,8 @@ class ExcelSessionWorker:
             elif action=='reconnect_workbook':extra.update(self.reconnect_workbook());extra['action']=action
             elif action=='inspect_vba':extra['vba_source']=self.inspect_vba()
             elif action=='prepare_vba_patch':extra['vba_patch']=self.prepare_vba_patch(command)
-            elif action=='apply_vba_patch':extra['vba_patch_applied']=self.apply_vba_patch(command)
+            elif action=='apply_vba_patch':
+                self.command_stage('vba_patch_apply');extra['vba_patch_applied']=self.apply_vba_patch(command);self.command_stage('vba_patch_complete',candidate_path=str(extra['vba_patch_applied'].get('path') or ''))
             elif action=='read_range':extra['snapshot']=self.read_range(command)
             elif action=='list_sheets':pass
             elif action=='apply_edits':self.apply_edits(command.get('edits'))
@@ -7707,15 +8121,19 @@ class ExcelSessionWorker:
             if not isolated:self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
             # Reconnect already read and validated the complete session. A
             # second COM read could fail after success and discard that result.
-            result=({'workbook_id':self.workbook_id,'file_only':True,'source_mode':'saved_file','action':action} if file_only
+            if action not in ('prepare_vba_patch','apply_vba_patch','reconnect_workbook'):self.command_stage('session_metadata')
+            result=({'workbook_id':self.workbook_id,'file_only':file_only,'source_mode':command.get('source_mode','live'),'action':action} if action in ('prepare_vba_patch','apply_vba_patch')
                     else {} if action=='reconnect_workbook' else self.session_info())
+            if self._command_rebound:result.update({k:v for k,v in self._command_rebound.items() if k!='diagnostics'})
+            if action in ('prepare_vba_patch','apply_vba_patch','reconnect_workbook'):
+                diagnostics=dict(self._command_diagnostics);diagnostics.update(excel_owned_process_diagnostics(self.owned_process));diagnostics.update(extra.get('diagnostics',{}));extra['diagnostics']=excel_session_diagnostics(diagnostics)
             result.update(extra);self.send('done',id=identity,operation=action,result=result)
         except Exception as exc:
             if action not in ('inspect_vba','prepare_vba_patch','apply_vba_patch','reconnect_workbook') and not excel_connection_lost(exc) and not isinstance(exc,_ExcelWorkbookRebound):
                 with contextlib.suppress(Exception):self.excel.EnableEvents=True;self.excel.DisplayAlerts=True
             outcome={'result':{key:extra[key] for key in ('pdf_outputs','macro_outcome') if key in extra}} if extra else {}
             if isinstance(exc,_ExcelWorkbookRebound):outcome['result']=exc.result
-            fields=excel_worker_error_fields(exc,action,macro,{'working_copy':self.working_copy,'source_mode':'saved_file'}) if file_only else self.error_fields(exc,action,macro,invocation)
+            fields=excel_worker_error_fields(exc,action,macro,self._command_diagnostics) if file_only else self.error_fields(exc,action,macro,invocation)
             self.send('error',id=identity,operation=action,applied=self.applied,retry_safe=False,**outcome,**fields)
         return True
     def close(self):
@@ -7974,7 +8392,7 @@ class ExcelSessionController:
         self.process=None;self.owned_process=None;self.thread=None;self.reaper=None;self.dispatcher=None;self.previous=set();self.pending=None;self.temp_root=None;self.staged=None;self._copy_cancel=None
         self.resume_path=resume_path;self.session_file_lock=None;self.manifest={};self.resume_info=None;self._vba_requested_job='';self._file_patch_job_state=None
         self.state={'session_id':self.session_id,'workbook_id':self.session_id+'-book','state':'new','job_id':'','operation':'','original_path':str(self.original),'source_path':str(self.original),'staged_path':'','working_copy':'','temp_root':'','workspace_path':'','last_saved_path':'','pid':0,'hwnd':0,'owned':False,'alive':False,'active_sheet':'','last_result':{},'last_operation':'','error':'','error_operation':'','events':[],'cancelled':False,'finished':False,'handoff_incomplete':False}
-        self.state.update(error_details='',error_code='',macro_name='',resumed=resume_path is not None,externally_changed=False,vba_source={},vba_source_job='',vba_patch={},vba_patch_job='',attempt_id='',last_attempt_id='',last_job_id='')
+        self.state.update(error_details='',error_diagnostics={},error_code='',macro_name='',resumed=resume_path is not None,externally_changed=False,vba_source={},vba_source_job='',vba_patch={},vba_patch_job='',attempt_id='',last_attempt_id='',last_job_id='')
     def _event(self,event,**fields):
         with self.lock:
             if isinstance(fields.get('result'),dict) and 'snapshot' in fields['result']:
@@ -8135,6 +8553,8 @@ class ExcelSessionController:
         except (OSError,ValueError):pass
     def _consume(self,value):
         if not isinstance(value,dict) or value.get('session_id')!=self.session_id:return
+        value=dict(value,diagnostics=excel_session_diagnostics(value.get('diagnostics')))
+        if isinstance(value.get('result'),dict) and 'diagnostics' in value['result']:value['result']=dict(value['result'],diagnostics=excel_session_diagnostics(value['result']['diagnostics']))
         event=value.get('event')
         if event=='created':
             try:owned=ExcelOwnedProcess(value.get('pid'),value.get('hwnd'),self.previous)
@@ -8148,11 +8568,11 @@ class ExcelSessionController:
             message=str(value.get('message','Nie ukończono otwierania sesji Excel.'))[:1800]
             details=str(value.get('details',''))[:16384];code=str(value.get('code',''))[:100];macro_name=str(value.get('macro_name',''))[:1000]
             with self.lock:
-                self.state.update(state='error',error=excel_session_error_text(message),error_operation='open',error_details=details,error_code=code,macro_name=macro_name,job_id='')
+                self.state.update(state='error',error=excel_session_error_text(message),error_operation='open',error_details=details,error_diagnostics=value['diagnostics'],error_code=code,macro_name=macro_name,job_id='')
                 issue=value.get('dependency')
                 if isinstance(issue,dict) and issue.get('profile')=='excel' and issue.get('state') in ('missing','broken'):
                     self.state['dependency']=dependency_problem('excel',issue['state'],issue.get('details',''))
-            self._event('error',operation='open',message=message,details=details,code=code,macro_name=macro_name);return
+            self._event('error',operation='open',message=message,details=details,diagnostics=value['diagnostics'],code=code,macro_name=macro_name);return
         if event=='closed':return
         with self.lock:
             if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
@@ -8191,6 +8611,8 @@ class ExcelSessionController:
                 self._write_manifest()
         except Exception as exc:
             event='error';value['message']=safe_error(exc)
+        completed_without_connection=bool(event=='done' and operation in ('prepare_vba_patch','apply_vba_patch') and isinstance(value.get('result'),dict) and (value['result'].get('diagnostics') or {}).get('owned_process_alive') is False)
+        if completed_without_connection:value['result']=dict(value['result'],operation_completed=True,connection_lost_after_capture=True)
         with self.lock:
             if self.cancelled.is_set() or value.get('id')!=self.state['job_id']:return
             if event=='busy':self.state['state']='busy'
@@ -8200,16 +8622,18 @@ class ExcelSessionController:
                 if operation=='apply_vba_patch':self.state.update(vba_patch={},vba_patch_job='')
                 if (isinstance(value.get('result'),dict) and value['result'].get('handoff_incomplete') is True) or self.manifest.get('handoff_incomplete'):self.state['handoff_incomplete']=True
                 if event=='error':
-                    self.state.update(error=excel_session_error_text(value.get('message','Błąd Excel.'))[:1800],error_operation=str(value.get('operation') or operation or 'open'),error_details=str(value.get('details',''))[:16384],error_code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],applied=value.get('applied',0))
+                    self.state.update(error=excel_session_error_text(value.get('message','Błąd Excel.'))[:1800],error_operation=str(value.get('operation') or operation or 'open'),error_details=str(value.get('details',''))[:16384],error_diagnostics=value['diagnostics'],error_code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],applied=value.get('applied',0))
                     if value.get('result'):self.state.update(last_result=clone(value['result']),active_sheet=str(value['result'].get('active_sheet','')))
                 else:
-                    result=value.get('result') or {};self.state.update(error='',error_operation='',error_details='',error_code='',macro_name='',last_result=clone(result),active_sheet=str(result.get('active_sheet','')))
+                    result=value.get('result') or {};self.state.update(error='',error_operation='',error_details='',error_diagnostics={},error_code='',macro_name='',last_result=clone(result),active_sheet=str(result.get('active_sheet','')))
                     if result.get('saved_path'):self.state['last_saved_path']=result['saved_path']
-                disconnected=(file_patch_state is not None and file_patch_state['state']=='disconnected') or (event=='error' and (value.get('code')=='excel_disconnected' or operation=='reconnect_workbook'))
-                if (disconnected and not file_patch_state) or (value.get('result') or {}).get('workbook_rebound'):self.state.update(vba_patch={},vba_patch_job='',vba_source={},vba_source_job='')
+                disconnected=completed_without_connection or (file_patch_state is not None and file_patch_state['state']=='disconnected') or (event=='error' and (value.get('code')=='excel_disconnected' or operation=='reconnect_workbook'))
+                if (disconnected and not file_patch_state) or (value.get('result') or {}).get('workbook_rebound'):
+                    self.state.update(vba_source={},vba_source_job='')
+                    if not (event=='done' and operation=='prepare_vba_patch' and self.state.get('vba_patch_job')==value.get('id')):self.state.update(vba_patch={},vba_patch_job='')
                 self.state.update(state='disconnected' if disconnected else 'ready',job_id='',operation='',attempt_id='')
                 self._file_patch_job_state=None
-        self._event(event,id=value.get('id',''),attempt_id=attempt_id,operation=value.get('operation','open'),message=value.get('message',''),details=str(value.get('details',''))[:16384],code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],result=value.get('result',{}),applied=value.get('applied',0),retry_safe=False)
+        self._event(event,id=value.get('id',''),attempt_id=attempt_id,operation=value.get('operation','open'),message=value.get('message',''),details=str(value.get('details',''))[:16384],diagnostics=value['diagnostics'],code=str(value.get('code',''))[:100],macro_name=str(value.get('macro_name',''))[:1000],result=value.get('result',{}),applied=value.get('applied',0),retry_safe=False)
     def _accept_vba_source(self,report,jid):
         # Source belongs only to the current in-memory view, never the event log.
         if not isinstance(report,dict) or report.get('status') not in ('available','partial','denied','locked','unavailable'):return
@@ -8257,6 +8681,11 @@ class ExcelSessionController:
             entry={}
             for field,maximum in (('reason',1800),('module',128),('procedure',128),('stage',128),('statement',1800),('excerpt',3500)):
                 value=item.get(field,'')
+                if not isinstance(value,str) or len(value)>maximum:return
+                entry[field]=value
+            for field,maximum in (('helper_module',128),('helper_procedure',128),('helper_excerpt',3500)):
+                if field not in item:continue
+                value=item[field]
                 if not isinstance(value,str) or len(value)>maximum:return
                 entry[field]=value
             for field in ('line','end_line','block_line','block_end_line'):
@@ -8340,7 +8769,7 @@ class ExcelSessionController:
             if action in ('run_macro','run_control_macro','prepare_vba_patch','reconnect_workbook'):self.state.update(vba_patch={},vba_patch_job='')
             self._vba_requested_job=jid if command.get('diagnostics') is True else ''
             self._file_patch_job_state={'id':jid,'state':self.state['state']} if file_only else None
-            self.state.update(state='busy',job_id=jid,operation=action,attempt_id=attempt_id,error='',error_operation='',error_details='',error_code='',macro_name='')
+            self.state.update(state='busy',job_id=jid,operation=action,attempt_id=attempt_id,error='',error_operation='',error_details='',error_diagnostics={},error_code='',macro_name='')
             self.dispatcher=threading.Thread(target=self._dispatch,args=(command,),name='pivot-excel-request',daemon=False);self.dispatcher.start()
         self._event('submitted',operation=action,id=jid,attempt_id=attempt_id);return jid
     def _dispatch(self,command):
@@ -14282,6 +14711,24 @@ def native_ui_types():
         def copy_session_activity(self):
             text=self.activity_log.toPlainText();diagnosis=self.patch_diagnosis.toPlainText()
             QW.QApplication.clipboard().setText(text+('\n\n'+diagnosis if diagnosis else ''))
+        def record_operation_diagnostics(self,operation,diagnostics=None,details=''):
+            records=[]
+            if isinstance(diagnostics,dict):
+                labels={'operation_stage':'Etap','job_id':'Polecenie','attempt_id':'Próba','source_mode':'Źródło','working_copy':'Kopia sesji','snapshot_path':'Migawka',
+                    'candidate_path':'Zmieniona kopia','candidate_id':'Propozycja zmiany','source_sha256':'SHA-256 źródła','elapsed_ms':'Czas operacji [ms]','live_rebind_attempted':'Podjęto odnowienie przed kopiowaniem','preflight_error':'Błąd sprawdzenia połączenia',
+                    'savecopy_attempted':'Zlecono SaveCopyAs','savecopy_completed':'SaveCopyAs zakończone','primary_error':'Błąd pierwotny','restore_events_error':'Błąd przywracania zdarzeń',
+                    'owned_pid':'PID sesji','owned_hwnd':'Okno sesji','owned_process_alive':'Proces działa','owned_window_pid':'PID okna','owned_window_valid':'Okno istnieje','recovery':'Odzyskiwanie połączenia'}
+                for field,label_ in labels.items():
+                    if field not in diagnostics:continue
+                    value=diagnostics[field]
+                    if isinstance(value,(dict,list)):value=dumps(value)
+                    records.append(label_+': '+str(value)[:2000])
+            if details:records.append('Szczegóły błędu:\n'+str(details)[:12000]+('\n[Komunikat skrócono; otwórz „Szczegóły błędu”, aby skopiować pełną wersję.]' if len(str(details))>12000 else ''))
+            text='\n'.join(records).replace('\0','')
+            if not text:return
+            if len(text)>14000:text=text[:13880]+'\n[Szczegóły skrócono; pełny dostępny komunikat: „Szczegóły błędu”.]'
+            for index,offset in enumerate(range(0,len(text),3000)):
+                self.activity_event('Diagnostyka — '+self.activity_operation(operation)+(' · część '+str(index+1) if len(text)>3000 else '')+'\n'+text[offset:offset+3000],key=('operation-diagnostics',self._activity_attempt,operation,text,index))
         def clear_patch_diagnosis(self):
             self.patch_diagnosis.clear();self.patch_diagnosis_toggle.setChecked(False);self.patch_diagnosis_toggle.hide();self.patch_diagnosis.hide()
         def toggle_patch_diagnosis(self,visible):
@@ -14336,6 +14783,9 @@ def native_ui_types():
                 if item.get('stage'):lines.append('Etap analizy: '+str(item['stage'])[:100])
                 if item.get('statement'):lines.append('Instrukcja: '+str(item['statement'])[:1800])
                 if item.get('excerpt'):lines.append('Fragment źródła (nie ślad wykonania):\n'+str(item['excerpt'])[:4000])
+                if item.get('helper_excerpt'):
+                    helper='.'.join(str(item.get(field) or '') for field in ('helper_module','helper_procedure')).strip('.')
+                    lines.append('Wywołana funkcja: '+helper+'\nStatyczne źródło funkcji pomocniczej:\n'+str(item['helper_excerpt'])[:3500])
                 parts.append('\n'.join(line for line in lines if line))
             if not rejections and plan.get('reason'):parts.append(str(plan['reason'])[:1800])
             body='\n\n'.join(parts);tail='\n\n'+'\n'.join(metadata)[:6000];available=30000-len(tail)
@@ -14415,6 +14865,8 @@ def native_ui_types():
                     if location and location not in locations:locations.append(location)
                 descriptions=[('; '.join(locations)+': ' if locations else '')+reason for reason,locations in grouped.items()]
                 self.patch_note.setText('Nie utworzono zmienionej kopii. '+'\n'.join(descriptions)[:2500]);self.message.setText('Analiza zakończona bez propozycji zmiany VBA.');return
+            if self._snapshot.get('state')=='disconnected' and plan.get('source_mode')!='saved_file':
+                self.patch_note.setText('Analiza zapisanej migawki zakończyła się, ale połączenie z Excelem zostało utracone. Szczegóły i proponowana zmiana są dostępne poniżej. Przygotuj zmianę z ostatniej zapisanej kopii sesji albo połącz ponownie i ponów analizę.');return
             if self._patch_preview is not None:return
             dialog=QW.QDialog(self);dialog.setWindowTitle('Pierdol to — podgląd zmiany VBA');dialog.setWindowModality(Qt.WindowModality.WindowModal);layout=QW.QVBoxLayout(dialog)
             source_note=('Źródło: ostatnia zapisana kopia sesji. Niezapisane zmiany z Excela nie są uwzględnione. '+str(plan.get('source_note','')) if plan.get('source_mode')=='saved_file' else 'Źródło: bieżący skoroszyt z chwili przygotowania. Późniejsze edycje nie są uwzględnione.')
@@ -14570,7 +15022,7 @@ def native_ui_types():
             if self._last_prompts or self.foreground_command_active():layout.addWidget(label('To szczegóły wcześniejszego błędu. Bieżące zadanie lub pytanie Excela jest pokazane w głównym oknie sesji.',True,True))
             text=QW.QPlainTextEdit();text.setReadOnly(True);text.setPlainText(self.error_report());text.setLineWrapMode(QW.QPlainTextEdit.LineWrapMode.WidgetWidth);text.setWordWrapMode(QG.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere);layout.addWidget(text,1)
             layout.addWidget(button('Kopiuj szczegóły',self.copy_error_details));layout.addWidget(button('Zamknij',dialog.accept));limited_dialog_size(dialog,720,480);dialog.exec()
-        def remember_failure(self,message,details='',code='',operation=''):
+        def remember_failure(self,message,details='',code='',operation='',diagnostics=None):
             message=str(message or 'Nie udało się wykonać operacji Excela.');details=str(details or '')
             # Older workers can still expose raw COM tuples. Keep those in the
             # diagnostic view; their representation is not an instruction for a user.
@@ -14581,6 +15033,7 @@ def native_ui_types():
                 message='Excel zgłosił problem z uruchomieniem makra. Nie wiadomo jeszcze, czy makro jest niedostępne, czy jego uruchomienie blokują ustawienia lub stan skoroszytu.'
             value={'message':message,'details':details,'code':str(code or ''),'operation':str(operation or '')};key=digest(value)
             self.activity_event('Błąd — '+self.activity_operation(operation)+': '+message+(' [kod: '+str(code)+']' if code else ''),key=('failure',self._activity_attempt,key))
+            self.record_operation_diagnostics(operation,diagnostics,details)
             if key==self._last_failure_key:return
             self._last_failure_key=key;self._last_failure=value;self.failure_text.setPlainText(message);self.update_failure_presentation()
             self.failure_frame.setTitle('Problem z uruchomieniem makra' if code=='macro_unavailable' else 'Ostatnia operacja nie powiodła się');self.macro_recovery.setVisible(code=='macro_unavailable')
@@ -15040,7 +15493,9 @@ def native_ui_types():
             if state=='ready' and previous_state in ('starting','new'):self.activity_event('Sesja Excela gotowa. Kopia: '+str(snapshot.get('working_copy') or 'utworzona dla tej sesji')+'.')
             if state=='closed' and previous_state!='closed':self.activity_event('Sesja została zakończona.')
             saved_result=isinstance(snapshot.get('last_result'),dict) and snapshot['last_result'].get('source_mode')=='saved_file' and snapshot.get('last_operation') in ('prepare_vba_patch','apply_vba_patch')
-            if state=='disconnected' and previous_state!='disconnected' and not saved_result:
+            analysis_result=snapshot.get('last_result') or {}
+            completed_snapshot=bool(current_result and snapshot.get('last_operation') in ('prepare_vba_patch','apply_vba_patch') and analysis_result.get('action')==snapshot.get('last_operation') and analysis_result.get('operation_completed') is True and analysis_result.get('connection_lost_after_capture') is True)
+            if state=='disconnected' and previous_state!='disconnected' and not (saved_result or completed_snapshot):
                 self._queued=None;self._patch_plan={};self.clear_patch_diagnosis()
                 if self._patch_preview is not None:
                     with contextlib.suppress(RuntimeError):self._patch_preview.reject()
@@ -15062,11 +15517,12 @@ def native_ui_types():
             if current_result and result and snapshot.get('error') and not self._command_pending and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);self.apply_native_result(result,allow_reveal=False)
                 if isinstance(result.get('pdf_outputs'),dict):self._pdf_attempt_destination=''
-            if current_result and result and (state=='ready' or (state=='disconnected' and saved_result)) and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
+            if current_result and result and (state=='ready' or (state=='disconnected' and (saved_result or completed_snapshot))) and not self._command_pending and not snapshot.get('error') and digest(result)!=self._last_result_key:
                 self._last_result_key=digest(result);destination=result.get('destination') if isinstance(result,dict) else None
                 operation=(result.get('action') or snapshot.get('last_operation') or snapshot.get('operation') or '') if isinstance(result,dict) else ''
                 self.complete_run_attempt(snapshot,result)
                 if operation and operation!='open' and not completed_background:self.activity_event('Zakończono: '+self.activity_operation(operation)+'.'+(' Makro nie zostało ponowione.' if operation=='reconnect_workbook' else ''))
+                if not completed_background:self.record_operation_diagnostics(operation,result.get('diagnostics'))
                 if operation and operation not in ('open','read_range','activate_sheet','show_excel','reveal_control','inspect_vba') and not completed_background and not snapshot.get('handoff_incomplete') and state!='disconnected':self.clear_failure()
                 if operation in ('save_session','save_working','save_copy') and isinstance(result,dict) and (result.get('saved_path') or destination):self.saved_copy_path=str(result.get('saved_path') or destination);self.saved_copy_revision=str(result.get('saved_revision',''))
                 if operation not in ('read_range','open'):
@@ -15106,7 +15562,7 @@ def native_ui_types():
                 if self._quiet_read_error:self.native_note.setText('Nie odświeżono podglądu: '+str(snapshot['error']))
                 else:
                     self.message.setText(str(snapshot['error']))
-                    self.remember_failure(snapshot['error'],snapshot.get('error_details',''),snapshot.get('error_code',''),snapshot.get('error_operation',''))
+                    self.remember_failure(snapshot['error'],snapshot.get('error_details',''),snapshot.get('error_code',''),snapshot.get('error_operation',''),snapshot.get('error_diagnostics'))
                 if not self._command_pending and snapshot.get('error_operation') in ('prepare_vba_patch','apply_vba_patch'):self._patch_run_request=None;self.patch_note.setText('Nie przygotowano zmiany VBA. '+str(snapshot['error']))
                 self._close_after_save=False
             if state=='ready' and self._last_failure and not self.background_read_active() and not self._command_pending:
@@ -23636,11 +24092,24 @@ def excel_vba_patch_test_suite():
                     '  If MsgBox("'+self.prompt+'", vbYesNo) = vbYes Then Exit Function\n End If\n'
                     ' If lastInvalid Then\n  CheckDocument = False\n End If\nEnd Function\n')
 
+        def helper_fixture(self, helper_body=None, byref=False):
+            code=self.validator_fixture().replace(' CheckDocument = True',' Dim detail As String\n Dim continueRun As Boolean\n continueRun = True\n CheckDocument = True',1)
+            code=code.replace('  If MsgBox("'+self.prompt+'", vbYesNo) = vbYes Then Exit Function\n End If',
+                '  ReportSheet.Range("DocumentIdentifier").Select\n  detail = "Nieprawidlowy kod projektu."\n'
+                '  continueRun = AskUser(detail)\n End If\n If Not continueRun Then Exit Function')
+            if helper_body is None:
+                helper_body=(' Dim answer As VbMsgBoxResult\n Dim message As String\n'
+                    ' message = detail & " Czy przerwac sprawdzanie?"\n'
+                    ' answer = MsgBox(message, vbYesNo Or vbExclamation, "Validation")\n'
+                    ' If answer = vbYes Then\n  AskUser = False\n Else\n  AskUser = True\n End If\n')
+            return code+'Private Function AskUser('+('ByRef' if byref else 'ByVal')+' detail As String) As Boolean\n'+helper_body+'End Function\n'
+
         def execute_validator_fixture(self, code, first, selected, last):
             # Independent executable oracle for this fixture's tiny VBA subset.
             # No COM, external calls, package mutation or application launch.
             environment = {'firstinvalid':first, 'selectedinvalid':selected, 'lastinvalid':last, 'true':True, 'false':False}
-            lines = code[code.index('Function CheckDocument('):].splitlines()[1:-1]
+            source=code[code.index('Function CheckDocument('):]
+            lines = source[:source.index('End Function')].splitlines()[1:]
             active = [True];result = False;events = []
             for raw in lines:
                 text = raw.split("'",1)[0].strip()
@@ -23651,18 +24120,103 @@ def excel_vba_patch_test_suite():
                     value = False
                     if all(active):
                         if conditional[1].startswith('MsgBox('):events.append('question');value = False  # user answered No
+                        elif conditional[1].casefold().startswith('not '):value=not environment[conditional[1][4:].casefold()]
                         else:value = environment[conditional[1].casefold()]
                     if conditional[2]:
                         if all(active) and value:return result, events
                     else:active.append(value)
                     continue
                 if not all(active):continue
+                if text.startswith('Dim '):continue
                 if text == 'CheckDocument = True':result = True
                 elif text == 'CheckDocument = False':result = False
-                elif text in ('ReportSheet.Activate','ActiveWindow.ScrollRow = 1'):events.append(text)
+                elif text in ('continueRun = True','continueRun = False'):environment['continuerun']=text.endswith('True')
+                elif text == 'continueRun = AskUser(detail)':events.append('question');environment['continuerun']=True  # normal helper, No
+                elif text in ('ReportSheet.Activate','ActiveWindow.ScrollRow = 1','ReportSheet.Range("DocumentIdentifier").Select') or text.startswith('detail = '):events.append(text)
                 else:self.fail('Unknown instruction in fixture oracle: '+text)
             self.assertEqual(active,[True])
             return result,events
+
+        def test_helper_selected_effect_preserves_order_and_other_validation_results(self):
+            code=self.helper_fixture().replace('\n','\r\n');result=self.plan(code)
+            self.assertEqual(result['status'],'candidate');self.assertEqual(len(result['candidates']),1)
+            item=result['candidates'][0];patched=code[:item['start_offset']]+item['new_block']+code[item['end_offset']:]
+            evidence=item['semantic_evidence'];self.assertEqual(evidence['strategy'],'summarized_message_helper')
+            self.assertEqual(item['procedure'],'CheckDocument');self.assertEqual(evidence['call_path'],('thisworkbook.generatedocument','thisworkbook.checkdocument','thisworkbook.askuser'))
+            self.assertEqual(patched[:item['start_offset']],code[:item['start_offset']])
+            self.assertEqual(patched[item['start_offset']+len(item['new_block']):],code[item['end_offset']:])
+            self.assertEqual(patched.count('CheckDocument = True'),1)
+            self.assertEqual(patched.count('ActiveWindow.ScrollRow = 1'),2)
+            for first,selected,last in itertools.product((False,True),repeat=3):
+                with self.subTest(first=first,selected=selected,last=last):
+                    before,old_events=self.execute_validator_fixture(code,first,selected,last)
+                    after,new_events=self.execute_validator_fixture(patched,first,selected,last)
+                    self.assertEqual(before,not (first or selected or last));self.assertEqual(after,not (first or last))
+                    self.assertEqual(new_events,[event for event in old_events if event!='question'])
+
+        def test_helper_continuation_comes_from_caller_for_both_helper_polarities(self):
+            for invert_caller,invert_helper in itertools.product((False,True),repeat=2):
+                code=self.helper_fixture()
+                if invert_caller:code=code.replace('If Not continueRun Then','If continueRun Then')
+                if invert_helper:code=code.replace('If answer = vbYes Then','If answer = vbNo Then')
+                item=self.plan(code)['candidates'][0]
+                with self.subTest(caller=invert_caller,helper=invert_helper):
+                    self.assertIn('continueRun = '+('False' if invert_caller else 'True')+'\n',item['new_block'])
+            code=self.helper_fixture().replace(' If Not continueRun Then Exit Function',' StoreAnswer continueRun')
+            result=self.plan(code);self.assertFalse(result['candidates'])
+            self.assertTrue(any(item.get('helper_procedure')=='AskUser' for item in result['rejections']))
+
+        def test_helper_default_return_and_direct_comparison_are_summarized(self):
+            for body in (' AskUser = (MsgBox(detail & " Czy przerwac sprawdzanie?", vbYesNo) = vbNo)\n',
+                         ' If MsgBox(detail & " Czy przerwac sprawdzanie?", vbYesNo) = vbNo Then AskUser = True\n'):
+                with self.subTest(body=body):self.assertEqual(self.plan(self.helper_fixture(body))['status'],'candidate')
+
+        def test_shared_helper_matches_full_bound_prompt_and_only_selected_caller(self):
+            code=self.helper_fixture();guard=re.search(r' If selectedInvalid Then\n.*?\n End If\n If Not continueRun Then Exit Function',code,re.S)[0]
+            other=guard.replace('selectedInvalid','otherInvalid').replace('Nieprawidlowy kod projektu.','Missing account description.')
+            code=code.replace(guard,other+'\n'+guard)
+            result=self.plan(code);self.assertEqual(len(result['candidates']),1)
+            self.assertIn('If selectedInvalid Then',result['candidates'][0]['old_block'])
+            self.assertNotIn('Missing account',result['candidates'][0]['old_block'])
+            shared_footer=self.plan(code,prompt='An unknown document problem. Czy przerwac sprawdzanie?')
+            self.assertFalse(shared_footer['candidates'])
+
+        def test_helper_side_effect_refusal_contains_source_and_never_patches_shared_helper(self):
+            base=(' If MsgBox("'+self.prompt+'", vbYesNo) = vbYes Then\n  AskUser = False\n  Exit Function\n End If\n AskUser = True\n')
+            for instruction in ('detail = "modified"','SaveDocument','connection.Execute query','ReportSheet.Activate','On Error Resume Next','Static answer As Long'):
+                code=self.helper_fixture(' '+instruction+'\n'+base,byref=True)
+                with self.subTest(instruction=instruction):
+                    result=self.plan(code);self.assertFalse(result['candidates'])
+                    rejection=next(item for item in result['rejections'] if item.get('helper_procedure')=='AskUser')
+                    self.assertIn(instruction,rejection['helper_excerpt']);self.assertIn('MsgBox',rejection['helper_excerpt'])
+                    self.assertLessEqual(len(rejection['helper_excerpt']),3500)
+
+        def test_helper_shadowing_missing_success_and_constant_answers_refuse(self):
+            base=self.helper_fixture()
+            variants=(base.replace(' Dim detail As String',' Dim AskUser As Object\n Dim detail As String',1),
+                      base.replace(' CheckDocument = True\n',''),
+                      base.replace('Private Function AskUser','Private Static Function AskUser'),
+                      base.replace('  AskUser = True','  AskUser = False'),
+                      'Public Enum Answers\n vbYes = 7\nEnd Enum\n'+base)
+            for code in variants:
+                with self.subTest(code=code):self.assertFalse(self.plan(code)['candidates'])
+
+        def test_helper_numeric_coercion_and_overflow_are_not_guessed(self):
+            bodies=(' AskUser = (MsgBox(detail & " Czy przerwac sprawdzanie?", vbYesNo) = CInt(True) + 6)\n',
+                    ' Dim answer As Byte\n answer = MsgBox(detail & " Czy przerwac sprawdzanie?", vbYesNo) + 250\n AskUser = (answer = 256)\n',
+                    ' AskUser = (MsgBox(detail & " Czy przerwac sprawdzanie?", CInt(32767) + CInt(5)) = vbNo)\n',
+                    ' AskUser = (MsgBox(detail & " Czy przerwac sprawdzanie?", 32767 + 5) = vbNo)\n')
+            for body in bodies:
+                with self.subTest(body=body):self.assertFalse(self.plan(self.helper_fixture(body))['candidates'])
+
+        def test_helper_cross_module_refusal_exposes_its_source(self):
+            code=self.helper_fixture();offset=code.index('Private Function AskUser')
+            for qualifier in ('','Prompts.'):
+                main=code[:offset].replace('AskUser(detail)',qualifier+'AskUser(detail)')
+                helper=code[offset:].replace('Private Function','Public Function')
+                result=plan_vba_validation_patch([{'name':'ThisWorkbook','code':main},{'name':'Prompts','code':helper}],'ThisWorkbook.GenerateDocument',self.prompt)
+                self.assertFalse(result['candidates']);rejection=next(item for item in result['rejections'] if item.get('helper_module')=='Prompts')
+                self.assertIn('innym module',rejection['reason']);self.assertIn('answer = MsgBox',rejection['helper_excerpt'])
 
         def test_selected_check_preserves_prior_and_later_failures_and_ui_operations(self):
             code = self.validator_fixture();result = self.plan(code)
@@ -24859,6 +25413,37 @@ send('closed')
                 newer=controller.submit('run_macro',{'name':'GenerateDocument','attempt_id':'c'*32});controller.dispatcher.join(2)
                 controller._consume(event);self.assertEqual(controller.poll()['job_id'],newer)
                 self.finish_vba_command(controller,newer,'run_macro');self.assertEqual(controller.poll()['last_attempt_id'],'c'*32)
+        def test_operation_diagnostics_survive_error_clear_on_next_command_and_stay_bounded(self):
+            controller=self.start();callbacks=[];controller.on_event=callbacks.append
+            with patch.object(controller,'_send'):
+                jid=controller.submit('prepare_vba_patch',{'prompt_text':'Invalid document','attempt_id':'a'*32});controller.dispatcher.join(2)
+                diagnostic={'operation_stage':'live_capture_savecopyas','job_id':jid,'attempt_id':'a'*32,'source_mode':'live','snapshot_path':str(controller.temp_root/'base'/'copy.xlsm'),'savecopy_attempted':True,'savecopy_completed':False,'primary_error':'0x800401FD first','restore_events_error':'0x800706E6 second','owned_pid':424242,'owned_process_alive':True,'private_source':'never-log-this-source','recovery':{'native_stage':'native_window_application','code':'never-log-this-source'}}
+                event={'session_id':controller.session_id,'event':'error','id':jid,'attempt_id':'a'*32,'operation':'prepare_vba_patch','message':'Disconnected','code':'excel_disconnected','details':'0x800401FD original capture failure','diagnostics':diagnostic}
+                controller._consume(event);state=controller.poll();self.assertEqual(state['state'],'disconnected');self.assertEqual(state['error_diagnostics']['operation_stage'],'live_capture_savecopyas');self.assertIn('0x800401FD',state['error_details']);self.assertNotIn('never-log-this-source',dumps(state['events']));self.assertNotIn('never-log-this-source',dumps(callbacks))
+                reconnect=controller.submit('reconnect_workbook');controller.dispatcher.join(2);self.assertEqual(controller.poll()['error_diagnostics'],{})
+                controller._consume(event);self.assertEqual(controller.poll()['error_diagnostics'],{});self.assertEqual(controller.poll()['job_id'],reconnect)
+                self.finish_vba_command(controller,reconnect,'reconnect_workbook',{'diagnostics':{'operation_stage':'reconnect_complete','owned_process_alive':True,'private_source':'never-log-this-source'}})
+                state=controller.poll();self.assertEqual(state['state'],'ready');self.assertEqual(state['last_result']['diagnostics'],{'operation_stage':'reconnect_complete','owned_process_alive':True});self.assertEqual(state['error_diagnostics'],{});self.assertNotIn('never-log-this-source',dumps(state['events']))
+        def test_analysis_completed_after_read_only_rebind_preserves_new_private_plan(self):
+            controller=self.start();callbacks=[];controller.on_event=callbacks.append
+            with patch.object(controller,'_send'):
+                jid=controller.submit('prepare_vba_patch',{'prompt_text':'Invalid document'});controller.dispatcher.join(2);report=self.patch_report(controller)
+                self.finish_vba_command(controller,jid,'prepare_vba_patch',{'workbook_rebound':True,'controls_invalidated':True,'vba_patch':report,'diagnostics':{'operation_stage':'vba_analysis_complete','source_mode':'live','savecopy_completed':True,'live_rebind_attempted':True}})
+                state=controller.poll();self.assertEqual(state['vba_patch_job'],jid);self.assertEqual(state['vba_patch']['token'],report['token']);self.assertTrue(state['last_result']['controls_invalidated']);self.assertNotIn('private-patch-source',dumps(state['events']));self.assertNotIn('private-patch-source',dumps(callbacks));self.assertTrue(state['last_result']['diagnostics']['savecopy_completed'])
+        def test_completed_live_analysis_preserves_report_but_dead_process_never_becomes_ready(self):
+            controller=self.start()
+            with patch.object(controller,'_send'):
+                jid=controller.submit('prepare_vba_patch',{'prompt_text':'Invalid document'});controller.dispatcher.join(2);report=self.patch_report(controller,source_mode='live')
+                self.finish_vba_command(controller,jid,'prepare_vba_patch',{'action':'prepare_vba_patch','source_mode':'live','vba_patch':report,'diagnostics':{'operation_stage':'vba_analysis_complete','owned_process_alive':False,'savecopy_completed':True}})
+                state=controller.poll();self.assertEqual(state['state'],'disconnected');self.assertEqual(state['vba_patch_job'],jid);self.assertEqual(state['vba_patch']['token'],report['token']);self.assertTrue(state['last_result']['operation_completed']);self.assertTrue(state['last_result']['connection_lost_after_capture']);self.assertFalse(state['error'])
+                with self.assertRaises(UserError):controller.submit('apply_vba_patch',{'token':report['token'],'candidate_id':report['candidates'][0]['id'],'source_mode':'live'})
+                self.assertEqual(controller.poll()['vba_patch']['token'],report['token']);self.assertNotIn('private-patch-source',dumps(state['events']))
+        def test_unknown_process_liveness_does_not_invent_disconnection_on_analysis_completion(self):
+            controller=self.start()
+            with patch.object(controller,'_send'):
+                jid=controller.submit('prepare_vba_patch',{'prompt_text':'Invalid document'});controller.dispatcher.join(2)
+                self.finish_vba_command(controller,jid,'prepare_vba_patch',{'action':'prepare_vba_patch','source_mode':'live','vba_patch':self.patch_report(controller),'diagnostics':{'operation_stage':'vba_analysis_complete','owned_process_alive':None}})
+                state=controller.poll();self.assertEqual(state['state'],'ready');self.assertNotIn('connection_lost_after_capture',state['last_result'])
         def test_worker_loss_retains_unknown_attempt_and_never_replays_side_effect(self):
             controller=self.start();attempt='e'*32;jid=controller.submit('run_macro',{'name':'CrashAfterWrite','attempt_id':attempt})
             state=self.wait(controller,lambda s:s['finished'])
@@ -24936,6 +25521,7 @@ send('closed')
                 self.assertEqual(state['vba_patch_job'],jid);self.assertEqual(state['vba_patch']['token'],'a'*32);self.assertIn('private-patch-source',dumps(state['vba_patch']));self.assertNotIn('old_source',dumps(state['vba_patch']));self.assertNotIn('full_source',state['vba_patch'])
                 self.assertNotIn('vba_patch',state['last_result']);self.assertNotIn('private-patch-source',dumps(state['events']));self.assertNotIn('private-patch-source',dumps(callbacks));self.assertNotIn('private-patch-source',(controller.temp_root/'session.json').read_text('utf-8'))
                 jid=controller.submit('prepare_vba_patch',{'prompt_text':'Question'});controller.dispatcher.join(2);report=self.rejected_patch_report(controller)
+                report['rejections'][0].update(helper_module='Module1',helper_procedure='AskUser',helper_excerpt='private-helper-source: AskUser = True')
                 report['full_source']='discard-rejected-module';report['rejections'][0]['full_source']='discard-rejected-module'
                 self.finish_vba_command(controller,jid,'prepare_vba_patch',{'workbook_id':controller.poll()['workbook_id'],'vba_patch':report});state=controller.poll()
                 self.assertEqual(state['vba_patch_job'],jid);self.assertEqual(state['vba_patch']['status'],'unsupported')
@@ -24943,7 +25529,8 @@ send('closed')
                 expected={key:value for key,value in report['rejections'][0].items() if key!='full_source'}
                 self.assertEqual(state['vba_patch']['rejections'],[expected]);self.assertIn('private-rejected-source',dumps(state['vba_patch']))
                 self.assertNotIn('discard-rejected-module',dumps(state['vba_patch']));self.assertNotIn('vba_patch',state['last_result'])
-                for output in (state['last_result'],state['events'],callbacks):self.assertNotIn('private-rejected-source',dumps(output))
+                for output in (state['last_result'],state['events'],callbacks):
+                    self.assertNotIn('private-rejected-source',dumps(output));self.assertNotIn('private-helper-source',dumps(output))
                 self.assertNotIn('private-rejected-source',(controller.temp_root/'session.json').read_text('utf-8'))
         def test_vba_patch_rejection_diagnostics_reject_malformed_or_unbounded_reports(self):
             controller=self.start()
@@ -24953,7 +25540,7 @@ send('closed')
                 for field,value in (('modules',True),('procedures',-1),('blocks',1000001),('matched_blocks','1'),('candidates',None),('rejections',1.5),('complete',1),('complete',None)):
                     report=clone(baseline);report['analysis'][field]=value;reports.append(report)
                 report=clone(baseline);report['analysis']=[];reports.append(report)
-                for field,value in (('line',True),('line',0),('line','42'),('end_line',41),('end_line',2147483648),('block_line',-1),('block_end_line',39),
+                for field,value in (('helper_module','m'*129),('helper_procedure','p'*129),('helper_excerpt','x'*3501),('helper_excerpt',None),('line',True),('line',0),('line','42'),('end_line',41),('end_line',2147483648),('block_line',-1),('block_end_line',39),
                                     ('module','m'*129),('procedure','p'*129),('stage','s'*129),('statement','x'*1801),('excerpt','x'*3501),('reason','x'*1801),('excerpt',{})):
                     report=clone(baseline);report['rejections'][0][field]=value;reports.append(report)
                 reports.append(self.rejected_patch_report(controller,rejections=[baseline['rejections'][0]]*25))
@@ -25370,6 +25957,16 @@ send('closed')
             nodes,api,owned,application=self.native_reconnect_fixture()
             def changed(*_):owned.alive=lambda:False;return FakeCom(Application=application)
             with patch(__name__+'._excel_native_dispatch',side_effect=changed),self.assertRaises(_ExcelDisconnected):excel_native_application(self.worker.pythoncom,owned,api)
+        def test_native_recovery_reports_exact_com_stage_and_retained_process_liveness(self):
+            nodes,api,owned,application=self.native_reconnect_fixture();rpc=self.lost_com(0x800706E6)
+            class BrokenWindow:
+                @property
+                def Application(inner):raise rpc
+            with patch(__name__+'._excel_native_dispatch',return_value=BrokenWindow()),self.assertRaises(_ExcelDisconnected) as captured:excel_native_application(self.worker.pythoncom,owned,api)
+            details=captured.exception.recovery;self.assertEqual(details['native_stage'],'native_window_application');self.assertEqual(details['owned_pid'],42);self.assertEqual(details['owned_hwnd'],10);self.assertTrue(details['owned_process_alive']);self.assertTrue(details['owned_window_valid']);self.assertEqual(details['owned_window_pid'],42);self.assertIn('0x800706E6',details['last_error']);self.assertEqual(details['candidate_count'],2)
+            owned.alive=lambda:False
+            with self.assertRaises(_ExcelDisconnected) as exited:excel_native_application(self.worker.pythoncom,owned,api)
+            self.assertEqual(exited.exception.recovery['native_stage'],'native_owned_process');self.assertFalse(exited.exception.recovery['owned_process_alive'])
         @unittest.skipUnless(os.name=='nt','Windows native COM pointer boundary')
         def test_native_dispatch_uses_nativeom_iid_and_releases_api_reference_on_wrap_failure(self):
             import ctypes as c
@@ -25681,6 +26278,59 @@ send('closed')
             self.book.handlers['SaveCopyAs']=lambda path:Path(path).write_bytes(b'snapshot');self.zone_copy.side_effect=PermissionError('cannot preserve source zone')
             event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu');self.assertEqual(event['event'],'error');self.assertTrue(self.excel.EnableEvents);self.assertIsNone(self.worker.vba_patch_plan)
             self.assertFalse(self.patch_calls);self.assertFalse(any(name=='Run' for name,_ in self.excel.calls))
+        def test_live_capture_keeps_first_savecopy_hresult_when_restore_also_disconnects(self):
+            self.patch_fixture();primary=self.lost_com(0x800401FD);restore=self.lost_com(0x800706E6)
+            self.book.handlers['SaveCopyAs']=lambda *_:(_ for _ in ()).throw(primary)
+            def set_events(application,value):
+                if value is True:raise restore
+                application.__dict__['EnableEvents']=value
+            with patch.object(FakeCom,'EnableEvents',property(lambda app:app.__dict__.get('EnableEvents',True),set_events),create=True):
+                event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu',attempt_id='a'*32)
+            self.assertEqual(event['code'],'excel_disconnected');diagnostics=event['diagnostics'];self.assertEqual(diagnostics['operation_stage'],'live_capture_savecopyas')
+            self.assertIn('0x800401FD',diagnostics['primary_error']);self.assertIn('0x800706E6',diagnostics['restore_events_error']);self.assertTrue(diagnostics['connection_lost_during_restore'])
+            self.assertLess(event['details'].index('0x800401FD'),event['details'].index('0x800706E6'));self.assertEqual(diagnostics['attempt_id'],'a'*32);self.assertEqual(diagnostics['job_id'],event['id'])
+            self.assertEqual(diagnostics['working_copy'],str(self.path));self.assertTrue(Path(diagnostics['snapshot_path']).is_relative_to(self.path.parent));self.assertTrue(diagnostics['savecopy_attempted']);self.assertFalse(diagnostics['savecopy_completed'])
+            self.assertEqual([name for name,_ in self.book.calls].count('SaveCopyAs'),1);self.assertIsNone(self.worker.vba_patch_plan);self.assertFalse(any(name=='Run' for name,_ in self.excel.calls))
+        def test_live_capture_restore_disconnect_after_copy_does_not_claim_success(self):
+            self.patch_fixture();restore=self.lost_com(0x800706E6)
+            def set_events(application,value):
+                if value is True:raise restore
+                application.__dict__['EnableEvents']=value
+            with patch.object(FakeCom,'EnableEvents',property(lambda app:app.__dict__.get('EnableEvents',True),set_events),create=True):event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu')
+            self.assertEqual(event['code'],'excel_disconnected');self.assertEqual(event['diagnostics']['operation_stage'],'live_capture_restore_events');self.assertTrue(event['diagnostics']['savecopy_completed']);self.assertEqual(len(self.copy_events),1);self.assertIsNone(self.worker.vba_patch_plan)
+        def test_live_capture_rebinds_stale_book_before_single_savecopy_without_metadata_reads(self):
+            self.patch_fixture();self.worker.owned_excel=True;self.worker.book=self.disconnected_book();self.worker.control_refs['stale-control']={'shape':object()}
+            with patch.object(self.worker,'session_info',side_effect=AssertionError('Unneeded session metadata')),patch.object(self.worker,'read_range',side_effect=AssertionError('Unneeded grid snapshot')):
+                event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu')
+            self.assertEqual(event['event'],'done',event);self.assertTrue(event['result']['controls_invalidated']);self.assertEqual(event['result']['vba_patch']['status'],'candidate');self.assertEqual(event['result']['diagnostics']['operation_stage'],'vba_analysis_complete')
+            self.assertTrue(event['result']['diagnostics']['live_rebind_attempted']);self.assertIs(self.worker.book,self.book);self.assertFalse(self.worker.control_refs);self.assertEqual(len(self.copy_events),1);self.assertFalse(any(name=='Run' for name,_ in self.excel.calls));self.assertEqual(len(self.open_calls),1)
+        def test_live_capture_refreshes_application_if_events_read_disconnects_before_write(self):
+            self.patch_fixture();rpc=self.lost_com(0x800706E6);books=self.excel.Workbooks
+            class StaleEventsApplication:
+                Workbooks=books
+                @property
+                def EnableEvents(inner):raise rpc
+            stale=StaleEventsApplication();self.worker.owned_excel=True;self.worker.excel=stale;self.worker.owned_process=object()
+            with patch(__name__+'.excel_native_application',return_value=self.excel) as native,patch.object(self.worker,'session_info',side_effect=AssertionError('Unneeded session metadata')):
+                event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu')
+            self.assertEqual(event['event'],'done',event);native.assert_called_once_with(self.worker.pythoncom,self.worker.owned_process);self.assertIs(self.worker.excel,self.excel);self.assertEqual(len(self.copy_events),1)
+            self.assertTrue(event['result']['diagnostics']['recovery']['native_refresh_attempted']);self.assertFalse(event['result']['diagnostics']['recovery']['snapshot_included']);self.assertFalse(any(name=='Run' for name,_ in self.excel.calls))
+        def test_live_capture_disconnection_at_savecopy_never_refreshes_or_replays_write(self):
+            self.patch_fixture();self.book.handlers['SaveCopyAs']=lambda *_:(_ for _ in ()).throw(self.lost_com())
+            with patch(__name__+'.excel_native_application') as native:event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu')
+            native.assert_not_called();self.assertEqual(event['code'],'excel_disconnected');self.assertEqual([name for name,_ in self.book.calls].count('SaveCopyAs'),1);self.assertIsNone(self.worker.vba_patch_plan)
+        def test_completed_live_analysis_and_patch_do_not_request_later_com_metadata(self):
+            self.patch_fixture()
+            with patch.object(self.worker,'session_info',side_effect=self.lost_com(0x800706E6)) as metadata:
+                plan=self.prepared_patch();event=self.session_command('apply_vba_patch',token=plan['token'],candidate_id=plan['candidates'][0]['id'])
+            metadata.assert_not_called();self.assertEqual(event['event'],'done',event);self.assertEqual(event['result']['diagnostics']['operation_stage'],'vba_patch_complete');self.assertEqual(event['result']['diagnostics']['candidate_path'],event['result']['vba_patch_applied']['path'])
+            self.assertEqual(len(self.copy_events),1);self.assertEqual(len(self.patch_calls),1)
+        def test_live_capture_zone_failure_is_labeled_without_another_office_call(self):
+            self.patch_fixture();self.zone_copy.side_effect=PermissionError('Zone copy unavailable')
+            probes=[]
+            def office_probe(application):probes.append('unexpected COM read');raise AssertionError('Diagnostics must not probe Office after file work')
+            with patch.object(FakeCom,'ProtectedViewWindows',property(office_probe),create=True):event=self.session_command('prepare_vba_patch',prompt_text='Nieprawidlowy numer projektu')
+            self.assertEqual(event['event'],'error');self.assertEqual(event['diagnostics']['operation_stage'],'vba_snapshot_preserve_zone');self.assertTrue(event['diagnostics']['savecopy_completed']);self.assertEqual(len(self.copy_events),1);self.assertFalse(probes)
         def test_vba_patch_refuses_manifest_traversal_changed_companion_and_incomplete_handoff(self):
             companion=self.path.parent/'known.csv';companion.write_bytes(b'old');self.patch_fixture([companion.name]);plan=self.prepared_patch();companion.write_bytes(b'changed companion')
             event=self.session_command('apply_vba_patch',token=plan['token'],candidate_id=plan['candidates'][0]['id']);self.assertEqual(event['event'],'error');self.assertFalse(self.patch_calls)
@@ -30012,6 +30662,23 @@ def ui_test():
             dialog.record_patch_diagnosis(plan);dialog.copy_session_activity();text=QW.QApplication.clipboard().text()
             for detail in ('Module1.Validate','candidate-1','Zachowane wiersze: 42, 43','Pomijane wiersze: 41, 44, 45','External.Check','If False Then','e'*64,evidence['return_effect']):self.assertIn(detail,text)
             self.assertIn('Nie ustalono, które linie wykonał Excel',text);self.assertNotIn('If False Then',dialog.history.toPlainText());self.assertEqual(controller.snapshot['events'],[]);self.assertEqual(controller.calls,before)
+        def test_office_activity_copies_helper_source_on_refusal_without_execution(self):
+            dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);before=list(controller.calls)
+            source='Private Function AskUser(ByVal message As String) As Boolean\n    Audit.Write message\n    AskUser = True\nEnd Function'
+            dialog.record_patch_diagnosis({'candidates':[],'rejections':[{'module':'Module1','procedure':'Validate','reason':'Helper performs additional work.',
+                'statement':'proceed = AskUser(message)','helper_module':'Module1','helper_procedure':'AskUser','helper_excerpt':source}]})
+            dialog.copy_session_activity();text=QW.QApplication.clipboard().text()
+            self.assertIn('Module1.AskUser',text);self.assertIn(source,text);self.assertIn('Statyczne źródło funkcji pomocniczej',text)
+            self.assertNotIn('Audit.Write',dialog.history.toPlainText());self.assertEqual(controller.calls,before)
+        def test_office_activity_keeps_com_stage_and_hresult_after_later_success(self):
+            dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);before=list(controller.calls)
+            diagnostics={'operation_stage':'snapshot.save_copy','source_mode':'live','owned_pid':701,'owned_process_alive':True,'savecopy_attempted':True,'savecopy_completed':False}
+            details='0x800401FD primary SaveCopyAs failure\n0x800706E6 restore error'
+            for _ in range(2):dialog.remember_failure('Connection lost',details,'excel_disconnected','prepare_vba_patch',diagnostics)
+            text=dialog.activity_log.toPlainText();self.assertEqual(text.count('0x800401FD'),1);self.assertIn('snapshot.save_copy',text);self.assertIn('Proces działa: True',text)
+            dialog.clear_failure();dialog.record_operation_diagnostics('reconnect_workbook',{'operation_stage':'reconnect.complete','owned_pid':701});dialog.copy_session_activity();copied=QW.QApplication.clipboard().text()
+            for item in ('0x800401FD','0x800706E6','reconnect.complete','snapshot.save_copy'):self.assertIn(item,copied)
+            self.assertEqual(controller.calls,before)
         def test_office_activity_new_question_invalidates_diagnosis_without_erasing_timeline(self):
             dialog,controller=self.native_session();self.wait(lambda:not dialog._scan_pending);dialog.remember_vba_question(self.session_activity_prompt(),'Nie');before=list(controller.calls)
             dialog.present_vba_patch({'status':'unsupported','candidates':[],'rejections':[{'reason':'Nieznane wywołanie.','statement':'Call PreviousValidation()','excerpt':'18: Call PreviousValidation()'}]});self.assertIn('PreviousValidation',dialog.patch_diagnosis.toPlainText());log=dialog.activity_log.toPlainText()
@@ -30139,6 +30806,15 @@ def ui_test():
             controller.snapshot.update(state='disconnected',operation='',last_operation='apply_vba_patch',last_result={'action':'apply_vba_patch','source_mode':'saved_file','file_only':True,'vba_patch_applied':applied},error='',vba_patch={});dialog.poll();app.processEvents()
             self.assertTrue(dialog.patch_open_button.isVisible());self.assertEqual(dialog._patch_result['path'],str(destination));self.assertIn('Utworzono kopię',dialog.patch_note.text());self.assertFalse(dialog.native_macro.isEnabled());self.assertIn('Utracono',dialog.state_note.text());self.assertEqual(len(instances),1)
             self.assertFalse(any(call[0] in ('reconnect_workbook','run_macro','run_control_macro') for call in controller.calls))
+        def test_office_completed_live_analysis_survives_process_exit_as_read_only_report(self):
+            dialog,controller,instances,scan,action,prompt=self.vba_patch_session();plan=self.vba_patch_plan_fixture();before=list(controller.calls)
+            result={'action':'prepare_vba_patch','source_mode':'live','operation_completed':True,'connection_lost_after_capture':True,'diagnostics':{'operation_stage':'vba_analysis_complete','savecopy_completed':True,'owned_process_alive':False}}
+            controller.snapshot.update(state='disconnected',operation='',last_operation='prepare_vba_patch',last_result=result,error='',error_code='',error_operation='',vba_patch=plan)
+            dialog.poll();app.processEvents();dialog.poll()
+            self.assertEqual(dialog._patch_plan['token'],plan['token']);self.assertIsNone(dialog._patch_preview);self.assertFalse(dialog.native_macro.isEnabled());self.assertIn('Utracono',dialog.state_note.text())
+            self.assertIn('Analiza zapisanej migawki zakończyła się',dialog.patch_note.text());self.assertIn('Propozycja:',dialog.patch_diagnosis.toPlainText())
+            self.assertFalse(dialog.submit('apply_vba_patch',{'token':plan['token'],'candidate_id':plan['candidates'][0]['id']}));self.assertEqual(controller.calls,before)
+            dialog.copy_session_activity();self.assertIn('vba_analysis_complete',QW.QApplication.clipboard().text());self.assertIn('Proces działa: False',QW.QApplication.clipboard().text())
         def test_office_vba_patch_failed_live_capture_stops_progress_and_incomplete_copy_stays_blocked(self):
             dialog,controller,instances,scan,action,prompt=self.vba_patch_session();dialog.patch_button.click();self.wait(lambda:not dialog._command_pending)
             controller.snapshot.update(state='disconnected',operation='',last_result={},error='Połączenie zostało utracone.',error_code='excel_disconnected',error_operation='prepare_vba_patch');dialog.poll()
